@@ -1,0 +1,1285 @@
+from __future__ import annotations
+
+import json
+from datetime import datetime
+from html import escape
+from pathlib import Path
+from string import Template
+
+from finance_bot.config import Settings
+from finance_bot.db import FinanceDatabase
+from finance_bot.formatting import (
+    fixed_label,
+    format_date,
+    format_euro,
+    format_month,
+    parse_created_at,
+    tipo_label,
+)
+from finance_bot.parser import VALID_CATEGORIES
+
+
+def _user_label(row, aliases: dict[int, str] | None = None) -> str:
+    aliases = aliases or {}
+    user_id = row["telegram_user_id"]
+    if user_id in aliases:
+        return aliases[user_id]
+    return row["telegram_full_name"] or row["telegram_username"] or "Sin usuario"
+
+
+def _file_url(path_value: str | None) -> str:
+    if not path_value:
+        return ""
+    path = Path(path_value)
+    if not path.is_absolute():
+        path = Path.cwd() / path
+    try:
+        return path.resolve().as_uri()
+    except ValueError:
+        return ""
+
+
+def _transaction_payload(rows, aliases: dict[int, str]) -> list[dict[str, object]]:
+    transactions: list[dict[str, object]] = []
+    for row in rows:
+        created_at = parse_created_at(row["created_at"])
+        receipt = row["receipt_local_path"] or ""
+        transactions.append(
+            {
+                "id": row["id"],
+                "createdAt": row["created_at"],
+                "monthKey": created_at.strftime("%Y-%m"),
+                "monthName": format_month(created_at),
+                "date": format_date(created_at),
+                "dateIso": created_at.strftime("%Y-%m-%d"),
+                "description": row["note"],
+                "category": row["category"] or "",
+                "amount": format_euro(row["amount_cents"]),
+                "amountCents": row["amount_cents"],
+                "kind": row["kind"],
+                "type": tipo_label(row["kind"]),
+                "store": row["store"] or "",
+                "isFixed": bool(row["is_fixed"]),
+                "fixed": fixed_label(bool(row["is_fixed"])),
+                "userId": row["telegram_user_id"],
+                "user": _user_label(row, aliases),
+                "receipt": receipt,
+                "receiptUrl": _file_url(receipt),
+                "hasReceipt": bool(receipt),
+                "reviewStatus": row["review_status"] or "registered",
+                "duplicateOfId": row["duplicate_of_id"],
+            }
+        )
+    return transactions
+
+
+def _receipt_payload(rows, aliases: dict[int, str]) -> list[dict[str, object]]:
+    receipts: list[dict[str, object]] = []
+    for row in rows:
+        created_at = parse_created_at(row["created_at"])
+        path = row["local_path"]
+        receipts.append(
+            {
+                "id": row["id"],
+                "createdAt": row["created_at"],
+                "monthKey": created_at.strftime("%Y-%m"),
+                "date": format_date(created_at),
+                "status": row["status"],
+                "path": path,
+                "url": _file_url(path),
+                "caption": row["caption"] or "",
+                "reviewNotes": row["review_notes"] or "",
+                "user": _user_label(row, aliases),
+            }
+        )
+    return receipts
+
+
+def _add_months(date_value: datetime, months: int) -> datetime:
+    month_index = date_value.month - 1 + months
+    year = date_value.year + month_index // 12
+    month = month_index % 12 + 1
+    return date_value.replace(year=year, month=month, day=1)
+
+
+def _month_distance(start_month: str, end_month: str) -> int:
+    start = datetime.fromisoformat(start_month + "-01")
+    end = datetime.fromisoformat(end_month + "-01")
+    return (end.year - start.year) * 12 + (end.month - start.month)
+
+
+def _projection_status_label(kind: str, status: str) -> str:
+    if status == "completed":
+        return "Cobrado" if kind == "income" else "Pagado"
+    if status == "skipped":
+        return "Omitido"
+    return "Pendiente"
+
+
+def _projection_payload(
+    db: FinanceDatabase, transactions: list[dict[str, object]], month_count: int = 12
+) -> dict[str, object]:
+    start = datetime.now(db.timezone).replace(day=1)
+    months = [_add_months(start, index).strftime("%Y-%m") for index in range(month_count)]
+    templates = db.list_projection_templates()
+    overrides = {
+        (row["template_id"], row["month"]): row
+        for row in db.list_projection_occurrences(months[0], months[-1])
+    }
+
+    actual_by_month = {
+        month: {"income": 0, "expense": 0}
+        for month in months
+    }
+    for transaction in transactions:
+        month = str(transaction["monthKey"])
+        kind = str(transaction["kind"])
+        if month in actual_by_month and kind in actual_by_month[month]:
+            actual_by_month[month][kind] += int(transaction["amountCents"])
+
+    rows: list[dict[str, object]] = []
+    summaries = {
+        month: {
+            "monthKey": month,
+            "monthName": format_month(datetime.fromisoformat(month + "-01")),
+            "projectedIncomeCents": 0,
+            "projectedExpenseCents": 0,
+            "completedIncomeCents": 0,
+            "completedExpenseCents": 0,
+            "pendingIncomeCents": 0,
+            "pendingExpenseCents": 0,
+            "actualIncomeCents": actual_by_month[month]["income"],
+            "actualExpenseCents": actual_by_month[month]["expense"],
+        }
+        for month in months
+    }
+
+    for month_index, month in enumerate(months):
+        for template in templates:
+            start_month = template["start_month"] or months[0]
+            month_offset = _month_distance(start_month, month)
+            if month_offset < 0:
+                continue
+
+            installment_current = template["installment_current"]
+            installment_total = template["installment_total"]
+            if installment_current and installment_total:
+                installment_for_month = int(installment_current) + month_offset
+                if installment_for_month > int(installment_total):
+                    continue
+                remaining_installments = int(installment_total) - installment_for_month
+                installment_label = f"{installment_for_month}/{installment_total}"
+                remaining_label = f"Restan {remaining_installments}"
+            else:
+                installment_for_month = None
+                remaining_installments = None
+                installment_label = "Fijo"
+                remaining_label = ""
+
+            override = overrides.get((template["id"], month))
+            amount_cents = (
+                int(override["amount_cents"])
+                if override is not None
+                else int(template["default_amount_cents"])
+            )
+            status = str(override["status"]) if override is not None else "pending"
+            note = str(override["note"]) if override is not None else ""
+            kind = str(template["kind"])
+            summary = summaries[month]
+
+            if status != "skipped":
+                key = "projectedIncomeCents" if kind == "income" else "projectedExpenseCents"
+                summary[key] += amount_cents
+            if status == "completed":
+                key = "completedIncomeCents" if kind == "income" else "completedExpenseCents"
+                summary[key] += amount_cents
+            elif status == "pending":
+                key = "pendingIncomeCents" if kind == "income" else "pendingExpenseCents"
+                summary[key] += amount_cents
+
+            rows.append(
+                {
+                    "templateId": template["id"],
+                    "month": month,
+                    "monthName": summary["monthName"],
+                    "kind": kind,
+                    "type": tipo_label(kind),
+                    "name": template["name"],
+                    "category": template["category"] or "",
+                    "group": template["group_name"] or "",
+                    "startMonth": start_month,
+                    "amountCents": amount_cents,
+                    "amount": format_euro(amount_cents),
+                    "defaultAmountCents": template["default_amount_cents"],
+                    "status": status,
+                    "statusLabel": _projection_status_label(kind, status),
+                    "note": note,
+                    "installmentLabel": installment_label,
+                    "remainingInstallments": remaining_installments,
+                    "remainingLabel": remaining_label,
+                    "installmentCurrent": installment_for_month,
+                    "installmentTotal": installment_total,
+                    "sortOrder": template["sort_order"],
+                }
+            )
+
+    month_summaries: list[dict[str, object]] = []
+    for summary in summaries.values():
+        projected_balance = summary["projectedIncomeCents"] - summary["projectedExpenseCents"]
+        actual_balance = summary["actualIncomeCents"] - summary["actualExpenseCents"]
+        summary["projectedBalanceCents"] = projected_balance
+        summary["actualBalanceCents"] = actual_balance
+        summary["projectedIncome"] = format_euro(summary["projectedIncomeCents"])
+        summary["projectedExpense"] = format_euro(summary["projectedExpenseCents"])
+        summary["projectedBalance"] = format_euro(projected_balance)
+        summary["completedIncome"] = format_euro(summary["completedIncomeCents"])
+        summary["completedExpense"] = format_euro(summary["completedExpenseCents"])
+        summary["pendingIncome"] = format_euro(summary["pendingIncomeCents"])
+        summary["pendingExpense"] = format_euro(summary["pendingExpenseCents"])
+        summary["actualIncome"] = format_euro(summary["actualIncomeCents"])
+        summary["actualExpense"] = format_euro(summary["actualExpenseCents"])
+        summary["actualBalance"] = format_euro(actual_balance)
+        month_summaries.append(summary)
+
+    return {"months": month_summaries, "rows": rows}
+
+
+def render_report_html(settings: Settings, *, editable: bool = False) -> str:
+    settings.ensure_dirs()
+    db = FinanceDatabase(settings.sqlite_db_path, settings.timezone)
+    transactions = _transaction_payload(db.list_transactions(), settings.telegram_user_aliases)
+    receipts = _receipt_payload(db.list_receipts(), settings.telegram_user_aliases)
+    projections = _projection_payload(db, transactions)
+    generated_at = datetime.now().strftime("%d/%m/%Y %H:%M")
+
+    return _render_html(
+        transactions=transactions,
+        receipts=receipts,
+        projections=projections,
+        generated_at=generated_at,
+        db_path=str(settings.sqlite_db_path),
+        editable=editable,
+        valid_categories=list(VALID_CATEGORIES),
+    )
+
+
+def generate_report(settings: Settings, output_path: Path | None = None) -> Path:
+    output = output_path or settings.report_html_path
+    html = render_report_html(settings, editable=False)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    output.write_text(html, encoding="utf-8")
+    return output
+
+
+def _render_html(
+    *,
+    transactions: list[dict[str, object]],
+    receipts: list[dict[str, object]],
+    projections: dict[str, object],
+    generated_at: str,
+    db_path: str,
+    editable: bool,
+    valid_categories: list[str],
+) -> str:
+    template = Template(
+        """<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  $refresh_meta
+  <title>$title</title>
+  <style>
+    :root {
+      --bg: #f5f7f4;
+      --panel: #ffffff;
+      --ink: #17211d;
+      --muted: #60706a;
+      --line: #dce4dd;
+      --accent: #1f7a5a;
+      --accent-2: #2c6387;
+      --warn: #936719;
+      --danger: #b34545;
+      --soft: #edf3ee;
+      --radius: 8px;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      background: var(--bg);
+      color: var(--ink);
+      font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      font-size: 15px;
+    }
+    header {
+      border-bottom: 1px solid var(--line);
+      background: var(--soft);
+      padding: 18px clamp(16px, 4vw, 40px);
+    }
+    h1 { margin: 0; font-size: 24px; line-height: 1.2; }
+    header p { margin: 6px 0 0; color: var(--muted); }
+    main {
+      width: min(1440px, 100%);
+      margin: 0 auto;
+      padding: 18px clamp(12px, 3vw, 32px) 40px;
+    }
+    .filters {
+      display: grid;
+      grid-template-columns: repeat(7, minmax(120px, 1fr));
+      gap: 10px;
+      margin-bottom: 14px;
+      align-items: end;
+    }
+    label {
+      display: grid;
+      gap: 5px;
+      color: var(--muted);
+      font-size: 12px;
+      font-weight: 700;
+      text-transform: uppercase;
+    }
+    select, input {
+      width: 100%;
+      min-height: 38px;
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      background: var(--panel);
+      color: var(--ink);
+      padding: 8px 10px;
+      font: inherit;
+    }
+    button {
+      min-height: 38px;
+      border: 1px solid var(--accent);
+      border-radius: var(--radius);
+      background: var(--accent);
+      color: white;
+      font-weight: 700;
+      cursor: pointer;
+    }
+    button.secondary {
+      border-color: var(--line);
+      background: var(--panel);
+      color: var(--ink);
+    }
+    button.linkish {
+      min-height: 30px;
+      padding: 4px 9px;
+      border-color: var(--line);
+      background: #fbfcfb;
+      color: var(--accent-2);
+      font-size: 12px;
+    }
+    .tabs {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      margin-bottom: 14px;
+    }
+    .tab-button {
+      border-color: var(--line);
+      background: var(--panel);
+      color: var(--ink);
+    }
+    .tab-button.active {
+      border-color: var(--accent);
+      background: var(--accent);
+      color: white;
+    }
+    .cards {
+      display: grid;
+      grid-template-columns: repeat(7, minmax(130px, 1fr));
+      gap: 10px;
+      margin-bottom: 14px;
+    }
+    .projection-tools {
+      display: grid;
+      grid-template-columns: minmax(180px, 260px) 1fr;
+      gap: 12px;
+      align-items: end;
+      padding: 12px;
+      border-bottom: 1px solid var(--line);
+    }
+    .projection-cards {
+      display: grid;
+      grid-template-columns: repeat(6, minmax(130px, 1fr));
+      gap: 10px;
+      padding: 12px;
+    }
+    .card, .panel {
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+    }
+    .card { padding: 12px; }
+    .card span {
+      display: block;
+      color: var(--muted);
+      font-size: 11px;
+      font-weight: 800;
+      text-transform: uppercase;
+    }
+    .card strong {
+      display: block;
+      margin-top: 5px;
+      font-size: 21px;
+    }
+    .grid {
+      display: grid;
+      grid-template-columns: minmax(0, 1.2fr) minmax(320px, .8fr);
+      gap: 14px;
+    }
+    .panel { overflow: hidden; }
+    .panel h2 {
+      margin: 0;
+      padding: 13px 14px;
+      border-bottom: 1px solid var(--line);
+      font-size: 16px;
+    }
+    .chart-wrap { height: 276px; padding: 12px; }
+    canvas { width: 100%; height: 100%; display: block; }
+    .list {
+      display: grid;
+      gap: 8px;
+      padding: 12px;
+      max-height: 275px;
+      overflow: auto;
+    }
+    .notice, .receipt-item {
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      background: #fbfcfb;
+      padding: 10px;
+      overflow-wrap: anywhere;
+    }
+    .notice.warn { border-color: #e3c47e; background: #fff8e9; }
+    .notice.danger { border-color: #e2a6a6; background: #fff2f2; }
+    .table-wrap { max-height: 520px; overflow: auto; }
+    table { width: 100%; border-collapse: collapse; font-size: 14px; }
+    th, td {
+      padding: 9px 10px;
+      border-bottom: 1px solid var(--line);
+      text-align: left;
+      vertical-align: top;
+      white-space: nowrap;
+    }
+    td.description { min-width: 220px; white-space: normal; }
+    th {
+      position: sticky;
+      top: 0;
+      background: #f8faf7;
+      color: var(--muted);
+      font-size: 12px;
+      text-transform: uppercase;
+      z-index: 1;
+    }
+    .amount { text-align: right; font-variant-numeric: tabular-nums; }
+    .income { color: var(--accent); font-weight: 800; }
+    .expense { color: var(--danger); font-weight: 800; }
+    .muted { color: var(--muted); }
+    .pill {
+      display: inline-flex;
+      align-items: center;
+      min-height: 24px;
+      padding: 2px 8px;
+      border-radius: 999px;
+      background: #eef4f1;
+      color: var(--muted);
+      font-size: 12px;
+      font-weight: 800;
+    }
+    .status-completed { color: var(--accent); font-weight: 800; }
+    .status-pending { color: var(--warn); font-weight: 800; }
+    .status-skipped { color: var(--muted); font-weight: 800; }
+    .modal-backdrop {
+      position: fixed;
+      inset: 0;
+      z-index: 10;
+      display: grid;
+      place-items: center;
+      padding: 18px;
+      background: rgba(23, 33, 29, .42);
+    }
+    .modal-backdrop[hidden] { display: none; }
+    .modal {
+      width: min(680px, 100%);
+      max-height: min(720px, 92vh);
+      overflow: auto;
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      box-shadow: 0 20px 60px rgba(0, 0, 0, .18);
+    }
+    .modal header {
+      background: #f8faf7;
+      padding: 14px 16px;
+    }
+    .modal h2 { margin: 0; font-size: 18px; }
+    .modal form {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 12px;
+      padding: 16px;
+    }
+    .modal label.full { grid-column: 1 / -1; }
+    .modal .actions {
+      grid-column: 1 / -1;
+      display: flex;
+      justify-content: flex-end;
+      gap: 10px;
+      border-top: 1px solid var(--line);
+      padding-top: 12px;
+    }
+    .form-error {
+      grid-column: 1 / -1;
+      color: var(--danger);
+      font-weight: 700;
+    }
+    a { color: var(--accent-2); font-weight: 700; text-decoration: none; }
+    a:hover { text-decoration: underline; }
+    @media (max-width: 1100px) {
+      .filters, .cards, .projection-tools, .projection-cards, .grid { grid-template-columns: 1fr; }
+      .chart-wrap { height: 240px; }
+      .modal form { grid-template-columns: 1fr; }
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>Reporte de finanzas</h1>
+    <p>Generado el $generated_at desde $db_path</p>
+    $edit_hint
+  </header>
+  <main>
+    <nav class="tabs" aria-label="Pestanas del panel">
+      <button class="tab-button active" type="button" data-tab="dashboard">Panel inicial</button>
+      <button class="tab-button" type="button" data-tab="projection">Proyeccion</button>
+    </nav>
+
+    <section class="filters dashboard-panel" aria-label="Filtros">
+      <label>Mes<select id="monthFilter"></select></label>
+      <label>Categoría<select id="categoryFilter"></select></label>
+      <label>Tipo<select id="typeFilter"></select></label>
+      <label>Usuario<select id="userFilter"></select></label>
+      <label>Fijo<select id="fixedFilter"></select></label>
+      <label>Ticket<select id="receiptFilter"></select></label>
+      <label>Buscar<input id="searchFilter" type="search" placeholder="Descripción o tienda"></label>
+      <button id="resetFilters" type="button">Limpiar filtros</button>
+    </section>
+
+    <section class="cards dashboard-panel" aria-label="Resumen">
+      <div class="card"><span>Ingresos</span><strong id="incomeTotal">0,00 €</strong></div>
+      <div class="card"><span>Egresos</span><strong id="expenseTotal">0,00 €</strong></div>
+      <div class="card"><span>Balance</span><strong id="balanceTotal">0,00 €</strong></div>
+      <div class="card"><span>Fijos</span><strong id="fixedTotal">0,00 €</strong></div>
+      <div class="card"><span>Variables</span><strong id="variableTotal">0,00 €</strong></div>
+      <div class="card"><span>Con ticket</span><strong id="ticketCoverage">0%</strong></div>
+      <div class="card"><span>Pendientes</span><strong id="pendingCount">0</strong></div>
+    </section>
+
+    <section id="projectionPanel" class="panel" style="margin-bottom: 14px;" hidden>
+      <h2>Proyeccion proximos meses</h2>
+      <div class="projection-tools">
+        <label>Mes proyectado<select id="projectionMonth"></select></label>
+        <button id="addProjection" type="button">Anadir item</button>
+        <div class="muted">Edita importes por mes y marca lo ya pagado o cobrado.</div>
+      </div>
+      <div class="projection-cards" aria-label="Resumen proyectado">
+        <div class="card"><span>Ingresos proyectados</span><strong id="projectionIncome">0,00 EUR</strong></div>
+        <div class="card"><span>Gastos proyectados</span><strong id="projectionExpense">0,00 EUR</strong></div>
+        <div class="card"><span>Balance proyectado</span><strong id="projectionBalance">0,00 EUR</strong></div>
+        <div class="card"><span>Ya cobrado</span><strong id="projectionCompletedIncome">0,00 EUR</strong></div>
+        <div class="card"><span>Ya pagado</span><strong id="projectionCompletedExpense">0,00 EUR</strong></div>
+        <div class="card"><span>Balance real registrado</span><strong id="projectionActualBalance">0,00 EUR</strong></div>
+      </div>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>Concepto</th><th>Tipo</th><th>Categoria</th><th>Cuota</th><th>Restantes</th>
+              <th class="amount">Mensual</th><th>Estado</th><th>Nota</th><th>Acciones</th>
+            </tr>
+          </thead>
+          <tbody id="projectionBody"></tbody>
+        </table>
+      </div>
+    </section>
+
+    <section class="grid dashboard-panel">
+      <div class="panel">
+        <h2>Alertas y salud</h2>
+        <div id="alertsList" class="list"></div>
+      </div>
+      <div class="panel">
+        <h2>Ranking de tiendas</h2>
+        <div id="storeRanking" class="list"></div>
+      </div>
+    </section>
+
+    <section class="grid dashboard-panel" style="margin-top: 14px;">
+      <div class="panel">
+        <h2>Evolución mensual</h2>
+        <div class="chart-wrap"><canvas id="monthlyChart"></canvas></div>
+      </div>
+      <div class="panel">
+        <h2>Gasto por categoría</h2>
+        <div class="chart-wrap"><canvas id="categoryChart"></canvas></div>
+      </div>
+    </section>
+
+    <section class="panel dashboard-panel" style="margin-top: 14px;">
+      <h2>Movimientos</h2>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>Mes</th><th>Fecha</th><th>Descripción</th><th>Categoría</th>
+              <th class="amount">Cantidad</th><th>Tipo</th><th>Tienda</th><th>Usuario</th><th>Es fijo</th><th>Fuente</th><th>Acciones</th>
+            </tr>
+          </thead>
+          <tbody id="transactionsBody"></tbody>
+        </table>
+      </div>
+    </section>
+
+    <section class="panel dashboard-panel" style="margin-top: 14px;">
+      <h2>Bandeja de tickets y audios</h2>
+      <div id="receiptList" class="list"></div>
+    </section>
+  </main>
+
+  <div id="editModal" class="modal-backdrop" hidden>
+    <section class="modal" role="dialog" aria-modal="true" aria-labelledby="editTitle">
+      <header>
+        <h2 id="editTitle">Editar movimiento</h2>
+      </header>
+      <form id="editForm">
+        <input id="editId" type="hidden">
+        <label>Fecha<input id="editDate" name="date" type="date" required></label>
+        <label>Cantidad<input id="editAmount" name="amount" type="text" inputmode="decimal" required></label>
+        <label class="full">Descripción<input id="editDescription" name="description" type="text" required></label>
+        <label>Categoría<select id="editCategory" name="category" required></select></label>
+        <label>Tipo<select id="editKind" name="kind" required><option value="expense">Egreso</option><option value="income">Ingreso</option></select></label>
+        <label>Tienda<input id="editStore" name="store" type="text"></label>
+        <label>Es fijo<select id="editFixed" name="isFixed"><option value="false">No</option><option value="true">Sí</option></select></label>
+        <div id="editError" class="form-error" hidden></div>
+        <div class="actions">
+          <button id="cancelEdit" class="secondary" type="button">Cancelar</button>
+          <button type="submit">Guardar cambios</button>
+        </div>
+      </form>
+    </section>
+  </div>
+
+  <div id="projectionModal" class="modal-backdrop" hidden>
+    <section class="modal" role="dialog" aria-modal="true" aria-labelledby="projectionEditTitle">
+      <header>
+        <h2 id="projectionEditTitle">Editar proyeccion</h2>
+      </header>
+      <form id="projectionForm">
+        <input id="projectionTemplateId" type="hidden">
+        <input id="projectionEditMonth" type="hidden">
+        <label class="full">Concepto<input id="projectionName" name="name" type="text" required></label>
+        <label>Tipo<select id="projectionKind" name="kind" required><option value="expense">Egreso</option><option value="income">Ingreso</option></select></label>
+        <label>Categoria<select id="projectionCategory" name="category" required></select></label>
+        <label>Cantidad mensual<input id="projectionAmount" name="amount" type="text" inputmode="decimal" required></label>
+        <label>Estado<select id="projectionStatus" name="status" required><option value="pending">Pendiente</option><option value="completed">Pagado/Cobrado</option><option value="skipped">Omitido</option></select></label>
+        <label>Duracion<select id="projectionDuration" name="duration" required><option value="monthly">Fijo mensual</option><option value="once">Solo este mes</option><option value="installments">Cuotas</option></select></label>
+        <label>Cuota actual<input id="projectionInstallmentCurrent" name="installmentCurrent" type="number" min="1" step="1"></label>
+        <label>Total cuotas<input id="projectionInstallmentTotal" name="installmentTotal" type="number" min="1" step="1"></label>
+        <label>Actualizar base<select id="projectionUpdateDefault" name="updateDefault"><option value="false">Solo este mes</option><option value="true">Tambien proximos meses</option></select></label>
+        <label class="full">Nota<input id="projectionNote" name="note" type="text"></label>
+        <div id="projectionError" class="form-error" hidden></div>
+        <div class="actions">
+          <button id="cancelProjectionEdit" class="secondary" type="button">Cancelar</button>
+          <button type="submit">Guardar proyeccion</button>
+        </div>
+      </form>
+    </section>
+  </div>
+
+  <script>
+    const transactions = $transactions_json;
+    const receipts = $receipts_json;
+    const projections = $projections_json;
+    const editable = $editable_json;
+    const validCategories = $valid_categories_json;
+    const money = new Intl.NumberFormat('es-ES', { style: 'currency', currency: 'EUR' });
+    const filters = {
+      month: document.getElementById('monthFilter'),
+      category: document.getElementById('categoryFilter'),
+      type: document.getElementById('typeFilter'),
+      user: document.getElementById('userFilter'),
+      fixed: document.getElementById('fixedFilter'),
+      receipt: document.getElementById('receiptFilter'),
+      search: document.getElementById('searchFilter')
+    };
+    const projectionMonth = document.getElementById('projectionMonth');
+
+    function unique(values) {
+      return Array.from(new Set(values.filter(Boolean))).sort(function(a, b) {
+        return String(a).localeCompare(String(b), 'es');
+      });
+    }
+    function fillSelect(select, values, allLabel) {
+      select.innerHTML = '';
+      const all = document.createElement('option');
+      all.value = '';
+      all.textContent = allLabel;
+      select.appendChild(all);
+      values.forEach(function(value) {
+        const option = document.createElement('option');
+        option.value = value;
+        option.textContent = value;
+        select.appendChild(option);
+      });
+    }
+    function initFilters() {
+      fillSelect(filters.month, unique(transactions.map(function(row) { return row.monthKey; })), 'Todos');
+      fillSelect(filters.category, unique(transactions.map(function(row) { return row.category; })), 'Todas');
+      fillSelect(filters.type, unique(transactions.map(function(row) { return row.type; })), 'Todos');
+      fillSelect(filters.user, unique(transactions.map(function(row) { return row.user; })), 'Todos');
+      fillSelect(filters.fixed, ['Sí', 'No'], 'Todos');
+      fillSelect(filters.receipt, ['Con ticket', 'Sin ticket'], 'Todos');
+    }
+    function initEditForm() {
+      const category = document.getElementById('editCategory');
+      category.innerHTML = '';
+      validCategories.forEach(function(value) {
+        const option = document.createElement('option');
+        option.value = value;
+        option.textContent = value;
+        category.appendChild(option);
+      });
+    }
+    function initProjectionForm() {
+      const category = document.getElementById('projectionCategory');
+      category.innerHTML = '';
+      validCategories.forEach(function(value) {
+        const option = document.createElement('option');
+        option.value = value;
+        option.textContent = value;
+        category.appendChild(option);
+      });
+    }
+    function initProjectionMonths() {
+      projectionMonth.innerHTML = '';
+      projections.months.forEach(function(month) {
+        const option = document.createElement('option');
+        option.value = month.monthKey;
+        option.textContent = month.monthName + ' ' + month.monthKey.slice(0, 4);
+        projectionMonth.appendChild(option);
+      });
+    }
+    function showTab(tabName) {
+      const showProjection = tabName === 'projection';
+      document.querySelectorAll('.dashboard-panel').forEach(function(section) {
+        section.hidden = showProjection;
+      });
+      document.getElementById('projectionPanel').hidden = !showProjection;
+      document.querySelectorAll('.tab-button').forEach(function(button) {
+        button.classList.toggle('active', button.getAttribute('data-tab') === tabName);
+      });
+      if (showProjection) renderProjection();
+    }
+    function filteredTransactions() {
+      const search = filters.search.value.trim().toLowerCase();
+      return transactions.filter(function(row) {
+        if (filters.month.value && row.monthKey !== filters.month.value) return false;
+        if (filters.category.value && row.category !== filters.category.value) return false;
+        if (filters.type.value && row.type !== filters.type.value) return false;
+        if (filters.user.value && row.user !== filters.user.value) return false;
+        if (filters.fixed.value && row.fixed !== filters.fixed.value) return false;
+        if (filters.receipt.value === 'Con ticket' && !row.hasReceipt) return false;
+        if (filters.receipt.value === 'Sin ticket' && row.hasReceipt) return false;
+        if (search) {
+          const haystack = [row.description, row.store, row.category, row.user].join(' ').toLowerCase();
+          if (!haystack.includes(search)) return false;
+        }
+        return true;
+      });
+    }
+    function centsToMoney(cents) { return money.format(cents / 100); }
+    function setText(id, value) { document.getElementById(id).textContent = value; }
+    function escapeHtml(value) {
+      return String(value == null ? '' : value).replace(/[&<>"']/g, function(char) {
+        return {'&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#039;'}[char];
+      });
+    }
+    function sum(rows, fn) {
+      return rows.reduce(function(total, row) { return total + fn(row); }, 0);
+    }
+    function expenseRows(rows) {
+      return rows.filter(function(row) { return row.kind === 'expense'; });
+    }
+    function renderSummary(rows) {
+      const income = sum(rows.filter(function(row) { return row.kind === 'income'; }), function(row) { return row.amountCents; });
+      const expense = sum(expenseRows(rows), function(row) { return row.amountCents; });
+      const fixed = sum(expenseRows(rows).filter(function(row) { return row.isFixed; }), function(row) { return row.amountCents; });
+      const variable = expense - fixed;
+      const coverage = rows.length ? Math.round((rows.filter(function(row) { return row.hasReceipt; }).length / rows.length) * 100) : 0;
+      const pending = receipts.filter(function(row) { return ['nuevo', 'pending', 'voice_pending', 'dudoso'].includes(row.status); }).length;
+      setText('incomeTotal', centsToMoney(income));
+      setText('expenseTotal', centsToMoney(expense));
+      setText('balanceTotal', centsToMoney(income - expense));
+      setText('fixedTotal', centsToMoney(fixed));
+      setText('variableTotal', centsToMoney(variable));
+      setText('ticketCoverage', String(coverage) + '%');
+      setText('pendingCount', String(pending));
+    }
+    function renderAlerts(rows) {
+      const list = document.getElementById('alertsList');
+      const alerts = [];
+      const income = sum(rows.filter(function(row) { return row.kind === 'income'; }), function(row) { return row.amountCents; });
+      const expense = sum(expenseRows(rows), function(row) { return row.amountCents; });
+      const pending = receipts.filter(function(row) { return ['nuevo', 'pending', 'voice_pending', 'dudoso'].includes(row.status); });
+      const missing = receipts.filter(function(row) { return row.status === 'missing'; });
+      const withoutTicket = rows.filter(function(row) { return !row.hasReceipt; });
+      const fixed = sum(expenseRows(rows).filter(function(row) { return row.isFixed; }), function(row) { return row.amountCents; });
+      const categories = totalsBy(expenseRows(rows), 'category');
+      const topCategory = categories[0];
+      if (pending.length) alerts.push({tone: 'warn', text: pending.length + ' ticket(s) o audio(s) necesitan revisión.'});
+      if (missing.length) alerts.push({tone: 'danger', text: missing.length + ' archivo(s) faltan en la carpeta sincronizada.'});
+      if (income - expense < 0) alerts.push({tone: 'danger', text: 'El balance filtrado está en negativo: ' + centsToMoney(income - expense) + '.'});
+      if (withoutTicket.length) alerts.push({tone: 'warn', text: withoutTicket.length + ' movimiento(s) no tienen ticket enlazado.'});
+      if (topCategory) alerts.push({tone: '', text: 'Mayor gasto por categoría: ' + topCategory.key + ' con ' + centsToMoney(topCategory.value) + '.'});
+      if (fixed) alerts.push({tone: '', text: 'Gastos fijos filtrados: ' + centsToMoney(fixed) + '.'});
+      if (!alerts.length) alerts.push({tone: '', text: 'Todo limpio: sin pendientes visibles en este filtro.'});
+      list.innerHTML = alerts.map(function(item) {
+        return '<div class="notice ' + item.tone + '">' + escapeHtml(item.text) + '</div>';
+      }).join('');
+    }
+    function totalsBy(rows, key) {
+      const map = new Map();
+      rows.forEach(function(row) {
+        const label = row[key] || 'Sin dato';
+        map.set(label, (map.get(label) || 0) + row.amountCents);
+      });
+      return Array.from(map.entries()).map(function(entry) {
+        return {key: entry[0], value: entry[1]};
+      }).sort(function(a, b) { return b.value - a.value; });
+    }
+    function renderStoreRanking(rows) {
+      const list = document.getElementById('storeRanking');
+      const data = totalsBy(expenseRows(rows).filter(function(row) { return row.store; }), 'store').slice(0, 8);
+      if (!data.length) {
+        list.innerHTML = '<div class="muted">Sin tiendas en este filtro.</div>';
+        return;
+      }
+      list.innerHTML = data.map(function(item, index) {
+        return '<div class="notice"><strong>' + (index + 1) + '. ' + escapeHtml(item.key) + '</strong><br><span class="expense">' + centsToMoney(item.value) + '</span></div>';
+      }).join('');
+    }
+    function renderTable(rows) {
+      const body = document.getElementById('transactionsBody');
+      if (!rows.length) {
+        body.innerHTML = '<tr><td colspan="11" class="muted">No hay movimientos para los filtros seleccionados.</td></tr>';
+        return;
+      }
+      body.innerHTML = rows.slice().reverse().map(function(row) {
+        const source = row.receiptUrl ? '<a href="' + row.receiptUrl + '">Abrir</a>' : '<span class="muted">Sin ticket</span>';
+        const action = '<button class="linkish" type="button" data-edit-id="' + row.id + '">Editar</button>';
+        return '<tr>' +
+          '<td>' + escapeHtml(row.monthName) + '</td>' +
+          '<td>' + escapeHtml(row.date) + '</td>' +
+          '<td class="description">' + escapeHtml(row.description) + '</td>' +
+          '<td>' + escapeHtml(row.category) + '</td>' +
+          '<td class="amount ' + (row.kind === 'income' ? 'income' : 'expense') + '">' + escapeHtml(row.amount) + '</td>' +
+          '<td>' + escapeHtml(row.type) + '</td>' +
+          '<td>' + escapeHtml(row.store) + '</td>' +
+          '<td>' + escapeHtml(row.user) + '</td>' +
+          '<td>' + escapeHtml(row.fixed) + '</td>' +
+          '<td>' + source + '</td>' +
+          '<td>' + action + '</td>' +
+        '</tr>';
+      }).join('');
+    }
+    function getTransactionById(id) {
+      return transactions.find(function(row) { return String(row.id) === String(id); });
+    }
+    function amountInput(row) {
+      return (row.amountCents / 100).toFixed(2).replace('.', ',');
+    }
+    function showEditError(message) {
+      const error = document.getElementById('editError');
+      error.textContent = message;
+      error.hidden = !message;
+    }
+    function openEditModal(row) {
+      if (!editable) {
+        alert('Para editar abre el panel local con: python scripts/serve_dashboard.py');
+        return;
+      }
+      showEditError('');
+      document.getElementById('editId').value = row.id;
+      document.getElementById('editDate').value = row.dateIso;
+      document.getElementById('editAmount').value = amountInput(row);
+      document.getElementById('editDescription').value = row.description || '';
+      document.getElementById('editCategory').value = row.category || '';
+      document.getElementById('editKind').value = row.kind;
+      document.getElementById('editStore').value = row.store || '';
+      document.getElementById('editFixed').value = row.isFixed ? 'true' : 'false';
+      document.getElementById('editModal').hidden = false;
+      document.getElementById('editDescription').focus();
+    }
+    function closeEditModal() {
+      document.getElementById('editModal').hidden = true;
+      showEditError('');
+    }
+    async function submitEdit(event) {
+      event.preventDefault();
+      const id = document.getElementById('editId').value;
+      const payload = {
+        date: document.getElementById('editDate').value,
+        amount: document.getElementById('editAmount').value,
+        description: document.getElementById('editDescription').value,
+        category: document.getElementById('editCategory').value,
+        kind: document.getElementById('editKind').value,
+        store: document.getElementById('editStore').value,
+        isFixed: document.getElementById('editFixed').value === 'true'
+      };
+      try {
+        const response = await fetch('/api/transactions/' + encodeURIComponent(id), {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify(payload)
+        });
+        const result = await response.json().catch(function() { return {}; });
+        if (!response.ok || !result.ok) {
+          throw new Error(result.error || 'No se pudo guardar el movimiento.');
+        }
+        window.location.reload();
+      } catch (error) {
+        showEditError(error.message || 'No se pudo guardar el movimiento.');
+      }
+    }
+    function projectionRowsForMonth(month) {
+      return projections.rows.filter(function(row) { return row.month === month && row.status !== 'skipped'; });
+    }
+    function projectionSummaryForMonth(month) {
+      return projections.months.find(function(row) { return row.monthKey === month; }) || null;
+    }
+    function getProjectionRow(templateId, month) {
+      return projections.rows.find(function(row) {
+        return String(row.templateId) === String(templateId) && row.month === month;
+      });
+    }
+    function renderProjection() {
+      const month = projectionMonth.value || (projections.months[0] && projections.months[0].monthKey) || '';
+      const summary = projectionSummaryForMonth(month);
+      const body = document.getElementById('projectionBody');
+      if (!summary) {
+        body.innerHTML = '<tr><td colspan="9" class="muted">Aun no hay proyecciones cargadas.</td></tr>';
+        return;
+      }
+      setText('projectionIncome', summary.projectedIncome);
+      setText('projectionExpense', summary.projectedExpense);
+      setText('projectionBalance', summary.projectedBalance);
+      setText('projectionCompletedIncome', summary.completedIncome);
+      setText('projectionCompletedExpense', summary.completedExpense);
+      setText('projectionActualBalance', summary.actualBalance);
+
+      const rows = projectionRowsForMonth(month);
+      if (!rows.length) {
+        body.innerHTML = '<tr><td colspan="9" class="muted">No hay proyecciones para este mes.</td></tr>';
+        return;
+      }
+      body.innerHTML = rows.map(function(row) {
+        const amountClass = row.kind === 'income' ? 'income' : 'expense';
+        const statusClass = 'status-' + row.status;
+        const action = '<button class="linkish" type="button" data-projection-id="' + row.templateId + '" data-projection-month="' + row.month + '">Editar</button> ' +
+          '<button class="linkish" type="button" data-delete-projection-id="' + row.templateId + '" data-projection-month="' + row.month + '">Borrar</button>';
+        return '<tr>' +
+          '<td class="description">' + escapeHtml(row.name) + '</td>' +
+          '<td>' + escapeHtml(row.type) + '</td>' +
+          '<td>' + escapeHtml(row.category) + '</td>' +
+          '<td>' + escapeHtml(row.installmentLabel) + '</td>' +
+          '<td>' + escapeHtml(row.remainingLabel) + '</td>' +
+          '<td class="amount ' + amountClass + '">' + escapeHtml(row.amount) + '</td>' +
+          '<td class="' + statusClass + '">' + escapeHtml(row.statusLabel) + '</td>' +
+          '<td class="description">' + escapeHtml(row.note) + '</td>' +
+          '<td>' + action + '</td>' +
+        '</tr>';
+      }).join('');
+    }
+    function showProjectionError(message) {
+      const error = document.getElementById('projectionError');
+      error.textContent = message;
+      error.hidden = !message;
+    }
+    function openProjectionModal(row) {
+      if (!editable) {
+        alert('Para editar abre el panel local con: python scripts/serve_dashboard.py');
+        return;
+      }
+      showProjectionError('');
+      document.getElementById('projectionTemplateId').value = row.templateId;
+      document.getElementById('projectionEditMonth').value = row.month;
+      document.getElementById('projectionName').value = row.name || '';
+      document.getElementById('projectionKind').value = row.kind || 'expense';
+      document.getElementById('projectionCategory').value = row.category || '';
+      document.getElementById('projectionAmount').value = amountInput(row);
+      document.getElementById('projectionStatus').value = row.status;
+      document.getElementById('projectionDuration').value = row.installmentTotal ? (row.installmentTotal === 1 ? 'once' : 'installments') : 'monthly';
+      document.getElementById('projectionInstallmentCurrent').value = row.installmentCurrent || '';
+      document.getElementById('projectionInstallmentTotal').value = row.installmentTotal || '';
+      document.getElementById('projectionUpdateDefault').value = 'false';
+      document.getElementById('projectionNote').value = row.note || '';
+      document.getElementById('projectionModal').hidden = false;
+      document.getElementById('projectionAmount').focus();
+    }
+    function openNewProjectionModal() {
+      if (!editable) {
+        alert('Para editar abre el panel local con: python scripts/serve_dashboard.py');
+        return;
+      }
+      const month = projectionMonth.value || (projections.months[0] && projections.months[0].monthKey) || '';
+      showProjectionError('');
+      document.getElementById('projectionTemplateId').value = 'new';
+      document.getElementById('projectionEditMonth').value = month;
+      document.getElementById('projectionName').value = '';
+      document.getElementById('projectionKind').value = 'expense';
+      document.getElementById('projectionCategory').value = 'Hogar';
+      document.getElementById('projectionAmount').value = '';
+      document.getElementById('projectionStatus').value = 'pending';
+      document.getElementById('projectionDuration').value = 'monthly';
+      document.getElementById('projectionInstallmentCurrent').value = '';
+      document.getElementById('projectionInstallmentTotal').value = '';
+      document.getElementById('projectionUpdateDefault').value = 'true';
+      document.getElementById('projectionNote').value = '';
+      document.getElementById('projectionModal').hidden = false;
+      document.getElementById('projectionName').focus();
+    }
+    function closeProjectionModal() {
+      document.getElementById('projectionModal').hidden = true;
+      showProjectionError('');
+    }
+    async function submitProjectionEdit(event) {
+      event.preventDefault();
+      const id = document.getElementById('projectionTemplateId').value;
+      const month = document.getElementById('projectionEditMonth').value;
+      const payload = {
+        name: document.getElementById('projectionName').value,
+        kind: document.getElementById('projectionKind').value,
+        category: document.getElementById('projectionCategory').value,
+        amount: document.getElementById('projectionAmount').value,
+        status: document.getElementById('projectionStatus').value,
+        duration: document.getElementById('projectionDuration').value,
+        installmentCurrent: document.getElementById('projectionInstallmentCurrent').value,
+        installmentTotal: document.getElementById('projectionInstallmentTotal').value,
+        updateDefault: document.getElementById('projectionUpdateDefault').value === 'true',
+        note: document.getElementById('projectionNote').value,
+        month: month
+      };
+      try {
+        const url = id === 'new'
+          ? '/api/projections'
+          : '/api/projections/' + encodeURIComponent(id) + '/' + encodeURIComponent(month);
+        const response = await fetch(url, {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify(payload)
+        });
+        const result = await response.json().catch(function() { return {}; });
+        if (!response.ok || !result.ok) {
+          throw new Error(result.error || 'No se pudo guardar la proyeccion.');
+        }
+        window.location.reload();
+      } catch (error) {
+        showProjectionError(error.message || 'No se pudo guardar la proyeccion.');
+      }
+    }
+    async function deleteProjectionItem(templateId, month) {
+      if (!editable) {
+        alert('Para editar abre el panel local con: python scripts/serve_dashboard.py');
+        return;
+      }
+      if (!confirm('Borrar este item solo del mes seleccionado?')) return;
+      const response = await fetch('/api/projections/' + encodeURIComponent(templateId) + '/' + encodeURIComponent(month), {
+        method: 'DELETE'
+      });
+      const result = await response.json().catch(function() { return {}; });
+      if (!response.ok || !result.ok) {
+        alert(result.error || 'No se pudo borrar el item.');
+        return;
+      }
+      window.location.reload();
+    }
+    function chartBase(canvas) {
+      const rect = canvas.getBoundingClientRect();
+      const ratio = window.devicePixelRatio || 1;
+      canvas.width = Math.max(300, Math.floor(rect.width * ratio));
+      canvas.height = Math.max(200, Math.floor(rect.height * ratio));
+      const ctx = canvas.getContext('2d');
+      ctx.setTransform(ratio, 0, 0, ratio, 0, 0);
+      ctx.clearRect(0, 0, rect.width, rect.height);
+      return {ctx: ctx, width: rect.width, height: rect.height};
+    }
+    function drawMonthlyChart(rows) {
+      const canvas = document.getElementById('monthlyChart');
+      const base = chartBase(canvas);
+      const months = unique(transactions.map(function(row) { return row.monthKey; }));
+      const data = months.map(function(month) {
+        const monthRows = rows.filter(function(row) { return row.monthKey === month; });
+        return {
+          label: month,
+          income: sum(monthRows.filter(function(row) { return row.kind === 'income'; }), function(row) { return row.amountCents; }),
+          expense: sum(expenseRows(monthRows), function(row) { return row.amountCents; })
+        };
+      });
+      drawGroupedBars(base.ctx, base.width, base.height, data);
+    }
+    function drawCategoryChart(rows) {
+      const canvas = document.getElementById('categoryChart');
+      const base = chartBase(canvas);
+      drawHorizontalBars(base.ctx, base.width, base.height, totalsBy(expenseRows(rows), 'category').slice(0, 8));
+    }
+    function drawGroupedBars(ctx, width, height, data) {
+      const pad = {left: 48, right: 16, top: 18, bottom: 44};
+      const innerW = width - pad.left - pad.right;
+      const innerH = height - pad.top - pad.bottom;
+      const max = Math.max(1, ...data.flatMap(function(row) { return [row.income, row.expense]; }));
+      ctx.strokeStyle = '#dce4dd';
+      ctx.fillStyle = '#60706a';
+      ctx.font = '12px system-ui';
+      ctx.beginPath();
+      ctx.moveTo(pad.left, pad.top);
+      ctx.lineTo(pad.left, pad.top + innerH);
+      ctx.lineTo(pad.left + innerW, pad.top + innerH);
+      ctx.stroke();
+      if (!data.length) { ctx.fillText('Sin datos', pad.left + 10, pad.top + 24); return; }
+      const groupW = innerW / data.length;
+      data.forEach(function(row, index) {
+        [['income', '#1f7a5a'], ['expense', '#b34545']].forEach(function(item, seriesIndex) {
+          const value = row[item[0]];
+          const barH = (value / max) * innerH;
+          const x = pad.left + index * groupW + 10 + seriesIndex * 18;
+          const y = pad.top + innerH - barH;
+          ctx.fillStyle = item[1];
+          ctx.fillRect(x, y, 14, barH);
+        });
+        ctx.fillStyle = '#60706a';
+        ctx.save();
+        ctx.translate(pad.left + index * groupW + groupW / 2, pad.top + innerH + 14);
+        ctx.rotate(-0.45);
+        ctx.fillText(row.label, 0, 0);
+        ctx.restore();
+      });
+    }
+    function drawHorizontalBars(ctx, width, height, data) {
+      const pad = {left: 130, right: 28, top: 18, bottom: 18};
+      const innerW = width - pad.left - pad.right;
+      const rowH = Math.max(24, (height - pad.top - pad.bottom) / Math.max(1, data.length));
+      const max = Math.max(1, ...data.map(function(row) { return row.value; }));
+      ctx.font = '12px system-ui';
+      if (!data.length) { ctx.fillStyle = '#60706a'; ctx.fillText('Sin egresos', 12, 28); return; }
+      data.forEach(function(row, index) {
+        const y = pad.top + index * rowH;
+        const barW = (row.value / max) * innerW;
+        ctx.fillStyle = '#60706a';
+        ctx.fillText(row.key, 10, y + 16);
+        ctx.fillStyle = '#2c6387';
+        ctx.fillRect(pad.left, y + 3, barW, Math.max(12, rowH - 10));
+        ctx.fillStyle = '#17211d';
+        ctx.fillText(centsToMoney(row.value), pad.left + barW + 6, y + 16);
+      });
+    }
+    function renderReceipts() {
+      const list = document.getElementById('receiptList');
+      if (!receipts.length) {
+        list.innerHTML = '<div class="muted">Aun no hay archivos recibidos.</div>';
+        return;
+      }
+      list.innerHTML = receipts.slice().reverse().map(function(row) {
+        const link = row.url ? '<a href="' + row.url + '">Abrir archivo</a>' : '<span class="muted">Sin enlace</span>';
+        return '<div class="receipt-item">' +
+          '<strong>#' + row.id + ' <span class="pill">' + escapeHtml(row.status) + '</span> · ' + escapeHtml(row.user) + ' · ' + escapeHtml(row.date) + '</strong>' +
+          '<div>' + link + ' <span class="muted">' + escapeHtml(row.path) + '</span></div>' +
+          (row.caption ? '<div>' + escapeHtml(row.caption) + '</div>' : '') +
+          (row.reviewNotes ? '<div class="muted">' + escapeHtml(row.reviewNotes) + '</div>' : '') +
+        '</div>';
+      }).join('');
+    }
+    function render() {
+      const rows = filteredTransactions();
+      renderSummary(rows);
+      renderAlerts(rows);
+      renderStoreRanking(rows);
+      renderTable(rows);
+      drawMonthlyChart(rows);
+      drawCategoryChart(rows);
+      renderReceipts();
+    }
+    Object.values(filters).forEach(function(control) { control.addEventListener('input', render); });
+    document.getElementById('resetFilters').addEventListener('click', function() {
+      Object.values(filters).forEach(function(control) { control.value = ''; });
+      render();
+    });
+    document.getElementById('transactionsBody').addEventListener('click', function(event) {
+      const button = event.target.closest('[data-edit-id]');
+      if (!button) return;
+      const row = getTransactionById(button.getAttribute('data-edit-id'));
+      if (row) openEditModal(row);
+    });
+    document.getElementById('cancelEdit').addEventListener('click', closeEditModal);
+    document.getElementById('editModal').addEventListener('click', function(event) {
+      if (event.target.id === 'editModal') closeEditModal();
+    });
+    document.getElementById('editForm').addEventListener('submit', submitEdit);
+    document.querySelectorAll('.tab-button').forEach(function(button) {
+      button.addEventListener('click', function() {
+        showTab(button.getAttribute('data-tab') || 'dashboard');
+      });
+    });
+    projectionMonth.addEventListener('input', renderProjection);
+    document.getElementById('addProjection').addEventListener('click', openNewProjectionModal);
+    document.getElementById('projectionBody').addEventListener('click', function(event) {
+      const deleteButton = event.target.closest('[data-delete-projection-id]');
+      if (deleteButton) {
+        deleteProjectionItem(
+          deleteButton.getAttribute('data-delete-projection-id'),
+          deleteButton.getAttribute('data-projection-month')
+        );
+        return;
+      }
+      const button = event.target.closest('[data-projection-id]');
+      if (!button) return;
+      const row = getProjectionRow(
+        button.getAttribute('data-projection-id'),
+        button.getAttribute('data-projection-month')
+      );
+      if (row) openProjectionModal(row);
+    });
+    document.getElementById('cancelProjectionEdit').addEventListener('click', closeProjectionModal);
+    document.getElementById('projectionModal').addEventListener('click', function(event) {
+      if (event.target.id === 'projectionModal') closeProjectionModal();
+    });
+    document.getElementById('projectionForm').addEventListener('submit', submitProjectionEdit);
+    window.addEventListener('resize', render);
+    initFilters();
+    initEditForm();
+    initProjectionMonths();
+    initProjectionForm();
+    render();
+    renderProjection();
+  </script>
+</body>
+</html>
+"""
+    )
+    return template.safe_substitute(
+        title=escape("Reporte de finanzas"),
+        refresh_meta="" if editable else '<meta http-equiv="refresh" content="60">',
+        generated_at=escape(generated_at),
+        edit_hint=(
+            '<p>Modo edición activado. Pulsa Editar en cualquier movimiento para corregirlo.</p>'
+            if editable
+            else '<p class="muted">Este archivo es de lectura. Para editar, abre el panel local con: python scripts/serve_dashboard.py</p>'
+        ),
+        db_path=escape(db_path),
+        transactions_json=json.dumps(transactions, ensure_ascii=False),
+        receipts_json=json.dumps(receipts, ensure_ascii=False),
+        projections_json=json.dumps(projections, ensure_ascii=False),
+        editable_json=json.dumps(editable),
+        valid_categories_json=json.dumps(valid_categories, ensure_ascii=False),
+    )
