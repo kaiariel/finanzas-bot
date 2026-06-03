@@ -406,6 +406,29 @@ def _render_html(
       gap: 10px;
       padding: 12px;
     }
+    .analytics-tools {
+      display: grid;
+      grid-template-columns: minmax(180px, 260px) 1fr;
+      gap: 12px;
+      align-items: end;
+      padding: 12px;
+      border-bottom: 1px solid var(--line);
+    }
+    .analytics-grid {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+      gap: 14px;
+      margin-top: 14px;
+    }
+    .analytics-panel[hidden] { display: none; }
+    .recommendation-title {
+      display: block;
+      margin-bottom: 4px;
+      font-weight: 800;
+    }
+    .score-good { color: var(--accent); }
+    .score-warn { color: var(--warn); }
+    .score-danger { color: var(--danger); }
     .card, .panel {
       background: var(--panel);
       border: 1px solid var(--line);
@@ -538,7 +561,7 @@ def _render_html(
     a { color: var(--accent-2); font-weight: 700; text-decoration: none; }
     a:hover { text-decoration: underline; }
     @media (max-width: 1100px) {
-      .filters, .cards, .projection-tools, .projection-cards, .grid { grid-template-columns: 1fr; }
+      .filters, .cards, .projection-tools, .projection-cards, .analytics-tools, .analytics-grid, .grid { grid-template-columns: 1fr; }
       .chart-wrap { height: 240px; }
       .modal form { grid-template-columns: 1fr; }
     }
@@ -554,6 +577,7 @@ def _render_html(
     <nav class="tabs" aria-label="Pestanas del panel">
       <button class="tab-button active" type="button" data-tab="dashboard">Panel inicial</button>
       <button class="tab-button" type="button" data-tab="projection">Proyeccion</button>
+      <button class="tab-button" type="button" data-tab="analytics">Analisis Codex</button>
     </nav>
 
     <section class="filters dashboard-panel" aria-label="Filtros">
@@ -603,6 +627,50 @@ def _render_html(
           <tbody id="projectionBody"></tbody>
         </table>
       </div>
+    </section>
+
+    <section id="analyticsPanel" class="analytics-panel" hidden>
+      <section class="panel">
+        <h2>Analisis Codex</h2>
+        <div class="analytics-tools">
+          <label>Mes analizado<select id="analyticsMonth"></select></label>
+          <div class="muted">Lectura local de movimientos, tickets y proyecciones. No sustituye asesoria financiera.</div>
+        </div>
+        <div class="projection-cards" aria-label="Resumen de analisis">
+          <div class="card"><span>Score del mes</span><strong id="analyticsScore">0/100</strong></div>
+          <div class="card"><span>Balance proyectado</span><strong id="analyticsProjectedBalance">0,00 EUR</strong></div>
+          <div class="card"><span>Margen libre</span><strong id="analyticsSafetyMargin">0%</strong></div>
+          <div class="card"><span>Fijos / ingresos</span><strong id="analyticsFixedRatio">0%</strong></div>
+          <div class="card"><span>Mayor gasto real</span><strong id="analyticsTopExpense">Sin datos</strong></div>
+          <div class="card"><span>Meses en riesgo</span><strong id="analyticsRiskMonths">0</strong></div>
+        </div>
+      </section>
+
+      <section class="analytics-grid">
+        <div class="panel">
+          <h2>Diagnostico del mes</h2>
+          <div id="analyticsNarrative" class="list"></div>
+        </div>
+        <div class="panel">
+          <h2>Recomendaciones</h2>
+          <div id="analyticsRecommendations" class="list"></div>
+        </div>
+      </section>
+
+      <section class="panel" style="margin-top: 14px;">
+        <h2>Lectura de los proximos meses</h2>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>Mes</th><th class="amount">Ingresos</th><th class="amount">Gastos</th>
+                <th class="amount">Balance</th><th>Lectura Codex</th>
+              </tr>
+            </thead>
+            <tbody id="analyticsFutureBody"></tbody>
+          </table>
+        </div>
+      </section>
     </section>
 
     <section class="grid dashboard-panel">
@@ -715,6 +783,7 @@ def _render_html(
       search: document.getElementById('searchFilter')
     };
     const projectionMonth = document.getElementById('projectionMonth');
+    const analyticsMonth = document.getElementById('analyticsMonth');
 
     function unique(values) {
       return Array.from(new Set(values.filter(Boolean))).sort(function(a, b) {
@@ -764,23 +833,28 @@ def _render_html(
     }
     function initProjectionMonths() {
       projectionMonth.innerHTML = '';
+      analyticsMonth.innerHTML = '';
       projections.months.forEach(function(month) {
         const option = document.createElement('option');
         option.value = month.monthKey;
         option.textContent = month.monthName + ' ' + month.monthKey.slice(0, 4);
         projectionMonth.appendChild(option);
+        analyticsMonth.appendChild(option.cloneNode(true));
       });
     }
     function showTab(tabName) {
       const showProjection = tabName === 'projection';
+      const showAnalytics = tabName === 'analytics';
       document.querySelectorAll('.dashboard-panel').forEach(function(section) {
-        section.hidden = showProjection;
+        section.hidden = showProjection || showAnalytics;
       });
       document.getElementById('projectionPanel').hidden = !showProjection;
+      document.getElementById('analyticsPanel').hidden = !showAnalytics;
       document.querySelectorAll('.tab-button').forEach(function(button) {
         button.classList.toggle('active', button.getAttribute('data-tab') === tabName);
       });
       if (showProjection) renderProjection();
+      if (showAnalytics) renderAnalytics();
     }
     function filteredTransactions() {
       const search = filters.search.value.trim().toLowerCase();
@@ -999,6 +1073,223 @@ def _render_html(
           '<td class="' + statusClass + '">' + escapeHtml(row.statusLabel) + '</td>' +
           '<td class="description">' + escapeHtml(row.note) + '</td>' +
           '<td>' + action + '</td>' +
+        '</tr>';
+      }).join('');
+    }
+    function monthRows(month) {
+      return transactions.filter(function(row) { return row.monthKey === month; });
+    }
+    function ratioText(numerator, denominator) {
+      if (!denominator) return '0%';
+      return Math.round((numerator / denominator) * 100) + '%';
+    }
+    function currentMonthAnalysis(month) {
+      const actualRows = monthRows(month);
+      const expense = sum(expenseRows(actualRows), function(row) { return row.amountCents; });
+      const income = sum(actualRows.filter(function(row) { return row.kind === 'income'; }), function(row) { return row.amountCents; });
+      const fixed = sum(expenseRows(actualRows).filter(function(row) { return row.isFixed; }), function(row) { return row.amountCents; });
+      const variable = expense - fixed;
+      const categories = totalsBy(expenseRows(actualRows), 'category');
+      const stores = totalsBy(expenseRows(actualRows).filter(function(row) { return row.store; }), 'store');
+      const summary = projectionSummaryForMonth(month) || {
+        monthKey: month,
+        monthName: month,
+        projectedIncomeCents: income,
+        projectedExpenseCents: expense,
+        projectedBalanceCents: income - expense,
+        actualIncomeCents: income,
+        actualExpenseCents: expense,
+        actualBalanceCents: income - expense
+      };
+      return {
+        month: month,
+        rows: actualRows,
+        income: income,
+        expense: expense,
+        fixed: fixed,
+        variable: variable,
+        topCategory: categories[0] || null,
+        topStore: stores[0] || null,
+        summary: summary
+      };
+    }
+    function futureRiskMonths() {
+      return projections.months.filter(function(month) {
+        const income = month.projectedIncomeCents || 0;
+        const balance = month.projectedBalanceCents || 0;
+        return balance < 0 || (income > 0 && balance < income * 0.08);
+      });
+    }
+    function nearFinishedInstallments(month) {
+      return projectionRowsForMonth(month).filter(function(row) {
+        return row.kind === 'expense' && row.remainingInstallments != null && row.remainingInstallments >= 0 && row.remainingInstallments <= 2;
+      });
+    }
+    function recommendationHtml(item) {
+      return '<div class="notice ' + (item.tone || '') + '">' +
+        '<span class="recommendation-title">' + escapeHtml(item.title) + '</span>' +
+        escapeHtml(item.text) +
+      '</div>';
+    }
+    function renderAnalytics() {
+      const month = analyticsMonth.value || (projections.months[0] && projections.months[0].monthKey) || '';
+      if (!month) {
+        document.getElementById('analyticsNarrative').innerHTML = '<div class="muted">Aun no hay datos para analizar.</div>';
+        document.getElementById('analyticsRecommendations').innerHTML = '<div class="muted">Carga movimientos o proyecciones para generar recomendaciones.</div>';
+        document.getElementById('analyticsFutureBody').innerHTML = '<tr><td colspan="5" class="muted">Sin proyecciones.</td></tr>';
+        return;
+      }
+
+      const analysis = currentMonthAnalysis(month);
+      const summary = analysis.summary;
+      const projectedIncome = summary.projectedIncomeCents || 0;
+      const projectedExpense = summary.projectedExpenseCents || 0;
+      const projectedBalance = summary.projectedBalanceCents || 0;
+      const fixedRatio = projectedIncome ? analysis.fixed / projectedIncome : 0;
+      const marginRatio = projectedIncome ? projectedBalance / projectedIncome : 0;
+      const pendingReceipts = receipts.filter(function(row) {
+        return ['nuevo', 'pending', 'voice_pending', 'dudoso'].includes(row.status);
+      });
+      const clientAdvances = sum(expenseRows(analysis.rows).filter(function(row) {
+        return row.category === 'Ingresos clientes';
+      }), function(row) { return row.amountCents; });
+      const clientIncome = sum(analysis.rows.filter(function(row) {
+        return row.kind === 'income' && row.category === 'Ingresos clientes';
+      }), function(row) { return row.amountCents; });
+      const riskyMonths = futureRiskMonths();
+      const endingInstallments = nearFinishedInstallments(month);
+
+      let score = 100;
+      if (projectedBalance < 0) score -= 35;
+      else if (marginRatio < 0.08) score -= 18;
+      else if (marginRatio < 0.15) score -= 8;
+      if (fixedRatio > 0.7) score -= 22;
+      else if (fixedRatio > 0.5) score -= 10;
+      if (pendingReceipts.length) score -= Math.min(12, pendingReceipts.length * 4);
+      if (analysis.topCategory && projectedIncome && analysis.topCategory.value > projectedIncome * 0.25) score -= 8;
+      if (riskyMonths.length) score -= Math.min(16, riskyMonths.length * 4);
+      score = Math.max(0, Math.min(100, Math.round(score)));
+
+      const scoreNode = document.getElementById('analyticsScore');
+      scoreNode.textContent = score + '/100';
+      scoreNode.className = score >= 75 ? 'score-good' : (score >= 50 ? 'score-warn' : 'score-danger');
+      setText('analyticsProjectedBalance', centsToMoney(projectedBalance));
+      setText('analyticsSafetyMargin', ratioText(projectedBalance, projectedIncome));
+      setText('analyticsFixedRatio', ratioText(analysis.fixed, projectedIncome));
+      setText('analyticsTopExpense', analysis.topCategory ? analysis.topCategory.key + ' ' + centsToMoney(analysis.topCategory.value) : 'Sin datos');
+      setText('analyticsRiskMonths', String(riskyMonths.length));
+
+      const narrative = [];
+      narrative.push({
+        tone: projectedBalance < 0 ? 'danger' : (marginRatio < 0.08 ? 'warn' : ''),
+        title: 'Balance esperado',
+        text: 'Para este mes el balance proyectado es ' + centsToMoney(projectedBalance) + ' sobre ingresos de ' + centsToMoney(projectedIncome) + '.'
+      });
+      narrative.push({
+        tone: fixedRatio > 0.7 ? 'danger' : (fixedRatio > 0.5 ? 'warn' : ''),
+        title: 'Peso de gastos fijos',
+        text: 'Los gastos fijos registrados representan ' + ratioText(analysis.fixed, projectedIncome) + ' de los ingresos proyectados del mes.'
+      });
+      if (analysis.topCategory) {
+        narrative.push({
+          tone: '',
+          title: 'Concentracion de gasto',
+          text: 'La categoria con mas gasto real es ' + analysis.topCategory.key + ' con ' + centsToMoney(analysis.topCategory.value) + '.'
+        });
+      }
+      if (analysis.topStore) {
+        narrative.push({
+          tone: '',
+          title: 'Tienda principal',
+          text: 'La tienda con mayor gasto real es ' + analysis.topStore.key + ' con ' + centsToMoney(analysis.topStore.value) + '.'
+        });
+      }
+      if (!analysis.rows.length) {
+        narrative.push({
+          tone: 'warn',
+          title: 'Sin movimientos reales',
+          text: 'No hay movimientos registrados para este mes; el analisis se apoya solo en la proyeccion.'
+        });
+      }
+      document.getElementById('analyticsNarrative').innerHTML = narrative.map(recommendationHtml).join('');
+
+      const recommendations = [];
+      if (projectedBalance < 0) {
+        recommendations.push({
+          tone: 'danger',
+          title: 'Prioridad: cerrar el deficit',
+          text: 'Antes de asumir nuevos gastos, reduce o aplaza al menos ' + centsToMoney(Math.abs(projectedBalance)) + ' para dejar el mes en cero.'
+        });
+      } else if (marginRatio < 0.08) {
+        recommendations.push({
+          tone: 'warn',
+          title: 'Margen demasiado justo',
+          text: 'Intenta reservar un colchon minimo del 8-10% de ingresos. Para este mes eso seria acercarte a ' + centsToMoney(Math.round(projectedIncome * 0.1)) + ' libres.'
+        });
+      } else {
+        recommendations.push({
+          tone: '',
+          title: 'Aprovecha el margen',
+          text: 'Si el mes se mantiene asi, separa una parte del balance positivo para ahorro, deuda o gastos futuros antes de aumentar ocio o compras variables.'
+        });
+      }
+      if (fixedRatio > 0.5) {
+        recommendations.push({
+          tone: fixedRatio > 0.7 ? 'danger' : 'warn',
+          title: 'Audita gastos fijos',
+          text: 'Los fijos pesan mucho. Revisa suscripciones, deudas y servicios recurrentes; cada baja ahi mejora todos los meses siguientes.'
+        });
+      }
+      if (analysis.topCategory && analysis.topCategory.value > Math.max(analysis.variable * 0.35, projectedIncome * 0.12)) {
+        recommendations.push({
+          tone: 'warn',
+          title: 'Controla ' + analysis.topCategory.key,
+          text: 'Esa categoria concentra bastante gasto. Ponle un limite semanal y revisala antes de registrar nuevas compras similares.'
+        });
+      }
+      if (pendingReceipts.length) {
+        recommendations.push({
+          tone: 'warn',
+          title: 'Procesa pendientes',
+          text: 'Hay ' + pendingReceipts.length + ' ticket(s) o audio(s) pendientes. Registrarlos puede cambiar el balance y evitar decisiones con datos incompletos.'
+        });
+      }
+      if (clientAdvances > clientIncome) {
+        recommendations.push({
+          tone: 'warn',
+          title: 'Reembolsos de clientes',
+          text: 'Este mes hay ' + centsToMoney(clientAdvances - clientIncome) + ' mas en adelantos a clientes que en cobros de esa categoria. Conviene reclamar o separar seguimiento.'
+        });
+      }
+      if (endingInstallments.length) {
+        recommendations.push({
+          tone: '',
+          title: 'Cuotas cerca de terminar',
+          text: endingInstallments.length + ' cuota(s) estan cerca de acabar. Cuando terminen, redirige ese importe a ahorro o a bajar deuda en vez de absorberlo como gasto nuevo.'
+        });
+      }
+      if (riskyMonths.length) {
+        recommendations.push({
+          tone: 'warn',
+          title: 'Mira los proximos meses',
+          text: 'Hay ' + riskyMonths.length + ' mes(es) con deficit o margen bajo. Revisa especialmente ' + riskyMonths.slice(0, 3).map(function(row) { return row.monthName; }).join(', ') + '.'
+        });
+      }
+      document.getElementById('analyticsRecommendations').innerHTML = recommendations.map(recommendationHtml).join('');
+
+      document.getElementById('analyticsFutureBody').innerHTML = projections.months.slice(0, 6).map(function(row) {
+        const balance = row.projectedBalanceCents || 0;
+        const income = row.projectedIncomeCents || 0;
+        const tone = balance < 0 ? 'danger' : (income > 0 && balance < income * 0.08 ? 'warn' : '');
+        const label = balance < 0
+          ? 'Riesgo: deficit proyectado'
+          : (income > 0 && balance < income * 0.08 ? 'Margen bajo' : 'Saludable si se cumple la proyeccion');
+        return '<tr>' +
+          '<td>' + escapeHtml(row.monthName) + '</td>' +
+          '<td class="amount income">' + escapeHtml(row.projectedIncome) + '</td>' +
+          '<td class="amount expense">' + escapeHtml(row.projectedExpense) + '</td>' +
+          '<td class="amount ' + (balance >= 0 ? 'income' : 'expense') + '">' + escapeHtml(row.projectedBalance) + '</td>' +
+          '<td><span class="notice ' + tone + '">' + escapeHtml(label) + '</span></td>' +
         '</tr>';
       }).join('');
     }
@@ -1232,6 +1523,7 @@ def _render_html(
       });
     });
     projectionMonth.addEventListener('input', renderProjection);
+    analyticsMonth.addEventListener('input', renderAnalytics);
     document.getElementById('addProjection').addEventListener('click', openNewProjectionModal);
     document.getElementById('projectionBody').addEventListener('click', function(event) {
       const deleteButton = event.target.closest('[data-delete-projection-id]');
@@ -1262,6 +1554,7 @@ def _render_html(
     initProjectionForm();
     render();
     renderProjection();
+    renderAnalytics();
   </script>
 </body>
 </html>

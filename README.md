@@ -291,6 +291,7 @@ El reporte incluye:
 - Estado de tickets.
 - Enlaces a archivos originales.
 - Proyeccion mensual de ingresos y gastos.
+- Pestaña `Analisis Codex` con diagnostico del mes, meses futuros en riesgo y recomendaciones basadas en movimientos, tickets y proyecciones.
 
 ## Panel local editable
 
@@ -562,6 +563,12 @@ El reporte no tiene lo ultimo:
 ```powershell
 python scripts/generate_report.py
 ```
+
+El analisis no parece completo:
+
+- Revisa que no queden tickets pendientes con `python scripts/list_pending.py`.
+- Regenera el reporte despues de registrar tickets o editar proyecciones.
+- Completa la pestaña `Proyeccion`; el panel `Analisis Codex` depende de esos importes para anticipar meses futuros.
 
 El bot no arranca:
 
