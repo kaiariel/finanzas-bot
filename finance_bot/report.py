@@ -304,6 +304,7 @@ def _render_html(
       --radius: 8px;
     }
     * { box-sizing: border-box; }
+    [hidden] { display: none !important; }
     body {
       margin: 0;
       background: var(--bg);
@@ -400,12 +401,68 @@ def _render_html(
       padding: 12px;
       border-bottom: 1px solid var(--line);
     }
-    .projection-cards {
+    .tab-panel {
+      display: grid;
+      gap: 14px;
+      margin-bottom: 14px;
+    }
+    .summary-grid {
       display: grid;
       grid-template-columns: repeat(6, minmax(130px, 1fr));
       gap: 10px;
       padding: 12px;
     }
+    .projection-overview { grid-template-columns: repeat(5, minmax(150px, 1fr)); }
+    .analytics-summary { grid-template-columns: repeat(6, minmax(130px, 1fr)); }
+    .cashflow-grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(260px, 1fr));
+      gap: 10px;
+    }
+    .cashflow-list {
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      background: var(--panel);
+      min-height: 120px;
+      overflow: hidden;
+    }
+    .cashflow-list h3 {
+      display: flex;
+      justify-content: space-between;
+      align-items: baseline;
+      gap: 10px;
+      margin: 0;
+      padding: 10px;
+      border-bottom: 1px solid var(--line);
+      font-size: 13px;
+    }
+    .cashflow-list h3 strong { white-space: nowrap; }
+    .cashflow-list .items {
+      display: grid;
+      gap: 1px;
+      max-height: 260px;
+      overflow: auto;
+    }
+    .cashflow-item {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto;
+      gap: 8px;
+      padding: 8px 10px;
+      border-bottom: 1px solid var(--line);
+      background: white;
+    }
+    .cashflow-item span:first-child {
+      overflow-wrap: anywhere;
+    }
+    .section-heading {
+      display: flex;
+      justify-content: space-between;
+      gap: 12px;
+      align-items: baseline;
+      padding: 14px 12px 8px;
+    }
+    .section-heading h2 { margin: 0; padding: 0; border: 0; }
+    .section-heading p { margin: 0; }
     .analytics-tools {
       display: grid;
       grid-template-columns: minmax(180px, 260px) 1fr;
@@ -561,7 +618,7 @@ def _render_html(
     a { color: var(--accent-2); font-weight: 700; text-decoration: none; }
     a:hover { text-decoration: underline; }
     @media (max-width: 1100px) {
-      .filters, .cards, .projection-tools, .projection-cards, .analytics-tools, .analytics-grid, .grid { grid-template-columns: 1fr; }
+      .filters, .cards, .projection-tools, .summary-grid, .cashflow-grid, .analytics-tools, .analytics-grid, .grid { grid-template-columns: 1fr; }
       .chart-wrap { height: 240px; }
       .modal form { grid-template-columns: 1fr; }
     }
@@ -601,32 +658,59 @@ def _render_html(
       <div class="card"><span>Pendientes</span><strong id="pendingCount">0</strong></div>
     </section>
 
-    <section id="projectionPanel" class="panel" style="margin-bottom: 14px;" hidden>
-      <h2>Proyeccion proximos meses</h2>
-      <div class="projection-tools">
-        <label>Mes proyectado<select id="projectionMonth"></select></label>
-        <button id="addProjection" type="button">Anadir item</button>
-        <div class="muted">Edita importes por mes y marca lo ya pagado o cobrado.</div>
-      </div>
-      <div class="projection-cards" aria-label="Resumen proyectado">
-        <div class="card"><span>Ingresos proyectados</span><strong id="projectionIncome">0,00 EUR</strong></div>
-        <div class="card"><span>Gastos proyectados</span><strong id="projectionExpense">0,00 EUR</strong></div>
-        <div class="card"><span>Balance proyectado</span><strong id="projectionBalance">0,00 EUR</strong></div>
-        <div class="card"><span>Ya cobrado</span><strong id="projectionCompletedIncome">0,00 EUR</strong></div>
-        <div class="card"><span>Ya pagado</span><strong id="projectionCompletedExpense">0,00 EUR</strong></div>
-        <div class="card"><span>Balance real registrado</span><strong id="projectionActualBalance">0,00 EUR</strong></div>
-      </div>
-      <div class="table-wrap">
-        <table>
-          <thead>
-            <tr>
-              <th>Concepto</th><th>Tipo</th><th>Categoria</th><th>Cuota</th><th>Restantes</th>
-              <th class="amount">Mensual</th><th>Estado</th><th>Nota</th><th>Acciones</th>
-            </tr>
-          </thead>
-          <tbody id="projectionBody"></tbody>
-        </table>
-      </div>
+    <section id="projectionPanel" class="tab-panel" hidden>
+      <section class="panel">
+        <h2>Proyeccion proximos meses</h2>
+        <div class="projection-tools">
+          <label>Mes proyectado<select id="projectionMonth"></select></label>
+          <button id="addProjection" type="button">Anadir item</button>
+          <div class="muted">Edita importes por mes y marca lo ya pagado o cobrado.</div>
+        </div>
+        <div class="summary-grid projection-overview" aria-label="Resumen proyectado">
+          <div class="card"><span>Ingresos proyectados</span><strong id="projectionIncome">0,00 EUR</strong></div>
+          <div class="card"><span>Gastos proyectados</span><strong id="projectionExpense">0,00 EUR</strong></div>
+          <div class="card"><span>Balance proyectado</span><strong id="projectionBalance">0,00 EUR</strong></div>
+          <div class="card"><span>Balance restante</span><strong id="projectionRemainingBalance">0,00 EUR</strong></div>
+          <div class="card"><span>Balance real registrado</span><strong id="projectionActualBalance">0,00 EUR</strong></div>
+        </div>
+      </section>
+
+      <section class="cashflow-grid" aria-label="Flujo restante del mes">
+        <div class="cashflow-list">
+          <h3><span>Ya cobrado</span><strong id="collectedIncomeTotal" class="income">0,00 EUR</strong></h3>
+          <div id="collectedIncomeList" class="items"></div>
+        </div>
+        <div class="cashflow-list">
+          <h3><span>Falta cobrar</span><strong id="pendingIncomeTotal" class="income">0,00 EUR</strong></h3>
+          <div id="pendingIncomeList" class="items"></div>
+        </div>
+        <div class="cashflow-list">
+          <h3><span>Ya pagado</span><strong id="paidExpenseTotal" class="expense">0,00 EUR</strong></h3>
+          <div id="paidExpenseList" class="items"></div>
+        </div>
+        <div class="cashflow-list">
+          <h3><span>Falta pagar</span><strong id="pendingExpenseTotal" class="expense">0,00 EUR</strong></h3>
+          <div id="pendingExpenseList" class="items"></div>
+        </div>
+      </section>
+
+      <section class="panel">
+        <div class="section-heading">
+          <h2>Detalle editable del mes</h2>
+          <p class="muted">Anade, edita, borra o marca como pagado/cobrado.</p>
+        </div>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>Concepto</th><th>Tipo</th><th>Categoria</th><th>Cuota</th><th>Restantes</th>
+                <th class="amount">Mensual</th><th>Estado</th><th>Nota</th><th>Acciones</th>
+              </tr>
+            </thead>
+            <tbody id="projectionBody"></tbody>
+          </table>
+        </div>
+      </section>
     </section>
 
     <section id="analyticsPanel" class="analytics-panel" hidden>
@@ -636,7 +720,7 @@ def _render_html(
           <label>Mes analizado<select id="analyticsMonth"></select></label>
           <div class="muted">Lectura local de movimientos, tickets y proyecciones. No sustituye asesoria financiera.</div>
         </div>
-        <div class="projection-cards" aria-label="Resumen de analisis">
+        <div class="summary-grid analytics-summary" aria-label="Resumen de analisis">
           <div class="card"><span>Score del mes</span><strong id="analyticsScore">0/100</strong></div>
           <div class="card"><span>Balance proyectado</span><strong id="analyticsProjectedBalance">0,00 EUR</strong></div>
           <div class="card"><span>Margen libre</span><strong id="analyticsSafetyMargin">0%</strong></div>
@@ -1043,17 +1127,23 @@ def _render_html(
       const summary = projectionSummaryForMonth(month);
       const body = document.getElementById('projectionBody');
       if (!summary) {
+        setText('projectionIncome', '0,00 EUR');
+        setText('projectionExpense', '0,00 EUR');
+        setText('projectionBalance', '0,00 EUR');
+        setText('projectionRemainingBalance', '0,00 EUR');
+        setText('projectionActualBalance', '0,00 EUR');
+        renderProjectionCashflow([]);
         body.innerHTML = '<tr><td colspan="9" class="muted">Aun no hay proyecciones cargadas.</td></tr>';
         return;
       }
       setText('projectionIncome', summary.projectedIncome);
       setText('projectionExpense', summary.projectedExpense);
       setText('projectionBalance', summary.projectedBalance);
-      setText('projectionCompletedIncome', summary.completedIncome);
-      setText('projectionCompletedExpense', summary.completedExpense);
       setText('projectionActualBalance', summary.actualBalance);
 
       const rows = projectionRowsForMonth(month);
+      const totals = renderProjectionCashflow(rows);
+      setText('projectionRemainingBalance', centsToMoney(totals.pendingIncome - totals.pendingExpense));
       if (!rows.length) {
         body.innerHTML = '<tr><td colspan="9" class="muted">No hay proyecciones para este mes.</td></tr>';
         return;
@@ -1075,6 +1165,54 @@ def _render_html(
           '<td>' + action + '</td>' +
         '</tr>';
       }).join('');
+    }
+    function cashflowTotal(rows) {
+      return sum(rows, function(row) { return row.amountCents || 0; });
+    }
+    function renderCashflowList(id, totalId, rows) {
+      const container = document.getElementById(id);
+      const total = cashflowTotal(rows);
+      setText(totalId, centsToMoney(total));
+      if (!rows.length) {
+        container.innerHTML = '<div class="muted" style="padding: 10px;">Sin movimientos.</div>';
+        return total;
+      }
+      container.innerHTML = rows.map(function(row) {
+        const tone = row.kind === 'income' ? 'income' : 'expense';
+        return '<div class="cashflow-item">' +
+          '<span>' + escapeHtml(row.name) + (row.note ? '<br><small class="muted">' + escapeHtml(row.note) + '</small>' : '') + '</span>' +
+          '<strong class="' + tone + '">' + escapeHtml(row.amount) + '</strong>' +
+        '</div>';
+      }).join('');
+      return total;
+    }
+    function renderProjectionCashflow(rows) {
+      const collectedIncomeRows = rows.filter(function(row) { return row.kind === 'income' && row.status === 'completed'; });
+      const pendingIncomeRows = rows.filter(function(row) { return row.kind === 'income' && row.status === 'pending'; });
+      const paidExpenseRows = rows.filter(function(row) { return row.kind === 'expense' && row.status === 'completed'; });
+      const pendingExpenseRows = rows.filter(function(row) { return row.kind === 'expense' && row.status === 'pending'; });
+      return {
+        collectedIncome: renderCashflowList(
+          'collectedIncomeList',
+          'collectedIncomeTotal',
+          collectedIncomeRows
+        ),
+        pendingIncome: renderCashflowList(
+          'pendingIncomeList',
+          'pendingIncomeTotal',
+          pendingIncomeRows
+        ),
+        paidExpense: renderCashflowList(
+          'paidExpenseList',
+          'paidExpenseTotal',
+          paidExpenseRows
+        ),
+        pendingExpense: renderCashflowList(
+          'pendingExpenseList',
+          'pendingExpenseTotal',
+          pendingExpenseRows
+        )
+      };
     }
     function monthRows(month) {
       return transactions.filter(function(row) { return row.monthKey === month; });

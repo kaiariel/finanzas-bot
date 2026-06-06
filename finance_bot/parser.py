@@ -109,6 +109,11 @@ CATEGORY_KEYWORDS: tuple[tuple[str, tuple[str, ...]], ...] = (
             "google cloud",
             "cloud apps",
             "apps",
+            "anthropic",
+            "antrophic",
+            "creditos",
+            "créditos",
+            "capcut",
             "hosting",
             "suscripcion",
             "suscripciones",
@@ -145,6 +150,9 @@ CATEGORY_KEYWORDS: tuple[tuple[str, tuple[str, ...]], ...] = (
             "medico",
             "gel",
             "cuidado",
+            "seguro salud",
+            "seguro medico",
+            "seguro médico",
             "peluqueria",
             "peluquería",
             "barberia",
@@ -251,7 +259,21 @@ CATEGORY_KEYWORDS: tuple[tuple[str, tuple[str, ...]], ...] = (
             "bolsas basura",
         ),
     ),
-    ("Ocio", ("restaurante", "bar", "cine", "copas", "ocio", "cafe", "cena", "tapas")),
+    (
+        "Ocio",
+        (
+            "restaurante",
+            "bar",
+            "cine",
+            "copas",
+            "ocio",
+            "cafe",
+            "cena",
+            "tapas",
+            "apuesta",
+            "apuestas",
+        ),
+    ),
 )
 
 STORE_ALIASES: tuple[tuple[str, tuple[str, ...]], ...] = (
@@ -278,6 +300,8 @@ STORE_ALIASES: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("Claude", ("claude",)),
     ("ChatGPT", ("chatgpt",)),
     ("OpenAI", ("openai",)),
+    ("Anthropic", ("anthropic", "antrophic")),
+    ("Capcut", ("capcut",)),
     ("Google Cloud", ("google cloud", "cloud apps")),
     ("Endesa", ("endesa",)),
     ("Iberdrola", ("iberdrola",)),
@@ -418,6 +442,9 @@ def infer_store(text: str) -> str:
 
 def infer_category_from_keywords(text: str, store: str) -> str | None:
     normalized = normalize_text(text)
+    if _contains_keyword(normalized, "apuesta") or _contains_keyword(normalized, "apuestas"):
+        return "Ocio"
+
     for category, keywords in CATEGORY_KEYWORDS:
         if any(_contains_keyword(normalized, keyword) for keyword in keywords):
             return category
@@ -437,6 +464,8 @@ def infer_kind(text: str, sign: str | None, category: str | None) -> str:
         return "expense"
     if category == "Ingresos clientes" and is_client_reimbursable_expense(normalized):
         return "expense"
+    if category and category not in INCOME_CATEGORIES and "cobro" in words:
+        return "expense"
     if words & INCOME_WORDS:
         return "income"
     if words & EXPENSE_WORDS:
@@ -444,6 +473,19 @@ def infer_kind(text: str, sign: str | None, category: str | None) -> str:
     if category in INCOME_CATEGORIES:
         return "income"
     return "expense"
+
+
+def infer_is_fixed(text: str, category: str) -> bool:
+    normalized = normalize_text(text)
+    if _contains_keyword(normalized, "creditos") or _contains_keyword(normalized, "créditos"):
+        return False
+    if _contains_keyword(normalized, "seguro salud"):
+        return True
+    if _contains_keyword(normalized, "musica de izhan") or _contains_keyword(
+        normalized, "música de izhan"
+    ):
+        return True
+    return category in FIXED_CATEGORIES
 
 
 def is_client_reimbursable_expense(normalized_text: str) -> bool:
@@ -496,7 +538,7 @@ def parse_transaction(text: str) -> ParsedTransaction | None:
         note=note,
         source_text=text.strip(),
         store=store,
-        is_fixed=category in FIXED_CATEGORIES,
+        is_fixed=infer_is_fixed(text, category),
         needs_clarification=needs_clarification,
     )
 
@@ -512,7 +554,7 @@ def _split_inline_transactions(text: str) -> list[str]:
 
     parts = [
         part.strip(" -;,.")
-        for part in re.split(r";+|,(?=\s*[^\d\s])", cleaned)
+        for part in re.split(r";+|,(?!\d)", cleaned)
         if part.strip(" -;,.")
     ]
     return parts or [cleaned]

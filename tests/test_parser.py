@@ -128,6 +128,24 @@ def test_comma_separated_expenses_are_split_without_breaking_decimals() -> None:
     ]
 
 
+def test_cobro_with_expense_categories_is_treated_as_charge() -> None:
+    parsed = parse_transactions(
+        "cobro 22 euros seguro salud, 25 euros musica de izhan, "
+        "6 euros creditos antrophic, 5 euros chatgpt creditos, "
+        "20 euros apuesta por paraguay campeon mundial, 13 euros capcut"
+    )
+
+    assert [(item.kind, item.amount_cents, item.category, item.store) for item in parsed] == [
+        ("expense", 2200, "Salud & Cuidado", ""),
+        ("expense", 2500, "Izhan", ""),
+        ("expense", 600, "Suscripciones", "Anthropic"),
+        ("expense", 500, "Suscripciones", "ChatGPT"),
+        ("expense", 2000, "Ocio", ""),
+        ("expense", 1300, "Suscripciones", "Capcut"),
+    ]
+    assert [item.is_fixed for item in parsed] == [True, True, False, False, False, True]
+
+
 def test_transaction_table_format() -> None:
     parsed = parse_transaction("gasto 12,50 mercadona comida")
 
