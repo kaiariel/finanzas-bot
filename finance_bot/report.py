@@ -622,74 +622,216 @@ def _render_html(
       .chart-wrap { height: 240px; }
       .modal form { grid-template-columns: 1fr; }
     }
+
+    /* ---- Rediseño: jerarquía, estados y claridad ---- */
+    .mode-badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      margin-top: 8px;
+      padding: 3px 10px;
+      border-radius: 999px;
+      font-size: 12px;
+      font-weight: 800;
+      text-transform: uppercase;
+      letter-spacing: .02em;
+    }
+    .mode-badge.read { background: #e7eef4; color: var(--accent-2); }
+    .mode-badge.edit { background: #e3f1ea; color: var(--accent); }
+    .mode-hint { margin: 6px 0 0; color: var(--muted); font-size: 13px; }
+
+    /* Resumen con jerarquía: balance protagonista */
+    .summary {
+      display: grid;
+      grid-template-columns: minmax(220px, 1.4fr) repeat(3, minmax(120px, 1fr));
+      gap: 10px;
+      margin-bottom: 14px;
+    }
+    .summary .secondary-cards {
+      grid-column: 2 / -1;
+      display: grid;
+      grid-template-columns: repeat(3, minmax(110px, 1fr));
+      grid-template-rows: 1fr 1fr;
+      gap: 10px;
+    }
+    .card.hero {
+      grid-row: 1;
+      display: flex;
+      flex-direction: column;
+      justify-content: center;
+      gap: 4px;
+      padding: 16px 18px;
+      border-width: 2px;
+    }
+    .card.hero span { font-size: 12px; }
+    .card.hero strong { font-size: 34px; line-height: 1.05; }
+    .card.hero.balance-pos { border-color: var(--accent); background: #f1f8f4; }
+    .card.hero.balance-pos strong { color: var(--accent); }
+    .card.hero.balance-neg { border-color: var(--danger); background: #fdf3f3; }
+    .card.hero.balance-neg strong { color: var(--danger); }
+    .card .delta {
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+      margin-top: 2px;
+      font-size: 12px;
+      font-weight: 700;
+      text-transform: none;
+      letter-spacing: 0;
+    }
+    .delta.up { color: var(--accent); }
+    .delta.down { color: var(--danger); }
+    .delta.flat { color: var(--muted); }
+
+    /* Filtros: primarios visibles, resto plegable */
+    .filters-bar {
+      display: grid;
+      grid-template-columns: minmax(150px, 220px) minmax(180px, 1fr) auto auto;
+      gap: 10px;
+      align-items: end;
+      margin-bottom: 12px;
+    }
+    .filters-more {
+      display: grid;
+      grid-template-columns: repeat(5, minmax(120px, 1fr));
+      gap: 10px;
+      margin-bottom: 14px;
+      padding: 12px;
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      background: var(--panel);
+    }
+    .filters-more[hidden] { display: none; }
+
+    /* Leyenda de gráficas */
+    .chart-legend {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 14px;
+      padding: 0 12px 8px;
+      font-size: 12px;
+      color: var(--muted);
+      font-weight: 700;
+    }
+    .chart-legend span { display: inline-flex; align-items: center; gap: 6px; }
+    .legend-dot { width: 11px; height: 11px; border-radius: 3px; display: inline-block; }
+    .legend-income { background: var(--accent); }
+    .legend-expense { background: var(--danger); }
+
+    /* Estados legibles en bandeja de tickets */
+    .status-badge {
+      display: inline-flex;
+      align-items: center;
+      min-height: 22px;
+      padding: 2px 9px;
+      border-radius: 999px;
+      font-size: 11px;
+      font-weight: 800;
+      text-transform: uppercase;
+      letter-spacing: .02em;
+    }
+    .status-badge.tone-ok { background: #e3f1ea; color: var(--accent); }
+    .status-badge.tone-warn { background: #fbf0d8; color: var(--warn); }
+    .status-badge.tone-danger { background: #f8dede; color: var(--danger); }
+    .status-badge.tone-neutral { background: #eaeeec; color: var(--muted); }
+    .receipt-head { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+    .receipt-path { margin-top: 6px; font-size: 12px; }
+    .receipt-path summary { cursor: pointer; color: var(--accent-2); font-weight: 700; }
+    .receipt-path code { color: var(--muted); word-break: break-all; font-size: 11px; }
+
+    /* Bloques de alertas vs info */
+    .insight-block + .insight-block { margin-top: 12px; }
+    .insight-block h3 {
+      margin: 0 0 8px;
+      font-size: 12px;
+      text-transform: uppercase;
+      letter-spacing: .03em;
+      color: var(--muted);
+    }
+
+    @media (max-width: 1100px) {
+      .summary, .summary .secondary-cards, .filters-bar, .filters-more { grid-template-columns: 1fr; }
+      .summary .secondary-cards { grid-column: 1; grid-template-rows: none; }
+      .card.hero strong { font-size: 30px; }
+    }
   </style>
 </head>
 <body>
   <header>
     <h1>Reporte de finanzas</h1>
-    <p>Generado el $generated_at desde $db_path</p>
+    <p class="mode-hint">Generado el $generated_at</p>
     $edit_hint
   </header>
   <main>
-    <nav class="tabs" aria-label="Pestanas del panel">
+    <nav class="tabs" aria-label="Pestañas del panel">
       <button class="tab-button active" type="button" data-tab="dashboard">Panel inicial</button>
-      <button class="tab-button" type="button" data-tab="projection">Proyeccion</button>
-      <button class="tab-button" type="button" data-tab="analytics">Analisis Codex</button>
+      <button class="tab-button" type="button" data-tab="projection">Proyección</button>
+      <button class="tab-button" type="button" data-tab="analytics">Diagnóstico</button>
     </nav>
 
-    <section class="filters dashboard-panel" aria-label="Filtros">
+    <section class="filters-bar dashboard-panel" aria-label="Filtros principales">
       <label>Mes<select id="monthFilter"></select></label>
+      <label>Buscar<input id="searchFilter" type="search" placeholder="Descripción o tienda"></label>
+      <button id="toggleFilters" class="secondary" type="button" aria-expanded="false">Más filtros</button>
+      <button id="resetFilters" class="secondary" type="button">Limpiar</button>
+    </section>
+
+    <section class="filters-more dashboard-panel" id="moreFilters" aria-label="Filtros avanzados" hidden>
       <label>Categoría<select id="categoryFilter"></select></label>
       <label>Tipo<select id="typeFilter"></select></label>
       <label>Usuario<select id="userFilter"></select></label>
       <label>Fijo<select id="fixedFilter"></select></label>
       <label>Ticket<select id="receiptFilter"></select></label>
-      <label>Buscar<input id="searchFilter" type="search" placeholder="Descripción o tienda"></label>
-      <button id="resetFilters" type="button">Limpiar filtros</button>
     </section>
 
-    <section class="cards dashboard-panel" aria-label="Resumen">
-      <div class="card"><span>Ingresos</span><strong id="incomeTotal">0,00 €</strong></div>
-      <div class="card"><span>Egresos</span><strong id="expenseTotal">0,00 €</strong></div>
-      <div class="card"><span>Balance</span><strong id="balanceTotal">0,00 €</strong></div>
-      <div class="card"><span>Fijos</span><strong id="fixedTotal">0,00 €</strong></div>
-      <div class="card"><span>Variables</span><strong id="variableTotal">0,00 €</strong></div>
-      <div class="card"><span>Con ticket</span><strong id="ticketCoverage">0%</strong></div>
-      <div class="card"><span>Pendientes</span><strong id="pendingCount">0</strong></div>
+    <section class="summary dashboard-panel" aria-label="Resumen del periodo">
+      <div class="card hero" id="balanceCard">
+        <span>Balance</span>
+        <strong id="balanceTotal">0,00 €</strong>
+        <span class="delta" id="balanceMeta"></span>
+      </div>
+      <div class="secondary-cards">
+        <div class="card"><span>Ingresos</span><strong id="incomeTotal">0,00 €</strong><span class="delta" id="incomeDelta"></span></div>
+        <div class="card"><span>Egresos</span><strong id="expenseTotal">0,00 €</strong><span class="delta" id="expenseDelta"></span></div>
+        <div class="card"><span>Con ticket</span><strong id="ticketCoverage">0%</strong></div>
+        <div class="card"><span>Fijos</span><strong id="fixedTotal">0,00 €</strong></div>
+        <div class="card"><span>Variables</span><strong id="variableTotal">0,00 €</strong></div>
+        <div class="card"><span>Pendientes</span><strong id="pendingCount">0</strong></div>
+      </div>
     </section>
 
     <section id="projectionPanel" class="tab-panel" hidden>
       <section class="panel">
-        <h2>Proyeccion proximos meses</h2>
+        <h2>Proyección próximos meses</h2>
         <div class="projection-tools">
           <label>Mes proyectado<select id="projectionMonth"></select></label>
-          <button id="addProjection" type="button">Anadir item</button>
+          <button id="addProjection" type="button">Añadir item</button>
           <div class="muted">Edita importes por mes y marca lo ya pagado o cobrado.</div>
         </div>
         <div class="summary-grid projection-overview" aria-label="Resumen proyectado">
-          <div class="card"><span>Ingresos proyectados</span><strong id="projectionIncome">0,00 EUR</strong></div>
-          <div class="card"><span>Gastos proyectados</span><strong id="projectionExpense">0,00 EUR</strong></div>
-          <div class="card"><span>Balance proyectado</span><strong id="projectionBalance">0,00 EUR</strong></div>
-          <div class="card"><span>Balance restante</span><strong id="projectionRemainingBalance">0,00 EUR</strong></div>
-          <div class="card"><span>Balance real registrado</span><strong id="projectionActualBalance">0,00 EUR</strong></div>
+          <div class="card"><span>Ingresos proyectados</span><strong id="projectionIncome">0,00 €</strong></div>
+          <div class="card"><span>Gastos proyectados</span><strong id="projectionExpense">0,00 €</strong></div>
+          <div class="card"><span>Balance proyectado</span><strong id="projectionBalance">0,00 €</strong></div>
+          <div class="card"><span>Balance restante</span><strong id="projectionRemainingBalance">0,00 €</strong></div>
+          <div class="card"><span>Balance real registrado</span><strong id="projectionActualBalance">0,00 €</strong></div>
         </div>
       </section>
 
       <section class="cashflow-grid" aria-label="Flujo restante del mes">
         <div class="cashflow-list">
-          <h3><span>Ya cobrado</span><strong id="collectedIncomeTotal" class="income">0,00 EUR</strong></h3>
+          <h3><span>Ya cobrado</span><strong id="collectedIncomeTotal" class="income">0,00 €</strong></h3>
           <div id="collectedIncomeList" class="items"></div>
         </div>
         <div class="cashflow-list">
-          <h3><span>Falta cobrar</span><strong id="pendingIncomeTotal" class="income">0,00 EUR</strong></h3>
+          <h3><span>Falta cobrar</span><strong id="pendingIncomeTotal" class="income">0,00 €</strong></h3>
           <div id="pendingIncomeList" class="items"></div>
         </div>
         <div class="cashflow-list">
-          <h3><span>Ya pagado</span><strong id="paidExpenseTotal" class="expense">0,00 EUR</strong></h3>
+          <h3><span>Ya pagado</span><strong id="paidExpenseTotal" class="expense">0,00 €</strong></h3>
           <div id="paidExpenseList" class="items"></div>
         </div>
         <div class="cashflow-list">
-          <h3><span>Falta pagar</span><strong id="pendingExpenseTotal" class="expense">0,00 EUR</strong></h3>
+          <h3><span>Falta pagar</span><strong id="pendingExpenseTotal" class="expense">0,00 €</strong></h3>
           <div id="pendingExpenseList" class="items"></div>
         </div>
       </section>
@@ -697,13 +839,13 @@ def _render_html(
       <section class="panel">
         <div class="section-heading">
           <h2>Detalle editable del mes</h2>
-          <p class="muted">Anade, edita, borra o marca como pagado/cobrado.</p>
+          <p class="muted">Añade, edita, borra o marca como pagado/cobrado.</p>
         </div>
         <div class="table-wrap">
           <table>
             <thead>
               <tr>
-                <th>Concepto</th><th>Tipo</th><th>Categoria</th><th>Cuota</th><th>Restantes</th>
+                <th>Concepto</th><th>Tipo</th><th>Categoría</th><th>Cuota</th><th>Restantes</th>
                 <th class="amount">Mensual</th><th>Estado</th><th>Nota</th><th>Acciones</th>
               </tr>
             </thead>
@@ -715,14 +857,14 @@ def _render_html(
 
     <section id="analyticsPanel" class="analytics-panel" hidden>
       <section class="panel">
-        <h2>Analisis Codex</h2>
+        <h2>Diagnóstico</h2>
         <div class="analytics-tools">
           <label>Mes analizado<select id="analyticsMonth"></select></label>
-          <div class="muted">Lectura local de movimientos, tickets y proyecciones. No sustituye asesoria financiera.</div>
+          <div class="muted">Lectura local de movimientos, tickets y proyecciones. No sustituye asesoría financiera.</div>
         </div>
-        <div class="summary-grid analytics-summary" aria-label="Resumen de analisis">
+        <div class="summary-grid analytics-summary" aria-label="Resumen del diagnóstico">
           <div class="card"><span>Score del mes</span><strong id="analyticsScore">0/100</strong></div>
-          <div class="card"><span>Balance proyectado</span><strong id="analyticsProjectedBalance">0,00 EUR</strong></div>
+          <div class="card"><span>Balance proyectado</span><strong id="analyticsProjectedBalance">0,00 €</strong></div>
           <div class="card"><span>Margen libre</span><strong id="analyticsSafetyMargin">0%</strong></div>
           <div class="card"><span>Fijos / ingresos</span><strong id="analyticsFixedRatio">0%</strong></div>
           <div class="card"><span>Mayor gasto real</span><strong id="analyticsTopExpense">Sin datos</strong></div>
@@ -732,7 +874,7 @@ def _render_html(
 
       <section class="analytics-grid">
         <div class="panel">
-          <h2>Diagnostico del mes</h2>
+          <h2>Diagnóstico del mes</h2>
           <div id="analyticsNarrative" class="list"></div>
         </div>
         <div class="panel">
@@ -742,13 +884,13 @@ def _render_html(
       </section>
 
       <section class="panel" style="margin-top: 14px;">
-        <h2>Lectura de los proximos meses</h2>
+        <h2>Lectura de los próximos meses</h2>
         <div class="table-wrap">
           <table>
             <thead>
               <tr>
                 <th>Mes</th><th class="amount">Ingresos</th><th class="amount">Gastos</th>
-                <th class="amount">Balance</th><th>Lectura Codex</th>
+                <th class="amount">Balance</th><th>Lectura</th>
               </tr>
             </thead>
             <tbody id="analyticsFutureBody"></tbody>
@@ -760,7 +902,16 @@ def _render_html(
     <section class="grid dashboard-panel">
       <div class="panel">
         <h2>Alertas y salud</h2>
-        <div id="alertsList" class="list"></div>
+        <div class="list">
+          <div class="insight-block">
+            <h3>Necesita tu atención</h3>
+            <div id="alertsList"></div>
+          </div>
+          <div class="insight-block">
+            <h3>Para tu información</h3>
+            <div id="infoList"></div>
+          </div>
+        </div>
       </div>
       <div class="panel">
         <h2>Ranking de tiendas</h2>
@@ -771,6 +922,10 @@ def _render_html(
     <section class="grid dashboard-panel" style="margin-top: 14px;">
       <div class="panel">
         <h2>Evolución mensual</h2>
+        <div class="chart-legend">
+          <span><i class="legend-dot legend-income"></i>Ingresos</span>
+          <span><i class="legend-dot legend-expense"></i>Gastos</span>
+        </div>
         <div class="chart-wrap"><canvas id="monthlyChart"></canvas></div>
       </div>
       <div class="panel">
@@ -784,9 +939,9 @@ def _render_html(
       <div class="table-wrap">
         <table>
           <thead>
-            <tr>
-              <th>Mes</th><th>Fecha</th><th>Descripción</th><th>Categoría</th>
-              <th class="amount">Cantidad</th><th>Tipo</th><th>Tienda</th><th>Usuario</th><th>Es fijo</th><th>Fuente</th><th>Acciones</th>
+            <tr id="transactionsHead">
+              <th>Fecha</th><th>Descripción</th><th>Categoría</th>
+              <th class="amount">Cantidad</th><th>Tipo</th><th>Tienda</th><th>Usuario</th><th>Fijo</th><th>Ticket</th>
             </tr>
           </thead>
           <tbody id="transactionsBody"></tbody>
@@ -970,24 +1125,78 @@ def _render_html(
     function expenseRows(rows) {
       return rows.filter(function(row) { return row.kind === 'expense'; });
     }
+    function previousMonthKey(monthKey) {
+      const date = new Date(monthKey + '-01T00:00:00');
+      date.setMonth(date.getMonth() - 1);
+      return date.toISOString().slice(0, 7);
+    }
+    function monthTotals(monthKey) {
+      const monthRows = transactions.filter(function(row) { return row.monthKey === monthKey; });
+      const income = sum(monthRows.filter(function(row) { return row.kind === 'income'; }), function(row) { return row.amountCents; });
+      const expense = sum(expenseRows(monthRows), function(row) { return row.amountCents; });
+      return {income: income, expense: expense, balance: income - expense};
+    }
+    function setDelta(id, current, previous, goodWhenUp) {
+      const node = document.getElementById(id);
+      if (!node) return;
+      if (previous == null) { node.textContent = ''; node.className = 'delta'; return; }
+      const diff = current - previous;
+      if (Math.abs(diff) < 1) {
+        node.textContent = '→ igual que el mes anterior';
+        node.className = 'delta flat';
+        return;
+      }
+      const up = diff > 0;
+      const positive = goodWhenUp ? up : !up;
+      node.textContent = (up ? '↑ ' : '↓ ') + centsToMoney(Math.abs(diff)) + ' vs mes anterior';
+      node.className = 'delta ' + (positive ? 'up' : 'down');
+    }
     function renderSummary(rows) {
       const income = sum(rows.filter(function(row) { return row.kind === 'income'; }), function(row) { return row.amountCents; });
       const expense = sum(expenseRows(rows), function(row) { return row.amountCents; });
       const fixed = sum(expenseRows(rows).filter(function(row) { return row.isFixed; }), function(row) { return row.amountCents; });
       const variable = expense - fixed;
+      const balance = income - expense;
       const coverage = rows.length ? Math.round((rows.filter(function(row) { return row.hasReceipt; }).length / rows.length) * 100) : 0;
       const pending = receipts.filter(function(row) { return ['nuevo', 'pending', 'voice_pending', 'dudoso'].includes(row.status); }).length;
       setText('incomeTotal', centsToMoney(income));
       setText('expenseTotal', centsToMoney(expense));
-      setText('balanceTotal', centsToMoney(income - expense));
+      setText('balanceTotal', centsToMoney(balance));
       setText('fixedTotal', centsToMoney(fixed));
       setText('variableTotal', centsToMoney(variable));
       setText('ticketCoverage', String(coverage) + '%');
       setText('pendingCount', String(pending));
+
+      const balanceCard = document.getElementById('balanceCard');
+      balanceCard.classList.remove('balance-pos', 'balance-neg');
+      balanceCard.classList.add(balance < 0 ? 'balance-neg' : 'balance-pos');
+
+      // Deltas y contexto solo cuando hay un mes concreto seleccionado.
+      const selectedMonth = filters.month.value;
+      const balanceMeta = document.getElementById('balanceMeta');
+      if (selectedMonth && income > 0) {
+        const ratio = Math.round((balance / income) * 100);
+        balanceMeta.textContent = ratio + '% de los ingresos del mes';
+        balanceMeta.className = 'delta ' + (balance < 0 ? 'down' : (ratio < 8 ? 'flat' : 'up'));
+      } else {
+        balanceMeta.textContent = '';
+        balanceMeta.className = 'delta';
+      }
+      if (selectedMonth) {
+        const prev = monthTotals(previousMonthKey(selectedMonth));
+        const hasPrev = transactions.some(function(row) { return row.monthKey === previousMonthKey(selectedMonth); });
+        setDelta('incomeDelta', income, hasPrev ? prev.income : null, true);
+        setDelta('expenseDelta', expense, hasPrev ? prev.expense : null, false);
+      } else {
+        setDelta('incomeDelta', income, null, true);
+        setDelta('expenseDelta', expense, null, false);
+      }
     }
     function renderAlerts(rows) {
-      const list = document.getElementById('alertsList');
+      const alertsList = document.getElementById('alertsList');
+      const infoList = document.getElementById('infoList');
       const alerts = [];
+      const info = [];
       const income = sum(rows.filter(function(row) { return row.kind === 'income'; }), function(row) { return row.amountCents; });
       const expense = sum(expenseRows(rows), function(row) { return row.amountCents; });
       const pending = receipts.filter(function(row) { return ['nuevo', 'pending', 'voice_pending', 'dudoso'].includes(row.status); });
@@ -996,15 +1205,19 @@ def _render_html(
       const fixed = sum(expenseRows(rows).filter(function(row) { return row.isFixed; }), function(row) { return row.amountCents; });
       const categories = totalsBy(expenseRows(rows), 'category');
       const topCategory = categories[0];
-      if (pending.length) alerts.push({tone: 'warn', text: pending.length + ' ticket(s) o audio(s) necesitan revisión.'});
-      if (missing.length) alerts.push({tone: 'danger', text: missing.length + ' archivo(s) faltan en la carpeta sincronizada.'});
       if (income - expense < 0) alerts.push({tone: 'danger', text: 'El balance filtrado está en negativo: ' + centsToMoney(income - expense) + '.'});
+      if (missing.length) alerts.push({tone: 'danger', text: missing.length + ' archivo(s) faltan en la carpeta sincronizada.'});
+      if (pending.length) alerts.push({tone: 'warn', text: pending.length + ' ticket(s) o audio(s) necesitan revisión.'});
       if (withoutTicket.length) alerts.push({tone: 'warn', text: withoutTicket.length + ' movimiento(s) no tienen ticket enlazado.'});
-      if (topCategory) alerts.push({tone: '', text: 'Mayor gasto por categoría: ' + topCategory.key + ' con ' + centsToMoney(topCategory.value) + '.'});
-      if (fixed) alerts.push({tone: '', text: 'Gastos fijos filtrados: ' + centsToMoney(fixed) + '.'});
-      if (!alerts.length) alerts.push({tone: '', text: 'Todo limpio: sin pendientes visibles en este filtro.'});
-      list.innerHTML = alerts.map(function(item) {
-        return '<div class="notice ' + item.tone + '">' + escapeHtml(item.text) + '</div>';
+      if (topCategory) info.push({text: 'Mayor gasto por categoría: ' + topCategory.key + ' con ' + centsToMoney(topCategory.value) + '.'});
+      if (fixed) info.push({text: 'Gastos fijos filtrados: ' + centsToMoney(fixed) + '.'});
+      if (!alerts.length) alerts.push({tone: 'ok', text: 'Todo en orden: sin avisos para este filtro.'});
+      if (!info.length) info.push({text: 'Sin datos adicionales para mostrar.'});
+      alertsList.innerHTML = alerts.map(function(item) {
+        return '<div class="notice ' + (item.tone === 'ok' ? '' : item.tone) + '">' + escapeHtml(item.text) + '</div>';
+      }).join('');
+      infoList.innerHTML = info.map(function(item) {
+        return '<div class="notice">' + escapeHtml(item.text) + '</div>';
       }).join('');
     }
     function totalsBy(rows, key) {
@@ -1030,15 +1243,19 @@ def _render_html(
     }
     function renderTable(rows) {
       const body = document.getElementById('transactionsBody');
+      const colCount = editable ? 10 : 9;
       if (!rows.length) {
-        body.innerHTML = '<tr><td colspan="11" class="muted">No hay movimientos para los filtros seleccionados.</td></tr>';
+        body.innerHTML = '<tr><td colspan="' + colCount + '" class="muted">No hay movimientos para los filtros seleccionados.</td></tr>';
         return;
       }
       body.innerHTML = rows.slice().reverse().map(function(row) {
-        const source = row.receiptUrl ? '<a href="' + row.receiptUrl + '">Abrir</a>' : '<span class="muted">Sin ticket</span>';
-        const action = '<button class="linkish" type="button" data-edit-id="' + row.id + '">Editar</button>';
+        const source = row.receiptUrl
+          ? '<a href="' + row.receiptUrl + '" title="Abrir ticket">📎</a>'
+          : '<span class="muted" title="Sin ticket">—</span>';
+        const action = editable
+          ? '<td><button class="linkish" type="button" data-edit-id="' + row.id + '">Editar</button></td>'
+          : '';
         return '<tr>' +
-          '<td>' + escapeHtml(row.monthName) + '</td>' +
           '<td>' + escapeHtml(row.date) + '</td>' +
           '<td class="description">' + escapeHtml(row.description) + '</td>' +
           '<td>' + escapeHtml(row.category) + '</td>' +
@@ -1047,8 +1264,8 @@ def _render_html(
           '<td>' + escapeHtml(row.store) + '</td>' +
           '<td>' + escapeHtml(row.user) + '</td>' +
           '<td>' + escapeHtml(row.fixed) + '</td>' +
-          '<td>' + source + '</td>' +
-          '<td>' + action + '</td>' +
+          '<td style="text-align:center">' + source + '</td>' +
+          action +
         '</tr>';
       }).join('');
     }
@@ -1127,13 +1344,13 @@ def _render_html(
       const summary = projectionSummaryForMonth(month);
       const body = document.getElementById('projectionBody');
       if (!summary) {
-        setText('projectionIncome', '0,00 EUR');
-        setText('projectionExpense', '0,00 EUR');
-        setText('projectionBalance', '0,00 EUR');
-        setText('projectionRemainingBalance', '0,00 EUR');
-        setText('projectionActualBalance', '0,00 EUR');
+        setText('projectionIncome', '0,00 €');
+        setText('projectionExpense', '0,00 €');
+        setText('projectionBalance', '0,00 €');
+        setText('projectionRemainingBalance', '0,00 €');
+        setText('projectionActualBalance', '0,00 €');
         renderProjectionCashflow([]);
-        body.innerHTML = '<tr><td colspan="9" class="muted">Aun no hay proyecciones cargadas.</td></tr>';
+        body.innerHTML = '<tr><td colspan="9" class="muted">Aún no hay proyecciones cargadas.</td></tr>';
         return;
       }
       setText('projectionIncome', summary.projectedIncome);
@@ -1151,8 +1368,10 @@ def _render_html(
       body.innerHTML = rows.map(function(row) {
         const amountClass = row.kind === 'income' ? 'income' : 'expense';
         const statusClass = 'status-' + row.status;
-        const action = '<button class="linkish" type="button" data-projection-id="' + row.templateId + '" data-projection-month="' + row.month + '">Editar</button> ' +
-          '<button class="linkish" type="button" data-delete-projection-id="' + row.templateId + '" data-projection-month="' + row.month + '">Borrar</button>';
+        const action = editable
+          ? '<button class="linkish" type="button" data-projection-id="' + row.templateId + '" data-projection-month="' + row.month + '">Editar</button> ' +
+            '<button class="linkish" type="button" data-delete-projection-id="' + row.templateId + '" data-projection-month="' + row.month + '">Borrar</button>'
+          : '<span class="muted">—</span>';
         return '<tr>' +
           '<td class="description">' + escapeHtml(row.name) + '</td>' +
           '<td>' + escapeHtml(row.type) + '</td>' +
@@ -1613,19 +1832,39 @@ def _render_html(
         ctx.fillText(centsToMoney(row.value), pad.left + barW + 6, y + 16);
       });
     }
+    const RECEIPT_STATUS = {
+      nuevo: {label: 'Pendiente de revisar', tone: 'warn'},
+      pending: {label: 'Pendiente de revisar', tone: 'warn'},
+      voice_pending: {label: 'Audio por transcribir', tone: 'warn'},
+      dudoso: {label: 'Necesita revisión manual', tone: 'warn'},
+      processed: {label: 'Procesado', tone: 'ok'},
+      duplicado: {label: 'Duplicado', tone: 'neutral'},
+      missing: {label: 'Archivo no encontrado', tone: 'danger'}
+    };
+    function receiptStatus(status) {
+      return RECEIPT_STATUS[status] || {label: status || 'Desconocido', tone: 'neutral'};
+    }
     function renderReceipts() {
       const list = document.getElementById('receiptList');
       if (!receipts.length) {
-        list.innerHTML = '<div class="muted">Aun no hay archivos recibidos.</div>';
+        list.innerHTML = '<div class="muted">Aún no hay archivos recibidos.</div>';
         return;
       }
       list.innerHTML = receipts.slice().reverse().map(function(row) {
+        const state = receiptStatus(row.status);
         const link = row.url ? '<a href="' + row.url + '">Abrir archivo</a>' : '<span class="muted">Sin enlace</span>';
+        const path = row.path
+          ? '<details class="receipt-path"><summary>Ver ruta</summary><code>' + escapeHtml(row.path) + '</code></details>'
+          : '';
         return '<div class="receipt-item">' +
-          '<strong>#' + row.id + ' <span class="pill">' + escapeHtml(row.status) + '</span> · ' + escapeHtml(row.user) + ' · ' + escapeHtml(row.date) + '</strong>' +
-          '<div>' + link + ' <span class="muted">' + escapeHtml(row.path) + '</span></div>' +
+          '<div class="receipt-head">' +
+            '<span class="status-badge tone-' + state.tone + '">' + escapeHtml(state.label) + '</span>' +
+            '<span class="muted">#' + row.id + ' · ' + escapeHtml(row.user) + ' · ' + escapeHtml(row.date) + '</span>' +
+          '</div>' +
           (row.caption ? '<div>' + escapeHtml(row.caption) + '</div>' : '') +
           (row.reviewNotes ? '<div class="muted">' + escapeHtml(row.reviewNotes) + '</div>' : '') +
+          '<div>' + link + '</div>' +
+          path +
         '</div>';
       }).join('');
     }
@@ -1685,7 +1924,27 @@ def _render_html(
       if (event.target.id === 'projectionModal') closeProjectionModal();
     });
     document.getElementById('projectionForm').addEventListener('submit', submitProjectionEdit);
+    document.getElementById('toggleFilters').addEventListener('click', function() {
+      const panel = document.getElementById('moreFilters');
+      const button = document.getElementById('toggleFilters');
+      const open = panel.hidden;
+      panel.hidden = !open;
+      button.setAttribute('aria-expanded', String(open));
+      button.textContent = open ? 'Menos filtros' : 'Más filtros';
+    });
+    function setupEditableUi() {
+      // En modo lectura no mostramos controles de edición que no harían nada.
+      const head = document.getElementById('transactionsHead');
+      if (editable && head) {
+        const th = document.createElement('th');
+        th.textContent = 'Acciones';
+        head.appendChild(th);
+      }
+      const addButton = document.getElementById('addProjection');
+      if (addButton && !editable) addButton.hidden = true;
+    }
     window.addEventListener('resize', render);
+    setupEditableUi();
     initFilters();
     initEditForm();
     initProjectionMonths();
@@ -1700,12 +1959,14 @@ def _render_html(
     )
     return template.safe_substitute(
         title=escape("Reporte de finanzas"),
-        refresh_meta="" if editable else '<meta http-equiv="refresh" content="60">',
+        refresh_meta="",
         generated_at=escape(generated_at),
         edit_hint=(
-            '<p>Modo edición activado. Pulsa Editar en cualquier movimiento para corregirlo.</p>'
+            '<span class="mode-badge edit">✎ Modo edición</span>'
+            '<p class="mode-hint">Pulsa Editar en cualquier movimiento o proyección para corregirlo.</p>'
             if editable
-            else '<p class="muted">Este archivo es de lectura. Para editar, abre el panel local con: python scripts/serve_dashboard.py</p>'
+            else '<span class="mode-badge read">Solo lectura</span>'
+            '<p class="mode-hint">Para editar, abre el panel local: python scripts/serve_dashboard.py</p>'
         ),
         db_path=escape(db_path),
         transactions_json=json.dumps(transactions, ensure_ascii=False),

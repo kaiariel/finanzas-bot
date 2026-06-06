@@ -47,7 +47,7 @@ def test_report_includes_codex_analytics_panel(tmp_path) -> None:
 
     html = render_report_html(settings)
 
-    assert "Analisis Codex" in html
+    assert "Diagnóstico" in html
     assert 'id="analyticsPanel"' in html
     assert 'id="analyticsRecommendations"' in html
     assert "renderAnalytics" in html
