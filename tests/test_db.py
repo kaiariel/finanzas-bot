@@ -126,3 +126,59 @@ def test_update_projection_template_clears_installments(tmp_path) -> None:
     assert updated["default_amount_cents"] == 4000
     assert updated["installment_current"] is None
     assert updated["installment_total"] is None
+
+
+def test_expense_transaction_marks_matching_projection_completed(tmp_path) -> None:
+    db = FinanceDatabase(tmp_path / "finances.db", "Europe/Madrid")
+    template_id = db.upsert_projection_template(
+        kind="expense",
+        name="hosting sered",
+        default_amount_cents=3700,
+        category="Suscripciones",
+        start_month="2026-07",
+    )
+
+    transaction_id = db.add_manual_transaction(
+        kind="expense",
+        amount_cents=3700,
+        category="Suscripciones",
+        note="hosting sered",
+        store="Sered",
+        is_fixed=True,
+        source_text="pago por hosting sered",
+        created_at="2026-07-06T12:00:00+02:00",
+    )
+
+    occurrence = db.get_projection_occurrence(template_id, "2026-07")
+    transaction = db.get_transaction(transaction_id)
+    assert occurrence is not None
+    assert occurrence["status"] == "completed"
+    assert transaction is not None
+    assert transaction["projection_template_id"] == template_id
+
+
+def test_income_transaction_marks_matching_projection_completed(tmp_path) -> None:
+    db = FinanceDatabase(tmp_path / "finances.db", "Europe/Madrid")
+    template_id = db.upsert_projection_template(
+        kind="income",
+        name="Sueldo cocina Ariel",
+        default_amount_cents=118000,
+        category="Ingresos laborales",
+        start_month="2026-07",
+    )
+
+    transaction_id = db.add_manual_transaction(
+        kind="income",
+        amount_cents=118000,
+        category="Ingresos laborales",
+        note="sueldo cocina",
+        source_text="cobro de sueldo cocina",
+        created_at="2026-07-06T12:00:00+02:00",
+    )
+
+    occurrence = db.get_projection_occurrence(template_id, "2026-07")
+    transaction = db.get_transaction(transaction_id)
+    assert occurrence is not None
+    assert occurrence["status"] == "completed"
+    assert transaction is not None
+    assert transaction["projection_template_id"] == template_id

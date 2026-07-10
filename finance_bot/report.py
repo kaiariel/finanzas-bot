@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import json
+import unicodedata
 from datetime import datetime
+from difflib import get_close_matches
 from html import escape
 from pathlib import Path
 from string import Template
@@ -16,7 +18,11 @@ from finance_bot.formatting import (
     parse_created_at,
     tipo_label,
 )
-from finance_bot.parser import VALID_CATEGORIES
+from finance_bot.parser import (
+    HOUSEHOLD_FOOD_CATEGORY,
+    LEGACY_HOUSEHOLD_FOOD_CATEGORIES,
+    VALID_CATEGORIES,
+)
 
 
 def _user_label(row, aliases: dict[int, str] | None = None) -> str:
@@ -39,11 +45,53 @@ def _file_url(path_value: str | None) -> str:
         return ""
 
 
+def _normalize_text(value: str) -> str:
+    return "".join(
+        char for char in unicodedata.normalize("NFKD", value) if not unicodedata.combining(char)
+    ).replace("?", "").strip().lower()
+
+
+_NORMALIZED_CATEGORY_MAP = {
+    _normalize_text(category): category for category in VALID_CATEGORIES
+}
+_LEGACY_CATEGORY_MAP = {
+    _normalize_text(category): HOUSEHOLD_FOOD_CATEGORY
+    for category in LEGACY_HOUSEHOLD_FOOD_CATEGORIES
+}
+
+
+def _normalize_category(value: str | None) -> str:
+    raw = (value or "").strip()
+    if not raw:
+        return ""
+    normalized = _normalize_text(raw)
+    legacy = _LEGACY_CATEGORY_MAP.get(normalized)
+    if legacy:
+        return legacy
+    exact = _NORMALIZED_CATEGORY_MAP.get(normalized)
+    if exact:
+        return exact
+
+    close_match = get_close_matches(
+        normalized,
+        _NORMALIZED_CATEGORY_MAP.keys(),
+        n=1,
+        cutoff=0.75,
+    )
+    if close_match:
+        return _NORMALIZED_CATEGORY_MAP[close_match[0]]
+    return raw
+
+
 def _transaction_payload(rows, aliases: dict[int, str]) -> list[dict[str, object]]:
     transactions: list[dict[str, object]] = []
     for row in rows:
         created_at = parse_created_at(row["created_at"])
         receipt = row["receipt_local_path"] or ""
+        try:
+            inference_notes = json.loads(row["inference_notes"] or "[]")
+        except json.JSONDecodeError:
+            inference_notes = []
         transactions.append(
             {
                 "id": row["id"],
@@ -53,7 +101,8 @@ def _transaction_payload(rows, aliases: dict[int, str]) -> list[dict[str, object
                 "date": format_date(created_at),
                 "dateIso": created_at.strftime("%Y-%m-%d"),
                 "description": row["note"],
-                "category": row["category"] or "",
+                "sourceText": row["source_text"] or "",
+                "category": _normalize_category(row["category"]),
                 "amount": format_euro(row["amount_cents"]),
                 "amountCents": row["amount_cents"],
                 "kind": row["kind"],
@@ -68,6 +117,8 @@ def _transaction_payload(rows, aliases: dict[int, str]) -> list[dict[str, object
                 "hasReceipt": bool(receipt),
                 "reviewStatus": row["review_status"] or "registered",
                 "duplicateOfId": row["duplicate_of_id"],
+                "inferenceNotes": inference_notes,
+                "projectionTemplateId": row["projection_template_id"],
             }
         )
     return transactions
@@ -131,11 +182,17 @@ def _projection_payload(
         month: {"income": 0, "expense": 0}
         for month in months
     }
+    actual_expense_by_month_category = {month: {} for month in months}
     for transaction in transactions:
         month = str(transaction["monthKey"])
         kind = str(transaction["kind"])
         if month in actual_by_month and kind in actual_by_month[month]:
-            actual_by_month[month][kind] += int(transaction["amountCents"])
+            amount_cents = int(transaction["amountCents"])
+            actual_by_month[month][kind] += amount_cents
+            if kind == "expense":
+                category = str(transaction["category"] or "")
+                category_totals = actual_expense_by_month_category[month]
+                category_totals[category] = category_totals.get(category, 0) + amount_cents
 
     rows: list[dict[str, object]] = []
     summaries = {
@@ -185,17 +242,47 @@ def _projection_payload(
             status = str(override["status"]) if override is not None else "pending"
             note = str(override["note"]) if override is not None else ""
             kind = str(template["kind"])
+            category = _normalize_category(template["category"] or "")
+            template_name_key = _normalize_text(str(template["name"] or ""))
+            tracks_actual_category = (
+                kind == "expense"
+                and category == HOUSEHOLD_FOOD_CATEGORY
+                and template_name_key
+                in {
+                    _normalize_text("Hogar/Alimentacion"),
+                    _normalize_text("Hogar/Alimentación"),
+                    _normalize_text("Hogar y Alimentacion"),
+                    _normalize_text(HOUSEHOLD_FOOD_CATEGORY),
+                }
+                and status != "skipped"
+            )
+            actual_spent_cents = 0
+            remaining_budget_cents = amount_cents
+            if tracks_actual_category:
+                actual_spent_cents = actual_expense_by_month_category[month].get(category, 0)
+                remaining_budget_cents = amount_cents - actual_spent_cents
             summary = summaries[month]
 
             if status != "skipped":
                 key = "projectedIncomeCents" if kind == "income" else "projectedExpenseCents"
                 summary[key] += amount_cents
-            if status == "completed":
+            if tracks_actual_category:
+                summary["completedExpenseCents"] += actual_spent_cents
+                summary["pendingExpenseCents"] += remaining_budget_cents
+            elif status == "completed":
                 key = "completedIncomeCents" if kind == "income" else "completedExpenseCents"
                 summary[key] += amount_cents
             elif status == "pending":
                 key = "pendingIncomeCents" if kind == "income" else "pendingExpenseCents"
                 summary[key] += amount_cents
+
+            display_note = note
+            if tracks_actual_category:
+                budget_note = (
+                    f"Gastado real: {format_euro(actual_spent_cents)} · "
+                    f"falta: {format_euro(remaining_budget_cents)}"
+                )
+                display_note = f"{display_note} · {budget_note}" if display_note else budget_note
 
             rows.append(
                 {
@@ -205,15 +292,21 @@ def _projection_payload(
                     "kind": kind,
                     "type": tipo_label(kind),
                     "name": template["name"],
-                    "category": template["category"] or "",
+                    "category": category,
                     "group": template["group_name"] or "",
                     "startMonth": start_month,
                     "amountCents": amount_cents,
                     "amount": format_euro(amount_cents),
                     "defaultAmountCents": template["default_amount_cents"],
                     "status": status,
-                    "statusLabel": _projection_status_label(kind, status),
-                    "note": note,
+                    "statusLabel": "Variable" if tracks_actual_category else _projection_status_label(kind, status),
+                    "note": display_note,
+                    "storedNote": note,
+                    "tracksActualCategory": tracks_actual_category,
+                    "actualSpentCents": actual_spent_cents,
+                    "actualSpent": format_euro(actual_spent_cents),
+                    "remainingBudgetCents": remaining_budget_cents,
+                    "remainingBudget": format_euro(remaining_budget_cents),
                     "installmentLabel": installment_label,
                     "remainingInstallments": remaining_installments,
                     "remainingLabel": remaining_label,
@@ -245,7 +338,7 @@ def _projection_payload(
 
 
 def render_report_html(settings: Settings, *, editable: bool = False) -> str:
-    settings.ensure_dirs()
+    settings.ensure_core_dirs()
     db = FinanceDatabase(settings.sqlite_db_path, settings.timezone)
     transactions = _transaction_payload(db.list_transactions(), settings.telegram_user_aliases)
     receipts = _receipt_payload(db.list_receipts(), settings.telegram_user_aliases)
@@ -451,6 +544,28 @@ def _render_html(
       border-bottom: 1px solid var(--line);
       background: white;
     }
+    .cashflow-group {
+      border-bottom: 1px solid var(--line);
+      background: var(--panel-soft);
+    }
+    .cashflow-group:last-child {
+      border-bottom: 0;
+    }
+    .cashflow-group-header {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto;
+      gap: 8px;
+      padding: 9px 10px;
+      border-bottom: 1px solid var(--line);
+      font-size: 12px;
+      font-weight: 800;
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+      background: color-mix(in srgb, var(--panel) 82%, white);
+    }
+    .cashflow-group-items .cashflow-item:last-child {
+      border-bottom: 0;
+    }
     .cashflow-item span:first-child {
       overflow-wrap: anywhere;
     }
@@ -553,6 +668,19 @@ def _render_html(
       text-transform: uppercase;
       z-index: 1;
     }
+    thead .filter-row th {
+      top: 36px;
+      background: #fbfcfb;
+      padding-top: 6px;
+      padding-bottom: 6px;
+      text-transform: none;
+      font-size: 11px;
+    }
+    .filter-row select {
+      min-height: 30px;
+      padding: 4px 8px;
+      font-size: 12px;
+    }
     .amount { text-align: right; font-variant-numeric: tabular-nums; }
     .income { color: var(--accent); font-weight: 800; }
     .expense { color: var(--danger); font-weight: 800; }
@@ -571,6 +699,45 @@ def _render_html(
     .status-completed { color: var(--accent); font-weight: 800; }
     .status-pending { color: var(--warn); font-weight: 800; }
     .status-skipped { color: var(--muted); font-weight: 800; }
+    .status-chip {
+      display: inline-flex;
+      align-items: center;
+      gap: 5px;
+      min-height: 24px;
+      padding: 2px 10px;
+      border-radius: 999px;
+      font-size: 12px;
+      font-weight: 800;
+      white-space: nowrap;
+    }
+    .status-chip.status-completed { background: #e3f1ea; }
+    .status-chip.status-pending { background: #fbf0d8; }
+    .status-chip.status-skipped { background: #eaeeec; }
+    .quick-status {
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+      min-height: 28px;
+      padding: 2px 10px;
+      border: 1px solid var(--accent);
+      border-radius: 8px;
+      background: #fff;
+      color: var(--accent);
+      font: inherit;
+      font-size: 12px;
+      font-weight: 800;
+      cursor: pointer;
+      white-space: nowrap;
+    }
+    .quick-status:hover { background: #e3f1ea; }
+    .quick-status.undo { border-color: var(--line); color: var(--muted); }
+    .quick-status.undo:hover { background: #eaeeec; }
+    .quick-status:disabled { opacity: .5; cursor: wait; }
+    .cashflow-actions { display: inline-flex; align-items: center; gap: 8px; justify-self: end; }
+    .legend-proj-income { background: #1f7a5a; }
+    .legend-proj-expense { background: #b34545; }
+    .legend-proj-balance { background: #2c6387; }
+    .legend-actual-balance { background: #17211d; }
     .modal-backdrop {
       position: fixed;
       inset: 0;
@@ -639,6 +806,28 @@ def _render_html(
     .mode-badge.read { background: #e7eef4; color: var(--accent-2); }
     .mode-badge.edit { background: #e3f1ea; color: var(--accent); }
     .mode-hint { margin: 6px 0 0; color: var(--muted); font-size: 13px; }
+    .mode-actions { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 10px; }
+    .mode-actions a {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      min-height: 38px;
+      padding: 0 14px;
+      border-radius: 10px;
+      border: 1px solid var(--line);
+      background: #fff;
+      color: var(--accent-2);
+      font-size: 14px;
+      font-weight: 800;
+      text-decoration: none;
+      box-shadow: 0 4px 10px rgba(0, 0, 0, .04);
+    }
+    .mode-actions a.primary {
+      background: var(--accent);
+      border-color: var(--accent);
+      color: #fff;
+    }
+    .mode-actions a:hover { text-decoration: none; filter: brightness(.98); }
 
     /* Resumen con jerarquía: balance protagonista */
     .summary {
@@ -738,6 +927,24 @@ def _render_html(
     .receipt-path { margin-top: 6px; font-size: 12px; }
     .receipt-path summary { cursor: pointer; color: var(--accent-2); font-weight: 700; }
     .receipt-path code { color: var(--muted); word-break: break-all; font-size: 11px; }
+    .section-heading {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: baseline;
+      justify-content: space-between;
+      gap: 8px;
+      padding: 13px 14px;
+      border-bottom: 1px solid var(--line);
+    }
+    .section-heading h2 {
+      padding: 0;
+      border: 0;
+    }
+    .section-totals {
+      color: var(--muted);
+      font-size: 13px;
+      font-weight: 700;
+    }
 
     /* Bloques de alertas vs info */
     .insight-block + .insight-block { margin-top: 12px; }
@@ -817,7 +1024,21 @@ def _render_html(
         </div>
       </section>
 
-      <section class="cashflow-grid" aria-label="Flujo restante del mes">
+      <section class="panel">
+        <div class="section-heading">
+          <h2>Tendencia 12 meses</h2>
+          <div class="muted">Proyectado por mes y balance real registrado</div>
+        </div>
+        <div class="chart-legend">
+          <span><i class="legend-dot legend-proj-income"></i>Ingresos proyectados</span>
+          <span><i class="legend-dot legend-proj-expense"></i>Gastos proyectados</span>
+          <span><i class="legend-dot legend-proj-balance"></i>Balance proyectado</span>
+          <span><i class="legend-dot legend-actual-balance"></i>Balance real</span>
+        </div>
+        <div class="chart-wrap"><canvas id="trendChart"></canvas></div>
+      </section>
+
+      <section id="cashflowGrid" class="cashflow-grid" aria-label="Flujo restante del mes">
         <div class="cashflow-list">
           <h3><span>Ya cobrado</span><strong id="collectedIncomeTotal" class="income">0,00 €</strong></h3>
           <div id="collectedIncomeList" class="items"></div>
@@ -884,6 +1105,14 @@ def _render_html(
       </section>
 
       <section class="panel" style="margin-top: 14px;">
+        <div class="section-heading">
+          <h2>Avisos de IA</h2>
+          <div id="analyticsAiAlertsCount" class="section-totals">Sin avisos</div>
+        </div>
+        <div id="analyticsAiAlerts" class="list"></div>
+      </section>
+
+      <section class="panel" style="margin-top: 14px;">
         <h2>Lectura de los próximos meses</h2>
         <div class="table-wrap">
           <table>
@@ -914,16 +1143,21 @@ def _render_html(
         </div>
       </div>
       <div class="panel">
-        <h2>Ranking de tiendas</h2>
-        <div id="storeRanking" class="list"></div>
+        <div class="section-heading">
+          <h2>Ingresos filtrados</h2>
+          <div id="incomeListTotal" class="section-totals">0,00 €</div>
+        </div>
+        <div id="incomeList" class="list"></div>
       </div>
     </section>
 
     <section class="grid dashboard-panel" style="margin-top: 14px;">
       <div class="panel">
-        <h2>Evolución mensual</h2>
+        <div class="section-heading">
+          <h2>Gasto por dia</h2>
+          <div id="dailyExpenseMeta" class="section-totals">Sin datos</div>
+        </div>
         <div class="chart-legend">
-          <span><i class="legend-dot legend-income"></i>Ingresos</span>
           <span><i class="legend-dot legend-expense"></i>Gastos</span>
         </div>
         <div class="chart-wrap"><canvas id="monthlyChart"></canvas></div>
@@ -935,13 +1169,27 @@ def _render_html(
     </section>
 
     <section class="panel dashboard-panel" style="margin-top: 14px;">
-      <h2>Movimientos</h2>
+      <div class="section-heading">
+        <h2>Movimientos</h2>
+        <div id="transactionsTotals" class="section-totals">0 movimientos</div>
+      </div>
       <div class="table-wrap">
         <table>
           <thead>
             <tr id="transactionsHead">
               <th>Fecha</th><th>Descripción</th><th>Categoría</th>
               <th class="amount">Cantidad</th><th>Tipo</th><th>Tienda</th><th>Usuario</th><th>Fijo</th><th>Ticket</th>
+            </tr>
+            <tr class="filter-row">
+              <th></th>
+              <th></th>
+              <th><select id="tableCategoryFilter"></select></th>
+              <th><select id="amountSort"><option value="date_desc">Más reciente</option><option value="amount_asc">Cantidad asc</option><option value="amount_desc">Cantidad desc</option></select></th>
+              <th><select id="tableTypeFilter"></select></th>
+              <th><select id="tableStoreFilter"></select></th>
+              <th><select id="tableUserFilter"></select></th>
+              <th></th>
+              <th></th>
             </tr>
           </thead>
           <tbody id="transactionsBody"></tbody>
@@ -1021,6 +1269,13 @@ def _render_html(
       receipt: document.getElementById('receiptFilter'),
       search: document.getElementById('searchFilter')
     };
+    const movementFilters = {
+      category: document.getElementById('tableCategoryFilter'),
+      type: document.getElementById('tableTypeFilter'),
+      store: document.getElementById('tableStoreFilter'),
+      user: document.getElementById('tableUserFilter'),
+      amountSort: document.getElementById('amountSort')
+    };
     const projectionMonth = document.getElementById('projectionMonth');
     const analyticsMonth = document.getElementById('analyticsMonth');
 
@@ -1028,6 +1283,13 @@ def _render_html(
       return Array.from(new Set(values.filter(Boolean))).sort(function(a, b) {
         return String(a).localeCompare(String(b), 'es');
       });
+    }
+    function normalizeText(value) {
+      return String(value || '')
+        .normalize('NFD')
+        .replace(/[\u0300-\u036f]/g, '')
+        .toLowerCase()
+        .trim();
     }
     function fillSelect(select, values, allLabel) {
       select.innerHTML = '';
@@ -1049,6 +1311,10 @@ def _render_html(
       fillSelect(filters.user, unique(transactions.map(function(row) { return row.user; })), 'Todos');
       fillSelect(filters.fixed, ['Sí', 'No'], 'Todos');
       fillSelect(filters.receipt, ['Con ticket', 'Sin ticket'], 'Todos');
+      fillSelect(movementFilters.category, unique(transactions.map(function(row) { return row.category; })), 'Todas');
+      fillSelect(movementFilters.type, unique(transactions.map(function(row) { return row.type; })), 'Todos');
+      fillSelect(movementFilters.store, unique(transactions.map(function(row) { return row.store; })), 'Todas');
+      fillSelect(movementFilters.user, unique(transactions.map(function(row) { return row.user; })), 'Todos');
     }
     function initEditForm() {
       const category = document.getElementById('editCategory');
@@ -1097,7 +1363,7 @@ def _render_html(
     }
     function filteredTransactions() {
       const search = filters.search.value.trim().toLowerCase();
-      return transactions.filter(function(row) {
+      const filtered = transactions.filter(function(row) {
         if (filters.month.value && row.monthKey !== filters.month.value) return false;
         if (filters.category.value && row.category !== filters.category.value) return false;
         if (filters.type.value && row.type !== filters.type.value) return false;
@@ -1105,11 +1371,30 @@ def _render_html(
         if (filters.fixed.value && row.fixed !== filters.fixed.value) return false;
         if (filters.receipt.value === 'Con ticket' && !row.hasReceipt) return false;
         if (filters.receipt.value === 'Sin ticket' && row.hasReceipt) return false;
+        if (movementFilters.category.value && row.category !== movementFilters.category.value) return false;
+        if (movementFilters.type.value && row.type !== movementFilters.type.value) return false;
+        if (movementFilters.store.value && row.store !== movementFilters.store.value) return false;
+        if (movementFilters.user.value && row.user !== movementFilters.user.value) return false;
         if (search) {
           const haystack = [row.description, row.store, row.category, row.user].join(' ').toLowerCase();
           if (!haystack.includes(search)) return false;
         }
         return true;
+      });
+      if (movementFilters.amountSort.value === 'amount_asc') {
+        return filtered.slice().sort(function(a, b) {
+          if (a.amountCents !== b.amountCents) return a.amountCents - b.amountCents;
+          return a.createdAt.localeCompare(b.createdAt);
+        });
+      }
+      if (movementFilters.amountSort.value === 'amount_desc') {
+        return filtered.slice().sort(function(a, b) {
+          if (a.amountCents !== b.amountCents) return b.amountCents - a.amountCents;
+          return b.createdAt.localeCompare(a.createdAt);
+        });
+      }
+      return filtered.slice().sort(function(a, b) {
+        return b.createdAt.localeCompare(a.createdAt);
       });
     }
     function centsToMoney(cents) { return money.format(cents / 100); }
@@ -1191,6 +1476,10 @@ def _render_html(
         setDelta('incomeDelta', income, null, true);
         setDelta('expenseDelta', expense, null, false);
       }
+      setText(
+        'transactionsTotals',
+        rows.length + ' movimientos · ingresos ' + centsToMoney(income) + ' · egresos ' + centsToMoney(expense) + ' · balance ' + centsToMoney(balance)
+      );
     }
     function renderAlerts(rows) {
       const alertsList = document.getElementById('alertsList');
@@ -1230,15 +1519,18 @@ def _render_html(
         return {key: entry[0], value: entry[1]};
       }).sort(function(a, b) { return b.value - a.value; });
     }
-    function renderStoreRanking(rows) {
-      const list = document.getElementById('storeRanking');
-      const data = totalsBy(expenseRows(rows).filter(function(row) { return row.store; }), 'store').slice(0, 8);
-      if (!data.length) {
-        list.innerHTML = '<div class="muted">Sin tiendas en este filtro.</div>';
+    function renderIncomeList(rows) {
+      const list = document.getElementById('incomeList');
+      const incomeRows = rows.filter(function(row) { return row.kind === 'income'; });
+      const total = sum(incomeRows, function(row) { return row.amountCents; });
+      setText('incomeListTotal', centsToMoney(total));
+      if (!incomeRows.length) {
+        list.innerHTML = '<div class="muted">Sin ingresos en este filtro.</div>';
         return;
       }
-      list.innerHTML = data.map(function(item, index) {
-        return '<div class="notice"><strong>' + (index + 1) + '. ' + escapeHtml(item.key) + '</strong><br><span class="expense">' + centsToMoney(item.value) + '</span></div>';
+      list.innerHTML = incomeRows.map(function(row) {
+        const label = [row.date, row.description, row.store].filter(Boolean).join(' · ');
+        return '<div class="notice"><strong>' + escapeHtml(label) + '</strong><br><span class="income">' + centsToMoney(row.amountCents) + '</span></div>';
       }).join('');
     }
     function renderTable(rows) {
@@ -1248,7 +1540,7 @@ def _render_html(
         body.innerHTML = '<tr><td colspan="' + colCount + '" class="muted">No hay movimientos para los filtros seleccionados.</td></tr>';
         return;
       }
-      body.innerHTML = rows.slice().reverse().map(function(row) {
+      body.innerHTML = rows.map(function(row) {
         const source = row.receiptUrl
           ? '<a href="' + row.receiptUrl + '" title="Abrir ticket">📎</a>'
           : '<span class="muted" title="Sin ticket">—</span>';
@@ -1340,6 +1632,7 @@ def _render_html(
       });
     }
     function renderProjection() {
+      drawTrendChart();
       const month = projectionMonth.value || (projections.months[0] && projections.months[0].monthKey) || '';
       const summary = projectionSummaryForMonth(month);
       const body = document.getElementById('projectionBody');
@@ -1369,7 +1662,8 @@ def _render_html(
         const amountClass = row.kind === 'income' ? 'income' : 'expense';
         const statusClass = 'status-' + row.status;
         const action = editable
-          ? '<button class="linkish" type="button" data-projection-id="' + row.templateId + '" data-projection-month="' + row.month + '">Editar</button> ' +
+          ? quickStatusButton(row, {withLabel: true}) + ' ' +
+            '<button class="linkish" type="button" data-projection-id="' + row.templateId + '" data-projection-month="' + row.month + '">Editar</button> ' +
             '<button class="linkish" type="button" data-delete-projection-id="' + row.templateId + '" data-projection-month="' + row.month + '">Borrar</button>'
           : '<span class="muted">—</span>';
         return '<tr>' +
@@ -1379,16 +1673,109 @@ def _render_html(
           '<td>' + escapeHtml(row.installmentLabel) + '</td>' +
           '<td>' + escapeHtml(row.remainingLabel) + '</td>' +
           '<td class="amount ' + amountClass + '">' + escapeHtml(row.amount) + '</td>' +
-          '<td class="' + statusClass + '">' + escapeHtml(row.statusLabel) + '</td>' +
+          '<td><span class="status-chip ' + statusClass + '">' + escapeHtml(row.statusLabel) + '</span></td>' +
           '<td class="description">' + escapeHtml(row.note) + '</td>' +
           '<td>' + action + '</td>' +
         '</tr>';
       }).join('');
     }
+    function statusLabelFor(kind, status) {
+      if (status === 'completed') return kind === 'income' ? 'Cobrado' : 'Pagado';
+      if (status === 'skipped') return 'Omitido';
+      return 'Pendiente';
+    }
+    function quickStatusButton(row, options) {
+      options = options || {};
+      const attrs = ' data-status-id="' + row.templateId + '" data-status-month="' + row.month + '"';
+      if (row.status === 'pending') {
+        const label = options.withLabel ? '✓ ' + (row.kind === 'income' ? 'Cobrar' : 'Pagar') : '✓';
+        const title = row.kind === 'income' ? 'Marcar como cobrado' : 'Marcar como pagado';
+        return '<button class="quick-status" type="button" title="' + title + '"' + attrs + ' data-status-next="completed">' + label + '</button>';
+      }
+      const undoLabel = options.withLabel ? '↩ Pendiente' : '↩';
+      return '<button class="quick-status undo" type="button" title="Volver a pendiente"' + attrs + ' data-status-next="pending">' + undoLabel + '</button>';
+    }
+    async function setProjectionStatus(templateId, month, status, button) {
+      if (!editable) {
+        alert('Para editar abre el panel local con: python scripts/serve_dashboard.py');
+        return;
+      }
+      if (button) button.disabled = true;
+      try {
+        const url = '/api/projections/' + encodeURIComponent(templateId) + '/' + encodeURIComponent(month) + '/status';
+        const response = await fetch(url, {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({status: status})
+        });
+        const result = await response.json().catch(function() { return {}; });
+        if (!response.ok || !result.ok) {
+          throw new Error(result.error || 'No se pudo cambiar el estado.');
+        }
+        const row = getProjectionRow(templateId, month);
+        if (row) {
+          row.status = status;
+          row.statusLabel = statusLabelFor(row.kind, status);
+        }
+        renderProjection();
+      } catch (error) {
+        alert(error.message || 'No se pudo cambiar el estado.');
+        if (button) button.disabled = false;
+      }
+    }
+    function handleStatusClick(event) {
+      const button = event.target.closest('[data-status-id]');
+      if (!button) return false;
+      setProjectionStatus(
+        button.getAttribute('data-status-id'),
+        button.getAttribute('data-status-month'),
+        button.getAttribute('data-status-next') || 'completed',
+        button
+      );
+      return true;
+    }
     function cashflowTotal(rows) {
       return sum(rows, function(row) { return row.amountCents || 0; });
     }
-    function renderCashflowList(id, totalId, rows) {
+    function rowsGroupedByCategory(rows) {
+      const groups = new Map();
+      rows.forEach(function(row) {
+        const category = row.category || 'Sin categoria';
+        if (!groups.has(category)) groups.set(category, []);
+        groups.get(category).push(row);
+      });
+      return Array.from(groups.entries()).map(function(entry) {
+        return {
+          category: entry[0],
+          rows: entry[1],
+          totalCents: cashflowTotal(entry[1]),
+        };
+      }).sort(function(left, right) {
+        if (right.totalCents !== left.totalCents) return right.totalCents - left.totalCents;
+        return left.category.localeCompare(right.category, 'es');
+      });
+    }
+    function renderCashflowRows(rows) {
+      return rows.map(function(row) {
+        const tone = row.kind === 'income' ? 'income' : 'expense';
+        const quick = editable && !row.syntheticCashflow ? quickStatusButton(row) : '';
+        return '<div class="cashflow-item">' +
+          '<span>' + escapeHtml(row.name) + (row.note ? '<br><small class="muted">' + escapeHtml(row.note) + '</small>' : '') + '</span>' +
+          '<span class="cashflow-actions"><strong class="' + tone + '">' + escapeHtml(row.amount) + '</strong>' + quick + '</span>' +
+        '</div>';
+      }).join('');
+    }
+    function cashflowBudgetRow(row, amountCents, label, note) {
+      return Object.assign({}, row, {
+        name: label,
+        amountCents: amountCents,
+        amount: centsToMoney(amountCents),
+        note: note || '',
+        syntheticCashflow: true
+      });
+    }
+    function renderCashflowList(id, totalId, rows, options) {
+      options = options || {};
       const container = document.getElementById(id);
       const total = cashflowTotal(rows);
       setText(totalId, centsToMoney(total));
@@ -1396,20 +1783,46 @@ def _render_html(
         container.innerHTML = '<div class="muted" style="padding: 10px;">Sin movimientos.</div>';
         return total;
       }
-      container.innerHTML = rows.map(function(row) {
-        const tone = row.kind === 'income' ? 'income' : 'expense';
-        return '<div class="cashflow-item">' +
-          '<span>' + escapeHtml(row.name) + (row.note ? '<br><small class="muted">' + escapeHtml(row.note) + '</small>' : '') + '</span>' +
-          '<strong class="' + tone + '">' + escapeHtml(row.amount) + '</strong>' +
-        '</div>';
-      }).join('');
+      if (options.groupByCategory) {
+        container.innerHTML = rowsGroupedByCategory(rows).map(function(group) {
+          return '<section class="cashflow-group">' +
+            '<div class="cashflow-group-header">' +
+              '<span>' + escapeHtml(group.category) + '</span>' +
+              '<strong>' + escapeHtml(centsToMoney(group.totalCents)) + '</strong>' +
+            '</div>' +
+            '<div class="cashflow-group-items">' + renderCashflowRows(group.rows) + '</div>' +
+          '</section>';
+        }).join('');
+        return total;
+      }
+      container.innerHTML = renderCashflowRows(rows);
       return total;
     }
     function renderProjectionCashflow(rows) {
       const collectedIncomeRows = rows.filter(function(row) { return row.kind === 'income' && row.status === 'completed'; });
       const pendingIncomeRows = rows.filter(function(row) { return row.kind === 'income' && row.status === 'pending'; });
-      const paidExpenseRows = rows.filter(function(row) { return row.kind === 'expense' && row.status === 'completed'; });
-      const pendingExpenseRows = rows.filter(function(row) { return row.kind === 'expense' && row.status === 'pending'; });
+      const trackedExpenseRows = rows.filter(function(row) { return row.kind === 'expense' && row.tracksActualCategory; });
+      const manualExpenseRows = rows.filter(function(row) { return row.kind === 'expense' && !row.tracksActualCategory; });
+      const paidExpenseRows = manualExpenseRows
+        .filter(function(row) { return row.status === 'completed'; })
+        .concat(trackedExpenseRows.map(function(row) {
+          return cashflowBudgetRow(
+            row,
+            row.actualSpentCents || 0,
+            row.name + ' · gastado real',
+            'Registrado en movimientos del mes'
+          );
+        }));
+      const pendingExpenseRows = manualExpenseRows
+        .filter(function(row) { return row.status === 'pending'; })
+        .concat(trackedExpenseRows.map(function(row) {
+          return cashflowBudgetRow(
+            row,
+            row.remainingBudgetCents || 0,
+            row.name + ' · restante',
+            'Presupuesto mensual menos gasto real'
+          );
+        }));
       return {
         collectedIncome: renderCashflowList(
           'collectedIncomeList',
@@ -1419,7 +1832,8 @@ def _render_html(
         pendingIncome: renderCashflowList(
           'pendingIncomeList',
           'pendingIncomeTotal',
-          pendingIncomeRows
+          pendingIncomeRows,
+          {groupByCategory: true}
         ),
         paidExpense: renderCashflowList(
           'paidExpenseList',
@@ -1429,7 +1843,8 @@ def _render_html(
         pendingExpense: renderCashflowList(
           'pendingExpenseList',
           'pendingExpenseTotal',
-          pendingExpenseRows
+          pendingExpenseRows,
+          {groupByCategory: true}
         )
       };
     }
@@ -1488,11 +1903,50 @@ def _render_html(
         escapeHtml(item.text) +
       '</div>';
     }
+    function aiAlertsForMonth(month) {
+      const monthRows = transactions.filter(function(row) { return row.monthKey === month; });
+      const alerts = [];
+      monthRows.forEach(function(row) {
+        (row.inferenceNotes || []).forEach(function(note) {
+          alerts.push({
+            tone: 'warn',
+            title: '#' + row.id + ' · ' + (row.description || row.sourceText || row.category),
+            text: note + ' Se registró como ' + row.category + '. Si no corresponde, edítalo.'
+          });
+        });
+
+        const normalizedText = normalizeText(
+          [row.description, row.sourceText, row.store, row.category].filter(Boolean).join(' ')
+        );
+        const looksRecurringExpense = row.kind === 'expense' && (
+          row.isFixed ||
+          ['suscripcion', 'suscripciones', 'hosting', 'sered', 'hostinger', 'claude', 'chatgpt', 'alquiler', 'internet', 'seguro', 'cuota'].some(function(token) {
+            return normalizedText.includes(token);
+          })
+        );
+        const looksSalaryIncome = row.kind === 'income' && (
+          ['sueldo', 'nomina', 'cobro'].some(function(token) {
+            return normalizedText.includes(token);
+          })
+        );
+
+        if ((looksRecurringExpense || looksSalaryIncome) && !row.projectionTemplateId) {
+          alerts.push({
+            tone: 'warn',
+            title: '#' + row.id + ' · sin cruce con proyección',
+            text: 'No pude marcar automáticamente qué pago/cobro del mes corresponde a "' + (row.description || row.category) + '". Ahora quedó en ' + row.category + '; revísalo si era otro concepto.'
+          });
+        }
+      });
+      return alerts;
+    }
     function renderAnalytics() {
       const month = analyticsMonth.value || (projections.months[0] && projections.months[0].monthKey) || '';
       if (!month) {
         document.getElementById('analyticsNarrative').innerHTML = '<div class="muted">Aun no hay datos para analizar.</div>';
         document.getElementById('analyticsRecommendations').innerHTML = '<div class="muted">Carga movimientos o proyecciones para generar recomendaciones.</div>';
+        document.getElementById('analyticsAiAlerts').innerHTML = '<div class="muted">Sin avisos.</div>';
+        setText('analyticsAiAlertsCount', 'Sin avisos');
         document.getElementById('analyticsFutureBody').innerHTML = '<tr><td colspan="5" class="muted">Sin proyecciones.</td></tr>';
         return;
       }
@@ -1634,6 +2088,15 @@ def _render_html(
       }
       document.getElementById('analyticsRecommendations').innerHTML = recommendations.map(recommendationHtml).join('');
 
+      const aiAlerts = aiAlertsForMonth(month);
+      setText(
+        'analyticsAiAlertsCount',
+        aiAlerts.length ? (aiAlerts.length + ' aviso(s)') : 'Sin avisos'
+      );
+      document.getElementById('analyticsAiAlerts').innerHTML = aiAlerts.length
+        ? aiAlerts.map(recommendationHtml).join('')
+        : '<div class="muted">La IA no dejó dudas relevantes en este mes.</div>';
+
       document.getElementById('analyticsFutureBody').innerHTML = projections.months.slice(0, 6).map(function(row) {
         const balance = row.projectedBalanceCents || 0;
         const income = row.projectedIncomeCents || 0;
@@ -1672,7 +2135,7 @@ def _render_html(
       document.getElementById('projectionInstallmentCurrent').value = row.installmentCurrent || '';
       document.getElementById('projectionInstallmentTotal').value = row.installmentTotal || '';
       document.getElementById('projectionUpdateDefault').value = 'false';
-      document.getElementById('projectionNote').value = row.note || '';
+      document.getElementById('projectionNote').value = row.storedNote || row.note || '';
       document.getElementById('projectionModal').hidden = false;
       document.getElementById('projectionAmount').focus();
     }
@@ -1687,7 +2150,7 @@ def _render_html(
       document.getElementById('projectionEditMonth').value = month;
       document.getElementById('projectionName').value = '';
       document.getElementById('projectionKind').value = 'expense';
-      document.getElementById('projectionCategory').value = 'Hogar';
+      document.getElementById('projectionCategory').value = 'Hogar y Alimentación';
       document.getElementById('projectionAmount').value = '';
       document.getElementById('projectionStatus').value = 'pending';
       document.getElementById('projectionDuration').value = 'monthly';
@@ -1763,55 +2226,153 @@ def _render_html(
       ctx.clearRect(0, 0, rect.width, rect.height);
       return {ctx: ctx, width: rect.width, height: rect.height};
     }
-    function drawMonthlyChart(rows) {
+    function drawTrendChart() {
+      const canvas = document.getElementById('trendChart');
+      if (!canvas || canvas.offsetParent === null) return;
+      const base = chartBase(canvas);
+      const months = projections.months || [];
+      const ctx = base.ctx;
+      const pad = {left: 62, right: 16, top: 20, bottom: 36};
+      const innerW = base.width - pad.left - pad.right;
+      const innerH = base.height - pad.top - pad.bottom;
+      if (!months.length) {
+        ctx.fillStyle = '#60706a';
+        ctx.font = '12px system-ui';
+        ctx.fillText('Sin proyecciones cargadas.', pad.left, pad.top + 20);
+        return;
+      }
+      const hasActuals = function(month) {
+        return (month.actualIncomeCents || 0) !== 0 || (month.actualExpenseCents || 0) !== 0;
+      };
+      const balances = months.map(function(m) { return m.projectedBalanceCents || 0; })
+        .concat(months.filter(hasActuals).map(function(m) { return m.actualBalanceCents || 0; }));
+      const maxValue = Math.max(
+        1,
+        ...months.map(function(m) { return Math.max(m.projectedIncomeCents || 0, m.projectedExpenseCents || 0); }),
+        ...balances
+      );
+      const minValue = Math.min(0, ...balances);
+      const yFor = function(value) {
+        return pad.top + ((maxValue - value) / (maxValue - minValue)) * innerH;
+      };
+      ctx.font = '11px system-ui';
+      // Líneas guía horizontales con importes.
+      const steps = 4;
+      for (let i = 0; i <= steps; i++) {
+        const value = maxValue - ((maxValue - minValue) / steps) * i;
+        const y = yFor(value);
+        ctx.strokeStyle = '#eef2ee';
+        ctx.beginPath();
+        ctx.moveTo(pad.left, y);
+        ctx.lineTo(pad.left + innerW, y);
+        ctx.stroke();
+        ctx.fillStyle = '#60706a';
+        ctx.fillText(Math.round(value / 100) + ' €', 8, y + 4);
+      }
+      const zeroY = yFor(0);
+      ctx.strokeStyle = '#c8d2ca';
+      ctx.beginPath();
+      ctx.moveTo(pad.left, zeroY);
+      ctx.lineTo(pad.left + innerW, zeroY);
+      ctx.stroke();
+      const groupW = innerW / months.length;
+      const barW = Math.max(4, Math.min(16, groupW * 0.3));
+      const centerFor = function(index) { return pad.left + index * groupW + groupW / 2; };
+      months.forEach(function(month, index) {
+        const center = centerFor(index);
+        const incomeH = zeroY - yFor(month.projectedIncomeCents || 0);
+        const expenseH = zeroY - yFor(month.projectedExpenseCents || 0);
+        ctx.fillStyle = '#1f7a5a';
+        ctx.fillRect(center - barW - 1, zeroY - incomeH, barW, incomeH);
+        ctx.fillStyle = '#b34545';
+        ctx.fillRect(center + 1, zeroY - expenseH, barW, expenseH);
+        ctx.fillStyle = '#60706a';
+        const label = month.monthKey.slice(5) + '/' + month.monthKey.slice(2, 4);
+        ctx.fillText(label, center - ctx.measureText(label).width / 2, pad.top + innerH + 16);
+      });
+      // Línea de balance proyectado.
+      ctx.strokeStyle = '#2c6387';
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      months.forEach(function(month, index) {
+        const x = centerFor(index);
+        const y = yFor(month.projectedBalanceCents || 0);
+        if (index === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+      });
+      ctx.stroke();
+      ctx.lineWidth = 1;
+      // Puntos de balance real solo en meses con movimientos.
+      months.forEach(function(month, index) {
+        if (!hasActuals(month)) return;
+        const x = centerFor(index);
+        const y = yFor(month.actualBalanceCents || 0);
+        ctx.fillStyle = '#17211d';
+        ctx.beginPath();
+        ctx.arc(x, y, 4, 0, Math.PI * 2);
+        ctx.fill();
+        const amountLabel = centsToMoney(month.actualBalanceCents || 0);
+        ctx.fillText(amountLabel, x - ctx.measureText(amountLabel).width / 2, y - 9);
+      });
+    }
+    function drawDailyExpenseChart(rows) {
       const canvas = document.getElementById('monthlyChart');
       const base = chartBase(canvas);
-      const months = unique(transactions.map(function(row) { return row.monthKey; }));
-      const data = months.map(function(month) {
-        const monthRows = rows.filter(function(row) { return row.monthKey === month; });
-        return {
-          label: month,
-          income: sum(monthRows.filter(function(row) { return row.kind === 'income'; }), function(row) { return row.amountCents; }),
-          expense: sum(expenseRows(monthRows), function(row) { return row.amountCents; })
-        };
+      const expenseData = expenseRows(rows);
+      const selectedMonth = filters.month.value || unique(expenseData.map(function(row) { return row.monthKey; })).slice(-1)[0] || '';
+      const chartRows = selectedMonth
+        ? expenseData.filter(function(row) { return row.monthKey === selectedMonth; })
+        : expenseData;
+      const totalsByDay = new Map();
+      chartRows.forEach(function(row) {
+        const label = row.date;
+        totalsByDay.set(label, (totalsByDay.get(label) || 0) + row.amountCents);
       });
-      drawGroupedBars(base.ctx, base.width, base.height, data);
+      const data = Array.from(totalsByDay.entries()).map(function(entry) {
+        return { label: entry[0], value: entry[1] };
+      }).sort(function(a, b) {
+        const [dayA, monthA, yearA] = a.label.split('/').map(Number);
+        const [dayB, monthB, yearB] = b.label.split('/').map(Number);
+        return new Date(yearA, monthA - 1, dayA).getTime() - new Date(yearB, monthB - 1, dayB).getTime();
+      });
+      setText(
+        'dailyExpenseMeta',
+        (selectedMonth || 'Sin mes') + ' · total ' + centsToMoney(sum(chartRows, function(row) { return row.amountCents; }))
+      );
+      drawDailyBars(base.ctx, base.width, base.height, data);
     }
     function drawCategoryChart(rows) {
       const canvas = document.getElementById('categoryChart');
       const base = chartBase(canvas);
       drawHorizontalBars(base.ctx, base.width, base.height, totalsBy(expenseRows(rows), 'category').slice(0, 8));
     }
-    function drawGroupedBars(ctx, width, height, data) {
-      const pad = {left: 48, right: 16, top: 18, bottom: 44};
+    function drawDailyBars(ctx, width, height, data) {
+      const pad = {left: 52, right: 20, top: 24, bottom: 48};
       const innerW = width - pad.left - pad.right;
       const innerH = height - pad.top - pad.bottom;
-      const max = Math.max(1, ...data.flatMap(function(row) { return [row.income, row.expense]; }));
+      const max = Math.max(1, ...data.map(function(row) { return row.value; }));
       ctx.strokeStyle = '#dce4dd';
       ctx.fillStyle = '#60706a';
-      ctx.font = '12px system-ui';
+      ctx.font = '11px system-ui';
       ctx.beginPath();
       ctx.moveTo(pad.left, pad.top);
       ctx.lineTo(pad.left, pad.top + innerH);
       ctx.lineTo(pad.left + innerW, pad.top + innerH);
       ctx.stroke();
-      if (!data.length) { ctx.fillText('Sin datos', pad.left + 10, pad.top + 24); return; }
+      if (!data.length) { ctx.fillText('Sin gastos para este filtro', pad.left + 10, pad.top + 24); return; }
       const groupW = innerW / data.length;
       data.forEach(function(row, index) {
-        [['income', '#1f7a5a'], ['expense', '#b34545']].forEach(function(item, seriesIndex) {
-          const value = row[item[0]];
-          const barH = (value / max) * innerH;
-          const x = pad.left + index * groupW + 10 + seriesIndex * 18;
-          const y = pad.top + innerH - barH;
-          ctx.fillStyle = item[1];
-          ctx.fillRect(x, y, 14, barH);
-        });
+        const barW = Math.max(8, groupW - 8);
+        const value = row.value;
+        const barH = (value / max) * innerH;
+        const x = pad.left + index * groupW + (groupW - barW) / 2;
+        const y = pad.top + innerH - barH;
+        ctx.fillStyle = '#b34545';
+        ctx.fillRect(x, y, barW, barH);
         ctx.fillStyle = '#60706a';
-        ctx.save();
-        ctx.translate(pad.left + index * groupW + groupW / 2, pad.top + innerH + 14);
-        ctx.rotate(-0.45);
-        ctx.fillText(row.label, 0, 0);
-        ctx.restore();
+        const dayLabel = row.label.slice(0, 5);
+        ctx.fillText(dayLabel, x, pad.top + innerH + 14);
+        ctx.fillStyle = '#17211d';
+        ctx.fillText(centsToMoney(value), x, Math.max(14, y - 6));
       });
     }
     function drawHorizontalBars(ctx, width, height, data) {
@@ -1872,15 +2433,21 @@ def _render_html(
       const rows = filteredTransactions();
       renderSummary(rows);
       renderAlerts(rows);
-      renderStoreRanking(rows);
+      renderIncomeList(rows);
       renderTable(rows);
-      drawMonthlyChart(rows);
+      drawDailyExpenseChart(rows);
       drawCategoryChart(rows);
       renderReceipts();
     }
     Object.values(filters).forEach(function(control) { control.addEventListener('input', render); });
+    Object.values(movementFilters).forEach(function(control) { control.addEventListener('input', render); });
     document.getElementById('resetFilters').addEventListener('click', function() {
       Object.values(filters).forEach(function(control) { control.value = ''; });
+      movementFilters.category.value = '';
+      movementFilters.type.value = '';
+      movementFilters.store.value = '';
+      movementFilters.user.value = '';
+      movementFilters.amountSort.value = 'date_desc';
       render();
     });
     document.getElementById('transactionsBody').addEventListener('click', function(event) {
@@ -1902,7 +2469,9 @@ def _render_html(
     projectionMonth.addEventListener('input', renderProjection);
     analyticsMonth.addEventListener('input', renderAnalytics);
     document.getElementById('addProjection').addEventListener('click', openNewProjectionModal);
+    document.getElementById('cashflowGrid').addEventListener('click', handleStatusClick);
     document.getElementById('projectionBody').addEventListener('click', function(event) {
+      if (handleStatusClick(event)) return;
       const deleteButton = event.target.closest('[data-delete-projection-id]');
       if (deleteButton) {
         deleteProjectionItem(
@@ -1943,7 +2512,10 @@ def _render_html(
       const addButton = document.getElementById('addProjection');
       if (addButton && !editable) addButton.hidden = true;
     }
-    window.addEventListener('resize', render);
+    window.addEventListener('resize', function() {
+      render();
+      if (!document.getElementById('projectionPanel').hidden) renderProjection();
+    });
     setupEditableUi();
     initFilters();
     initEditForm();
@@ -1966,7 +2538,10 @@ def _render_html(
             '<p class="mode-hint">Pulsa Editar en cualquier movimiento o proyección para corregirlo.</p>'
             if editable
             else '<span class="mode-badge read">Solo lectura</span>'
-            '<p class="mode-hint">Para editar, abre el panel local: python scripts/serve_dashboard.py</p>'
+            '<p class="mode-hint">Este archivo es estático. Para editar, abre el panel local.</p>'
+            '<div class="mode-actions">'
+            '<a class="primary" href="http://127.0.0.1:8765/" target="_blank" rel="noreferrer">Abrir modo edición</a>'
+            '</div>'
         ),
         db_path=escape(db_path),
         transactions_json=json.dumps(transactions, ensure_ascii=False),

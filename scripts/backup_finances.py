@@ -15,7 +15,10 @@ from finance_bot.report import generate_report
 
 def main() -> None:
     settings = Settings.from_env()
-    settings.ensure_dirs()
+    settings.data_dir.mkdir(parents=True, exist_ok=True)
+    settings.sqlite_db_path.parent.mkdir(parents=True, exist_ok=True)
+    settings.export_csv_path.parent.mkdir(parents=True, exist_ok=True)
+    settings.report_html_path.parent.mkdir(parents=True, exist_ok=True)
     backup_dir = settings.data_dir / "backups"
     backup_dir.mkdir(parents=True, exist_ok=True)
 

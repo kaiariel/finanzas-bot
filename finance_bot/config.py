@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import unicodedata
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -40,7 +41,12 @@ def _parse_user_aliases(value: str | None) -> dict[int, str]:
 def _parse_bool(value: str | None, default: bool = False) -> bool:
     if value is None or value.strip() == "":
         return default
-    return value.strip().lower() in {"1", "true", "yes", "si", "sí", "on"}
+    normalized = "".join(
+        char
+        for char in unicodedata.normalize("NFKD", value.strip().lower())
+        if not unicodedata.combining(char)
+    )
+    return normalized in {"1", "true", "yes", "si", "on"}
 
 
 @dataclass(frozen=True)
@@ -55,6 +61,7 @@ class Settings:
     receipts_sync_dir: Path
     voices_sync_dir: Path
     timezone: str
+    prefer_codex_media_review: bool
     voice_transcription_enabled: bool
     voice_transcription_model: str
     voice_transcription_device: str
@@ -78,6 +85,9 @@ class Settings:
             receipts_sync_dir=Path(os.getenv("RECEIPTS_SYNC_DIR", data_dir / "receipts")),
             voices_sync_dir=Path(os.getenv("VOICES_SYNC_DIR", data_dir / "voices")),
             timezone=os.getenv("TIMEZONE", "Europe/Madrid").strip(),
+            prefer_codex_media_review=_parse_bool(
+                os.getenv("PREFER_CODEX_MEDIA_REVIEW"), default=True
+            ),
             voice_transcription_enabled=_parse_bool(
                 os.getenv("VOICE_TRANSCRIPTION_ENABLED"), default=False
             ),
@@ -92,10 +102,13 @@ class Settings:
         if not self.telegram_bot_token:
             raise RuntimeError("Falta TELEGRAM_BOT_TOKEN en .env")
 
-    def ensure_dirs(self) -> None:
+    def ensure_core_dirs(self) -> None:
         self.data_dir.mkdir(parents=True, exist_ok=True)
         self.sqlite_db_path.parent.mkdir(parents=True, exist_ok=True)
         self.export_csv_path.parent.mkdir(parents=True, exist_ok=True)
         self.report_html_path.parent.mkdir(parents=True, exist_ok=True)
+
+    def ensure_dirs(self) -> None:
+        self.ensure_core_dirs()
         self.receipts_sync_dir.mkdir(parents=True, exist_ok=True)
         self.voices_sync_dir.mkdir(parents=True, exist_ok=True)

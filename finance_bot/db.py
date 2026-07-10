@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import csv
+import json
+import re
 import sqlite3
+import unicodedata
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -15,7 +18,11 @@ from finance_bot.formatting import (
     parse_created_at,
     tipo_label,
 )
-from finance_bot.parser import ParsedTransaction
+from finance_bot.parser import (
+    HOUSEHOLD_FOOD_CATEGORY,
+    LEGACY_HOUSEHOLD_FOOD_CATEGORIES,
+    ParsedTransaction,
+)
 
 
 REVIEW_QUEUE_STATUSES = ("nuevo", "pending", "voice_pending", "dudoso")
@@ -132,6 +139,10 @@ class FinanceDatabase:
                 connection, "transactions", "review_status", "TEXT NOT NULL DEFAULT 'registered'"
             )
             self._ensure_column(connection, "transactions", "duplicate_of_id", "INTEGER")
+            self._ensure_column(
+                connection, "transactions", "inference_notes", "TEXT NOT NULL DEFAULT '[]'"
+            )
+            self._ensure_column(connection, "transactions", "projection_template_id", "INTEGER")
             self._ensure_column(connection, "receipts", "telegram_user_id", "INTEGER")
             self._ensure_column(connection, "receipts", "telegram_username", "TEXT")
             self._ensure_column(connection, "receipts", "telegram_full_name", "TEXT")
@@ -162,6 +173,7 @@ class FinanceDatabase:
             self._ensure_column(
                 connection, "projection_templates", "sort_order", "INTEGER NOT NULL DEFAULT 0"
             )
+            self._apply_household_food_projection_migration(connection)
 
     def _ensure_column(
         self, connection: sqlite3.Connection, table: str, column: str, definition: str
@@ -172,6 +184,72 @@ class FinanceDatabase:
         }
         if column not in columns:
             connection.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
+
+    def _apply_household_food_projection_migration(self, connection: sqlite3.Connection) -> None:
+        legacy_categories = tuple(
+            dict.fromkeys((*LEGACY_HOUSEHOLD_FOOD_CATEGORIES, HOUSEHOLD_FOOD_CATEGORY))
+        )
+        placeholders = ", ".join("?" for _ in legacy_categories)
+        connection.execute(
+            f"UPDATE transactions SET category = ? WHERE category IN ({placeholders})",
+            (HOUSEHOLD_FOOD_CATEGORY, *legacy_categories),
+        )
+        connection.execute(
+            f"""
+            UPDATE projection_templates
+            SET category = ?
+            WHERE kind = 'expense' AND category IN ({placeholders})
+            """,
+            (HOUSEHOLD_FOOD_CATEGORY, *legacy_categories),
+        )
+
+        household_names = (
+            "Hogar/Alimentacion",
+            "Hogar/Alimentación",
+            "Hogar y Alimentacion",
+            HOUSEHOLD_FOOD_CATEGORY,
+        )
+        household_placeholders = ", ".join("?" for _ in household_names)
+        connection.execute(
+            f"""
+            UPDATE projection_templates
+            SET name = ?, default_amount_cents = ?, category = ?, active = 1
+            WHERE kind = 'expense' AND name IN ({household_placeholders})
+            """,
+            (HOUSEHOLD_FOOD_CATEGORY, 60000, HOUSEHOLD_FOOD_CATEGORY, *household_names),
+        )
+        connection.execute(
+            f"""
+            UPDATE projection_occurrences
+            SET amount_cents = ?
+            WHERE template_id IN (
+                SELECT id FROM projection_templates
+                WHERE kind = 'expense' AND name = ?
+            )
+            """,
+            (60000, HOUSEHOLD_FOOD_CATEGORY),
+        )
+
+        izhan_projection_names = ("Musica Izhan", "Música Izhan", "Izhan hijo")
+        izhan_placeholders = ", ".join("?" for _ in izhan_projection_names)
+        connection.execute(
+            f"""
+            UPDATE projection_templates
+            SET active = 0
+            WHERE kind = 'expense' AND name IN ({izhan_placeholders})
+            """,
+            izhan_projection_names,
+        )
+        connection.execute(
+            """
+            UPDATE projection_templates
+            SET category = 'Ingresos laborales'
+            WHERE kind = 'income'
+              AND name IN ('Sueldo', 'Sueldo cocina Ariel', 'Sueldo Dahiana')
+              AND category = ?
+            """,
+            (HOUSEHOLD_FOOD_CATEGORY,),
+        )
 
     def add_transaction(
         self,
@@ -196,9 +274,9 @@ class FinanceDatabase:
                     store, is_fixed, source_text, receipt_local_path, receipt_drive_file_id,
                     receipt_drive_url, telegram_message_id, telegram_user_id,
                     telegram_username, telegram_full_name, receipt_id, review_status,
-                    duplicate_of_id
+                    duplicate_of_id, inference_notes
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     self._now(),
@@ -220,9 +298,12 @@ class FinanceDatabase:
                     receipt_id,
                     review_status,
                     duplicate_of_id,
+                    json.dumps(list(parsed.inference_notes), ensure_ascii=False),
                 ),
             )
-            return int(cursor.lastrowid)
+            transaction_id = int(cursor.lastrowid)
+        self.auto_apply_projection_for_transaction(transaction_id)
+        return transaction_id
 
     def add_manual_transaction(
         self,
@@ -258,9 +339,9 @@ class FinanceDatabase:
                     store, is_fixed, source_text, receipt_local_path, receipt_drive_file_id,
                     receipt_drive_url, telegram_message_id, telegram_user_id,
                     telegram_username, telegram_full_name, receipt_id, review_status,
-                    duplicate_of_id
+                    duplicate_of_id, inference_notes
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     created_at or self._now(),
@@ -282,9 +363,12 @@ class FinanceDatabase:
                     receipt_id,
                     review_status,
                     duplicate_of_id,
+                    "[]",
                 ),
             )
-            return int(cursor.lastrowid)
+            transaction_id = int(cursor.lastrowid)
+        self.auto_apply_projection_for_transaction(transaction_id)
+        return transaction_id
 
     def add_receipt(
         self,
@@ -353,7 +437,8 @@ class FinanceDatabase:
                 SELECT id, created_at, kind, amount_cents, currency, category, note,
                        store, is_fixed, source_text, receipt_local_path,
                        telegram_user_id, telegram_username, telegram_full_name,
-                       receipt_id, review_status, duplicate_of_id
+                       receipt_id, review_status, duplicate_of_id,
+                       inference_notes, projection_template_id
                 FROM transactions
                 WHERE id = ?
                 """,
@@ -371,6 +456,9 @@ class FinanceDatabase:
         note: str | None = None,
         store: str | None = None,
         is_fixed: bool | None = None,
+        review_status: str | None = None,
+        inference_notes: list[str] | tuple[str, ...] | None = None,
+        projection_template_id: int | None = None,
     ) -> sqlite3.Row:
         if kind is not None and kind not in {"expense", "income"}:
             raise ValueError("kind debe ser 'expense' o 'income'")
@@ -384,6 +472,7 @@ class FinanceDatabase:
             "category": category,
             "note": note,
             "store": store,
+            "review_status": review_status,
         }
         for column, value in values.items():
             if value is not None:
@@ -392,6 +481,12 @@ class FinanceDatabase:
         if is_fixed is not None:
             updates.append("is_fixed = ?")
             params.append(1 if is_fixed else 0)
+        if inference_notes is not None:
+            updates.append("inference_notes = ?")
+            params.append(json.dumps(list(inference_notes), ensure_ascii=False))
+        if projection_template_id is not None:
+            updates.append("projection_template_id = ?")
+            params.append(projection_template_id)
 
         if not updates:
             existing = self.get_transaction(transaction_id)
@@ -412,7 +507,8 @@ class FinanceDatabase:
                 SELECT id, created_at, kind, amount_cents, currency, category, note,
                        store, is_fixed, source_text, receipt_local_path,
                        telegram_user_id, telegram_username, telegram_full_name,
-                       receipt_id, review_status, duplicate_of_id
+                       receipt_id, review_status, duplicate_of_id,
+                       inference_notes, projection_template_id
                 FROM transactions
                 WHERE id = ?
                 """,
@@ -772,11 +868,136 @@ class FinanceDatabase:
                 SELECT id, created_at, kind, amount_cents, currency, category, note,
                        store, is_fixed, source_text, receipt_local_path,
                        telegram_user_id, telegram_username, telegram_full_name,
-                       receipt_id, review_status, duplicate_of_id
+                       receipt_id, review_status, duplicate_of_id,
+                       inference_notes, projection_template_id
                 FROM transactions
                 ORDER BY created_at ASC, id ASC
                 """
             ).fetchall()
+
+    def auto_apply_projection_for_transaction(self, transaction_id: int) -> int | None:
+        row = self.get_transaction(transaction_id)
+        if row is None:
+            raise KeyError(f"No existe el movimiento {transaction_id}")
+
+        month = str(row["created_at"])[:7]
+        transaction_text = " ".join(
+            part
+            for part in (
+                row["note"],
+                row["source_text"],
+                row["store"],
+                row["category"],
+            )
+            if part
+        )
+        normalized_text = self._normalize_text(transaction_text)
+        templates = [
+            template
+            for template in self.list_projection_templates()
+            if template["kind"] == row["kind"] and self._projection_applies_to_month(template, month)
+        ]
+        if not templates:
+            return None
+
+        scored: list[tuple[int, int, sqlite3.Row]] = []
+        for template in templates:
+            score = self._projection_match_score(row, template, normalized_text, month)
+            if score > 0:
+                scored.append((score, int(template["id"]), template))
+        if not scored:
+            return None
+
+        scored.sort(key=lambda item: (item[0], -item[1]), reverse=True)
+        best_score, _, best_template = scored[0]
+        second_score = scored[1][0] if len(scored) > 1 else -999
+        if best_score < 70 or best_score - second_score < 12:
+            return None
+
+        template_id = int(best_template["id"])
+        occurrence = self.get_projection_occurrence(template_id, month)
+        amount_cents = (
+            int(occurrence["amount_cents"])
+            if occurrence is not None
+            else int(best_template["default_amount_cents"])
+        )
+        note = str(occurrence["note"]) if occurrence is not None else ""
+        if not note.strip():
+            note = f"Marcado automaticamente por movimiento #{transaction_id}: {row['note']}"
+        self.set_projection_occurrence(
+            template_id=template_id,
+            month=month,
+            amount_cents=amount_cents,
+            status="completed",
+            note=note,
+        )
+        self.update_transaction(transaction_id, projection_template_id=template_id)
+        return template_id
+
+    def _projection_applies_to_month(self, template: sqlite3.Row, month: str) -> bool:
+        start_month = str(template["start_month"] or month)
+        month_offset = self._month_distance(start_month, month)
+        if month_offset < 0:
+            return False
+        installment_current = template["installment_current"]
+        installment_total = template["installment_total"]
+        if installment_current and installment_total:
+            return int(installment_current) + month_offset <= int(installment_total)
+        return True
+
+    def _projection_match_score(
+        self,
+        transaction: sqlite3.Row,
+        template: sqlite3.Row,
+        normalized_text: str,
+        month: str,
+    ) -> int:
+        template_name = self._normalize_text(str(template["name"] or ""))
+        if not template_name:
+            return 0
+
+        template_tokens = set(re.findall(r"\w+", template_name))
+        text_tokens = set(re.findall(r"\w+", normalized_text))
+        overlap = len(template_tokens & text_tokens)
+        score = overlap * 18
+
+        if template_name in normalized_text:
+            score += 80
+        if normalized_text and normalized_text in template_name:
+            score += 35
+        if transaction["store"]:
+            store = self._normalize_text(str(transaction["store"]))
+            if store and (store in template_name or template_name in store):
+                score += 24
+        if self._normalize_text(str(transaction["category"] or "")) == self._normalize_text(
+            str(template["category"] or "")
+        ):
+            score += 16
+
+        template_amount = int(template["default_amount_cents"])
+        occurrence = self.get_projection_occurrence(int(template["id"]), month)
+        if occurrence is not None:
+            template_amount = int(occurrence["amount_cents"])
+        difference = abs(int(transaction["amount_cents"]) - template_amount)
+        if difference == 0:
+            score += 26
+        elif difference <= 150:
+            score += 10
+
+        if transaction["is_fixed"]:
+            score += 10
+        return score
+
+    @staticmethod
+    def _normalize_text(value: str) -> str:
+        normalized = unicodedata.normalize("NFKD", value.strip().lower())
+        return "".join(ch for ch in normalized if not unicodedata.combining(ch))
+
+    @staticmethod
+    def _month_distance(start_month: str, end_month: str) -> int:
+        start = datetime.fromisoformat(start_month + "-01")
+        end = datetime.fromisoformat(end_month + "-01")
+        return (end.year - start.year) * 12 + (end.month - start.month)
 
     def export_csv(self, csv_path: Path) -> Path:
         csv_path.parent.mkdir(parents=True, exist_ok=True)

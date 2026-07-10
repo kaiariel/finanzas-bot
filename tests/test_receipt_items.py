@@ -15,8 +15,8 @@ def test_cash_fresh_ticket_items_are_split() -> None:
     assert parsed is not None
     assert parsed.store == "Cash Fresh"
     assert [(item.description, item.amount_cents, item.category) for item in parsed.items] == [
-        ("Agua Mineral", 69, "Alimentación"),
-        ("Leche Entera Brick", 690, "Alimentación"),
+        ("Agua Mineral", 69, "Hogar y Alimentación"),
+        ("Leche Entera Brick", 690, "Hogar y Alimentación"),
     ]
     assert parsed.difference_cents == 0
 
@@ -39,9 +39,9 @@ def test_mas_ticket_items_and_total_difference() -> None:
         "Postre Manz-Platano",
         "Diferencia / redondeo",
     ]
-    assert parsed.items[0].category == "Hogar"
+    assert parsed.items[0].category == "Hogar y Alimentación"
     assert parsed.items[-1].amount_cents == 7
-    assert parsed.items[-1].category == "Hogar"
+    assert parsed.items[-1].category == "Hogar y Alimentación"
 
 
 def test_non_item_bank_pdf_is_not_supermarket_ticket() -> None:

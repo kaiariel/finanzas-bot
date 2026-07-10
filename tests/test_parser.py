@@ -19,7 +19,7 @@ def test_parse_expense_text() -> None:
     assert parsed.kind == "expense"
     assert parsed.amount_cents == 1250
     assert parsed.currency == "EUR"
-    assert parsed.category == "Alimentación"
+    assert parsed.category == "Hogar y Alimentación"
     assert parsed.note == "mercadona comida"
     assert parsed.store == "Mercadona"
     assert parsed.is_fixed is False
@@ -32,6 +32,9 @@ def test_parse_income_text() -> None:
     assert parsed.kind == "income"
     assert parsed.amount_cents == 120000
     assert parsed.category == "Ingresos laborales"
+    assert parsed.inference_notes == (
+        "No se pudo deducir a que ingreso concreto del mes corresponde este cobro.",
+    )
 
 
 def test_google_ads_for_client_is_reimbursable_expense() -> None:
@@ -65,7 +68,7 @@ def test_free_text_supermarket_expense() -> None:
     parsed = parse_transaction("hoy gasté 20 euros en el super")
 
     assert parsed is not None
-    assert parsed.category == "Alimentación"
+    assert parsed.category == "Hogar y Alimentación"
     assert parsed.note == "super"
     assert parsed.store == ""
 
@@ -86,6 +89,16 @@ def test_fixed_subscription() -> None:
     assert parsed.store == "ChatGPT"
     assert parsed.is_fixed is True
     assert parsed.note == "ChatGPT"
+    assert parsed.inference_notes == ()
+
+
+def test_hostinger_is_subscription() -> None:
+    parsed = parse_transaction("gasto 26 hostinger")
+
+    assert parsed is not None
+    assert parsed.category == "Suscripciones"
+    assert parsed.store == "Hostinger"
+    assert parsed.is_fixed is True
 
 
 def test_samsung_installment_ignores_model_and_installment_numbers() -> None:
@@ -137,13 +150,34 @@ def test_cobro_with_expense_categories_is_treated_as_charge() -> None:
 
     assert [(item.kind, item.amount_cents, item.category, item.store) for item in parsed] == [
         ("expense", 2200, "Salud & Cuidado", ""),
-        ("expense", 2500, "Izhan", ""),
+        ("expense", 2500, "Hogar y Alimentación", ""),
         ("expense", 600, "Suscripciones", "Anthropic"),
         ("expense", 500, "Suscripciones", "ChatGPT"),
         ("expense", 2000, "Ocio", ""),
         ("expense", 1300, "Suscripciones", "Capcut"),
     ]
-    assert [item.is_fixed for item in parsed] == [True, True, False, False, False, True]
+    assert [item.is_fixed for item in parsed] == [True, False, False, False, False, True]
+
+
+def test_spoken_euro_amount_is_parsed() -> None:
+    parsed = parse_transaction("pegatinas para Isan por dos euros")
+
+    assert parsed is not None
+    assert parsed.amount_cents == 200
+    assert parsed.category == "Hogar y Alimentación"
+    assert parsed.note == "pegatinas para Isan"
+
+
+def test_audio_style_sentence_with_multiple_amounts_is_split() -> None:
+    parsed = parse_transactions(
+        "frutas y verduras 9,54 por vaso para Isan por un euro y pegatinas para Isan por dos euros"
+    )
+
+    assert [(item.note, item.amount_cents, item.category) for item in parsed] == [
+        ("frutas y verduras", 954, "Hogar y Alimentación"),
+        ("vaso para Isan", 100, "Hogar y Alimentación"),
+        ("pegatinas para Isan", 200, "Hogar y Alimentación"),
+    ]
 
 
 def test_transaction_table_format() -> None:
@@ -153,5 +187,5 @@ def test_transaction_table_format() -> None:
     assert transaction_table([parsed], datetime(2026, 6, 1)) == (
         "| Mes | Fecha | Descripción | Categoría | Cantidad | Tipo | Tienda | Es fijo |\n"
         "|-----|-------|-------------|-----------|----------|------|--------|---------|\n"
-        "| Junio | 01/06/2026 | mercadona comida | Alimentación | 12,50 € | Egreso | Mercadona | No |"
+        "| Junio | 01/06/2026 | mercadona comida | Hogar y Alimentación | 12,50 € | Egreso | Mercadona | No |"
     )

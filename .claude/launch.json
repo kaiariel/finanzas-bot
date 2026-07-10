@@ -1,0 +1,17 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "dashboard",
+      "runtimeExecutable": ".venv\\Scripts\\python.exe",
+      "runtimeArgs": ["scripts/serve_dashboard.py"],
+      "port": 8765
+    },
+    {
+      "name": "report-preview",
+      "runtimeExecutable": "python",
+      "runtimeArgs": ["-m", "http.server", "8799", "--directory", "reports"],
+      "port": 8799
+    }
+  ]
+}

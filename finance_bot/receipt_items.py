@@ -5,6 +5,7 @@ from dataclasses import dataclass, replace
 
 from finance_bot.parser import (
     GROCERY_STORES,
+    HOUSEHOLD_FOOD_CATEGORY,
     amount_to_cents,
     infer_category_from_keywords,
     infer_store,
@@ -94,12 +95,10 @@ def _line_should_skip(line: str) -> bool:
 def _item_category(description: str, store: str) -> str:
     normalized = normalize_text(description)
     if "bolsa" in normalized:
-        return "Hogar"
+        return HOUSEHOLD_FOOD_CATEGORY
     if "agua mineral" in normalized:
-        return "Alimentación"
-    return infer_category_from_keywords(description, store) or (
-        "Alimentación" if store in GROCERY_STORES else "Hogar"
-    )
+        return HOUSEHOLD_FOOD_CATEGORY
+    return infer_category_from_keywords(description, store) or HOUSEHOLD_FOOD_CATEGORY
 
 
 def _find_total(text: str) -> int | None:
@@ -157,7 +156,7 @@ def parse_supermarket_receipt_items(text: str) -> ParsedReceiptItems | None:
                 ReceiptItem(
                     description="Diferencia / redondeo",
                     amount_cents=difference_cents,
-                    category="Hogar",
+                    category=HOUSEHOLD_FOOD_CATEGORY,
                     store=store,
                     source_line="Diferencia / redondeo",
                 )

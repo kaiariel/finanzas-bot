@@ -27,11 +27,10 @@ EXPENSES = [
     ("chatgpt", "23,00", "", "Fijo", "Suscripciones"),
     ("Claude", "22,00", "", "Fijo", "Suscripciones"),
     ("telefono", "59,00", "Pagado", "1/12", "Deudas"),
-    ("Seguro Santander", "22,00", "", "Fijo", "Hogar"),
+    ("Seguro Santander", "22,00", "", "Fijo", "Hogar y Alimentación"),
     ("Contadora", "10,00", "", "Fijo", "Suscripciones"),
     ("Cu", "15,00", "Pagado", "26/60", "Deudas"),
     ("Cuota camara", "135,00", "", "6/12", "Deudas"),
-    ("Musica Izhan", "25,00", "", "Fijo", "Izhan"),
     ("icloud", "3,00", "", "Fijo", "Suscripciones"),
     ("Disney", "14,00", "", "Fijo", "Suscripciones"),
     ("Prime", "5,00", "", "Fijo", "Suscripciones"),
@@ -40,8 +39,7 @@ EXPENSES = [
     ("Alquiler", "700,00", "", "Fijo", "Alquiler"),
     ("Agua", "25,00", "", "Fijo", "Suministros"),
     ("Electricidad", "70,00", "", "Fijo", "Suministros"),
-    ("Hogar/Alimentacion", "500,00", "", "Fijo", "Alimentación"),
-    ("Izhan hijo", "250,00", "", "Fijo", "Izhan"),
+    ("Hogar y Alimentación", "600,00", "", "Fijo", "Hogar y Alimentación"),
     ("Pago amazon silla", "36,00", "", "3/4", "Deudas"),
 ]
 

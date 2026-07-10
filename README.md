@@ -34,6 +34,27 @@ Los mensajes de texto claros se registran directamente como movimientos.
 Las fotos, PDFs y voces ambiguas quedan en la bandeja de pendientes. No aparecen en la
 lista de movimientos hasta que se revisan y se convierten en entradas contables.
 
+## Cambios recientes
+
+- La revision de imagenes y audios ahora prefiere Codex por defecto: `review_pending.py`
+  marca esos pendientes como `dudoso` para revision manual, y el OCR/transcripcion local
+  queda como alternativa con `PREFER_CODEX_MEDIA_REVIEW=0`.
+- El parser entiende importes hablados sencillos, como `dos euros`, `veintidos euros` o
+  `treinta y cinco euros`, y separa mejor frases de audio con varios importes.
+- Las categorias `Alimentacion`, `Hogar` e `Izhan` se consolidaron en
+  `Hogar y Alimentación`; la migracion tambien corrige movimientos y proyecciones antiguas.
+- Los movimientos pueden enlazarse automaticamente con proyecciones mensuales. Si el
+  cruce es fiable, la proyeccion queda como completada y el movimiento guarda el
+  `projection_template_id`.
+- El reporte HTML incorpora filtros en la tabla de movimientos, lista de ingresos
+  filtrados, gasto diario, tendencia de 12 meses y avisos de IA cuando una categoria o
+  proyeccion se asumio con dudas.
+- El panel editable permite marcar proyecciones como `Pagar`, `Cobrar` o `Pendiente` con
+  un clic, conservando importe y nota del mes.
+- El registro manual de tickets valida todas las entradas antes de escribir, evita
+  duplicar movimientos en un pendiente ya registrado salvo que se autorice, y mantiene
+  el reporte actualizado.
+
 ## Instalacion
 
 Requisitos recomendados:
@@ -78,6 +99,7 @@ TIMEZONE=Europe/Madrid
 
 RECEIPTS_SYNC_DIR=data/receipts
 VOICES_SYNC_DIR=data/voices
+PREFER_CODEX_MEDIA_REVIEW=1
 
 VOICE_TRANSCRIPTION_ENABLED=0
 VOICE_TRANSCRIPTION_MODEL=base
@@ -161,6 +183,9 @@ gasto 4,20 Lidl frutas
 ingreso 250 trabajo extra
 ```
 
+El parser tambien tolera importes hablados sencillos, por ejemplo `spotify veintidos euros`
+o `gasto treinta y cinco euros mercadona`.
+
 Gastos pagados por adelantado para clientes:
 
 ```text
@@ -202,7 +227,7 @@ Ver pendientes desde terminal:
 python scripts/list_pending.py
 ```
 
-Revisar automaticamente pendientes con reglas locales, PDF, OCR o voz:
+Revisar automaticamente pendientes con reglas locales. Por defecto, las imagenes y audios se derivan a revision manual por Codex:
 
 ```powershell
 python scripts/review_pending.py
@@ -212,9 +237,10 @@ Notas importantes:
 
 - `review_pending.py` modifica la base de datos si consigue registrar movimientos.
 - Los PDFs se leen con `pypdf`.
-- Las imagenes necesitan Tesseract OCR instalado.
+- Por defecto, las imagenes y audios se marcan como `dudoso` para revision por Codex en vez de usar OCR/transcripcion local.
+- Si quieres volver al flujo anterior, configura `PREFER_CODEX_MEDIA_REVIEW=0` en `.env`.
+- Con `PREFER_CODEX_MEDIA_REVIEW=0`, las imagenes necesitan Tesseract OCR instalado.
 - Si Tesseract no esta en el `PATH`, configura `TESSERACT_CMD` en `.env`.
-- Si OCR no esta disponible, las imagenes quedan como `dudoso` para revision manual.
 
 ## Registrar tickets manualmente
 
@@ -240,7 +266,7 @@ Ejemplo:
     {
       "type": "Egreso",
       "amount": 605,
-      "category": "Izhan",
+      "category": "Hogar y Alimentación",
       "description": "Pañales talla 5",
       "store": "Mercadona",
       "date": "2026-06-02"
@@ -248,7 +274,7 @@ Ejemplo:
     {
       "type": "Egreso",
       "amount": "4,90",
-      "category": "Alimentación",
+      "category": "Hogar y Alimentación",
       "description": "Atún claro oliva pack 6",
       "store": "Mercadona",
       "date": "2026-06-02"
@@ -285,12 +311,14 @@ El reporte incluye:
 - Resumen mensual.
 - Balance.
 - Gastos por categoria.
-- Ranking de tiendas.
+- Lista de ingresos filtrados.
 - Movimientos filtrables.
 - Usuarios.
 - Estado de tickets.
 - Enlaces a archivos originales.
 - Proyeccion mensual de ingresos y gastos.
+- Grafico diario de gasto para el mes filtrado.
+- Grafico de tendencia de 12 meses con balance proyectado y balance real.
 - Pestaña `Analisis Codex` con diagnostico del mes, meses futuros en riesgo y recomendaciones basadas en movimientos, tickets y proyecciones.
 
 ## Panel local editable
@@ -310,6 +338,13 @@ http://127.0.0.1:8765
 Desde el panel puedes editar movimientos y proyecciones. Los cambios se escriben en
 SQLite y regeneran el reporte HTML.
 
+En la pestaña `Proyeccion` cada item pendiente tiene un boton rapido `✓ Pagar` o
+`✓ Cobrar` que cambia el estado con un clic, sin abrir el formulario de edicion.
+Los items ya completados muestran `↩ Pendiente` para deshacer. El cambio se aplica
+al instante sin recargar la pagina. La pestaña tambien incluye un grafico de
+tendencia de 12 meses con ingresos y gastos proyectados, balance proyectado y
+balance real registrado.
+
 Advertencia: el panel local tiene APIs de escritura. Usalo solo en tu maquina o red de
 confianza.
 
@@ -317,6 +352,13 @@ confianza.
 
 El reporte y el panel incluyen una pestaña de proyeccion para planificar meses futuros.
 Puedes tener gastos fijos, cuotas, ingresos esperados, items pagados/cobrados y omitidos.
+Cuando un movimiento nuevo coincide de forma clara con una proyeccion activa del mes,
+el sistema la marca automaticamente como completada. Esto funciona tanto para ingresos
+como para gastos recurrentes, y evita tener que cerrar manualmente cada pago/cobro.
+
+La proyeccion `Hogar y Alimentación` actua como presupuesto variable: el reporte calcula
+cuanto se ha gastado realmente en esa categoria durante el mes y cuanto queda disponible
+respecto al importe proyectado.
 
 Cargar o reponer la plantilla inicial:
 
@@ -338,13 +380,17 @@ Lista tickets y voces pendientes. No modifica datos.
 python scripts/review_pending.py
 ```
 
-Intenta procesar pendientes automaticamente. Modifica datos si registra movimientos.
+Intenta procesar pendientes automaticamente. Los PDFs aplican reglas locales; imagenes y audios se reservan para revision por Codex salvo que desactives `PREFER_CODEX_MEDIA_REVIEW`.
 
 ```powershell
 python scripts/register_manual_entries.py entradas.json
 ```
 
 Registra movimientos revisados manualmente. Modifica datos.
+Primero valida todas las entradas, por lo que un JSON parcialmente invalido no deja
+movimientos a medias. Si el `receipt_id` ya tiene movimientos enlazados, el script se
+detiene para evitar duplicados; puedes permitirlo con
+`"allow_existing_receipt_entries": true`.
 
 ```powershell
 python scripts/generate_report.py
@@ -369,6 +415,7 @@ python scripts/organize_receipts_by_month.py
 ```
 
 Mueve tickets dentro de carpetas mensuales y actualiza rutas en la base.
+Si la carpeta de tickets no es accesible, informa el problema y sale sin modificar datos.
 
 ```powershell
 python scripts/link_transactions_to_receipts.py
@@ -394,11 +441,9 @@ Egreso
 Categorías actuales:
 
 ```text
-Alimentación
-Hogar
+Hogar y Alimentación
 Suministros
 Alquiler
-Izhan
 Salud & Cuidado
 Ropa
 Educación
@@ -547,8 +592,14 @@ python scripts/list_pending.py
 
 Si aparecen como `pending`, revisalos con `review_pending.py` o registralos manualmente.
 
-Las imagenes no se leen automaticamente:
+Las imagenes no se leen automaticamente si prefieres Codex:
 
+- Deja `PREFER_CODEX_MEDIA_REVIEW=1` o sin definir.
+- Ejecuta `python scripts/review_pending.py` para marcarlas como revision manual.
+
+Si quieres volver a OCR local:
+
+- Configura `PREFER_CODEX_MEDIA_REVIEW=0`.
 - Instala Tesseract OCR.
 - Agrega Tesseract al `PATH`, o configura `TESSERACT_CMD`.
 - Vuelve a ejecutar `python scripts/review_pending.py`.

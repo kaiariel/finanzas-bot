@@ -40,6 +40,18 @@ class ReviewTransaction:
     currency: str = "EUR"
 
 
+def _path_access_issue(path: Path) -> str | None:
+    try:
+        path.stat()
+    except FileNotFoundError:
+        return "archivo no encontrado"
+    except PermissionError:
+        return "archivo inaccesible: acceso denegado"
+    except OSError as exc:
+        return f"archivo inaccesible: {exc}"
+    return None
+
+
 def _extract_pdf_text(path: Path) -> str:
     reader = PdfReader(str(path))
     return "\n".join(page.extract_text() or "" for page in reader.pages)
@@ -47,7 +59,7 @@ def _extract_pdf_text(path: Path) -> str:
 
 def _extract_image_text(path: Path) -> str:
     try:
-        from PIL import Image
+        from PIL import Image, ImageFilter, ImageOps
         import pytesseract
     except ImportError as exc:
         raise RuntimeError("OCR local no instalado. Ejecuta pip install -r requirements.txt") from exc
@@ -65,7 +77,19 @@ def _extract_image_text(path: Path) -> str:
         pytesseract.pytesseract.tesseract_cmd = tesseract_cmd
 
     try:
-        return pytesseract.image_to_string(Image.open(path), lang="spa+eng")
+        image = Image.open(path)
+        grayscale = ImageOps.grayscale(image)
+        enlarged = grayscale.resize((grayscale.width * 2, grayscale.height * 2))
+        sharpened = enlarged.filter(ImageFilter.SHARPEN)
+        thresholded = sharpened.point(lambda x: 0 if x < 180 else 255, mode="1")
+
+        variants = [image, grayscale, sharpened, thresholded]
+        texts: list[str] = []
+        for variant in variants:
+            text = pytesseract.image_to_string(variant, lang="spa+eng", config="--psm 6")
+            if text.strip():
+                texts.append(text)
+        return "\n".join(texts)
     except pytesseract.TesseractNotFoundError as exc:
         raise RuntimeError("Tesseract OCR no esta instalado en Windows") from exc
 
@@ -111,6 +135,23 @@ def _set_receipt(
             (status, caption, note, receipt_id),
         )
         connection.commit()
+
+
+def _send_media_to_codex_review(
+    settings: Settings,
+    row,
+    *,
+    media_label: str,
+    reason: str,
+) -> str:
+    _set_receipt(
+        settings,
+        row["id"],
+        status="dudoso",
+        caption=f"{media_label} pendiente de revision por Codex",
+        note=reason,
+    )
+    return f"#{row['id']} {media_label} derivado a Codex: {reason}"
 
 
 def _parsed_to_review(parsed: ParsedTransaction) -> ReviewTransaction:
@@ -247,11 +288,21 @@ def _review_supermarket_items(
 
 def _review_voice(settings: Settings, db: FinanceDatabase, row) -> str:
     path = Path(row["local_path"])
+    path_issue = _path_access_issue(path)
+    if path_issue:
+        _set_receipt(settings, row["id"], status="missing", note=path_issue)
+        return f"#{row['id']} marcado como missing: {path_issue}"
+
+    if settings.prefer_codex_media_review:
+        return _send_media_to_codex_review(
+            settings,
+            row,
+            media_label="audio",
+            reason="Revision manual preferida: Codex sustituye la transcripcion local",
+        )
+
     if not settings.voice_transcription_enabled:
         return f"#{row['id']} voz pendiente: transcripcion local desactivada"
-    if not path.exists():
-        _set_receipt(settings, row["id"], status="missing", note="archivo no encontrado")
-        return f"#{row['id']} marcado como missing: archivo no encontrado"
 
     try:
         transcription = transcribe_voice_file(path, settings)
@@ -441,11 +492,16 @@ def _review_generic_text(settings: Settings, db: FinanceDatabase, row, text: str
 
 def _review_pdf(settings: Settings, db: FinanceDatabase, row) -> str:
     path = Path(row["local_path"])
-    if not path.exists():
-        _set_receipt(settings, row["id"], status="missing", note="archivo no encontrado")
-        return f"#{row['id']} marcado como missing: archivo no encontrado"
+    path_issue = _path_access_issue(path)
+    if path_issue:
+        _set_receipt(settings, row["id"], status="missing", note=path_issue)
+        return f"#{row['id']} marcado como missing: {path_issue}"
 
-    text = _extract_pdf_text(path)
+    try:
+        text = _extract_pdf_text(path)
+    except PermissionError:
+        _set_receipt(settings, row["id"], status="missing", note="archivo inaccesible: acceso denegado")
+        return f"#{row['id']} marcado como missing: archivo inaccesible: acceso denegado"
     supermarket_items = parse_supermarket_receipt_items(text)
     if supermarket_items:
         return _review_supermarket_items(
@@ -467,12 +523,24 @@ def _review_pdf(settings: Settings, db: FinanceDatabase, row) -> str:
 
 def _review_image(settings: Settings, db: FinanceDatabase, row) -> str:
     path = Path(row["local_path"])
-    if not path.exists():
-        _set_receipt(settings, row["id"], status="missing", note="archivo no encontrado")
-        return f"#{row['id']} marcado como missing: archivo no encontrado"
+    path_issue = _path_access_issue(path)
+    if path_issue:
+        _set_receipt(settings, row["id"], status="missing", note=path_issue)
+        return f"#{row['id']} marcado como missing: {path_issue}"
+
+    if settings.prefer_codex_media_review:
+        return _send_media_to_codex_review(
+            settings,
+            row,
+            media_label="imagen",
+            reason="Revision manual preferida: Codex sustituye el OCR local",
+        )
 
     try:
         text = _extract_image_text(path)
+    except PermissionError:
+        _set_receipt(settings, row["id"], status="missing", note="archivo inaccesible: acceso denegado")
+        return f"#{row['id']} marcado como missing: archivo inaccesible: acceso denegado"
     except RuntimeError as exc:
         _set_receipt(settings, row["id"], status="dudoso", note=str(exc))
         return f"#{row['id']} imagen dudosa: {exc}"
@@ -488,7 +556,14 @@ def _review_image(settings: Settings, db: FinanceDatabase, row) -> str:
             label="imagen OCR",
         )
 
-    return _review_generic_text(settings, db, row, text, "imagen OCR")
+    _set_receipt(
+        settings,
+        row["id"],
+        status="dudoso",
+        caption="imagen OCR sin lectura fiable",
+        note="OCR sin estructura suficiente para registrar movimientos con seguridad",
+    )
+    return f"#{row['id']} imagen dudosa: OCR insuficiente para registro automatico"
 
 
 def main() -> None:
@@ -503,7 +578,7 @@ def main() -> None:
     for row in rows:
         path = Path(row["local_path"])
         suffix = path.suffix.lower()
-        if row["status"] == "voice_pending" and suffix in {".ogg", ".oga", ".mp3", ".wav", ".m4a"}:
+        if row["status"] in {"voice_pending", "dudoso"} and suffix in {".ogg", ".oga", ".mp3", ".wav", ".m4a"}:
             results.append(_review_voice(settings, db, row))
         elif row["status"] in {"pending", "nuevo", "dudoso"} and suffix == ".pdf":
             results.append(_review_pdf(settings, db, row))

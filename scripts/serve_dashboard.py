@@ -39,7 +39,7 @@ def _parse_kind(value: object) -> str:
 def _parse_bool(value: object) -> bool:
     if isinstance(value, bool):
         return value
-    return str(value or "").strip().lower() in {"1", "true", "yes", "si", "sÃ­", "sí"}
+    return str(value or "").strip().lower() in {"1", "true", "yes", "si", "sí"}
 
 
 def _parse_amount(value: object) -> int:
@@ -119,6 +119,30 @@ def _text(value: object, *, required: bool = False, field: str = "campo") -> str
     return text
 
 
+def set_projection_status(settings: Settings, template_id: int, month: str, status: str) -> None:
+    """Cambia solo el estado de un mes proyectado, conservando importe y nota."""
+    status = _parse_projection_status(status)
+    db = FinanceDatabase(settings.sqlite_db_path, settings.timezone)
+    template = db.get_projection_template(template_id)
+    if template is None:
+        raise KeyError(f"No existe la proyeccion {template_id}.")
+    occurrence = db.get_projection_occurrence(template_id, month)
+    amount_cents = (
+        int(occurrence["amount_cents"])
+        if occurrence is not None
+        else int(template["default_amount_cents"])
+    )
+    note = str(occurrence["note"]) if occurrence is not None else ""
+    db.set_projection_occurrence(
+        template_id=template_id,
+        month=month,
+        amount_cents=amount_cents,
+        status=status,
+        note=note,
+    )
+    generate_report(settings)
+
+
 class DashboardHandler(BaseHTTPRequestHandler):
     settings: Settings
 
@@ -155,9 +179,10 @@ class DashboardHandler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:
         path = urlparse(self.path).path
         match = re.fullmatch(r"/api/transactions/(\d+)", path)
+        status_match = re.fullmatch(r"/api/projections/(\d+)/(\d{4}-\d{2})/status", path)
         projection_match = re.fullmatch(r"/api/projections/(\d+)/(\d{4}-\d{2})", path)
         projection_create = path == "/api/projections"
-        if not match and not projection_match and not projection_create:
+        if not match and not status_match and not projection_match and not projection_create:
             self._send_json(404, {"ok": False, "error": "Ruta no encontrada."})
             return
 
@@ -166,6 +191,10 @@ class DashboardHandler(BaseHTTPRequestHandler):
             if match:
                 transaction_id = int(match.group(1))
                 self._update_transaction(transaction_id, payload)
+            elif status_match:
+                template_id = int(status_match.group(1))
+                month = _parse_month(status_match.group(2))
+                set_projection_status(self.settings, template_id, month, str(payload.get("status") or ""))
             elif projection_match:
                 assert projection_match is not None
                 template_id = int(projection_match.group(1))

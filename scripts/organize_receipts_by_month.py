@@ -24,10 +24,22 @@ def _month_folder(root: Path, created_at: str) -> Path:
     return root / f"{date:%Y-%m} {format_month(date)}"
 
 
+def _can_access_dir(path: Path) -> bool:
+    try:
+        path.mkdir(parents=True, exist_ok=True)
+        return True
+    except PermissionError:
+        return False
+    except OSError:
+        return False
+
+
 def main() -> None:
     settings = Settings.from_env()
     root = settings.receipts_sync_dir
-    root.mkdir(parents=True, exist_ok=True)
+    if not _can_access_dir(root):
+        print(f"Carpeta de tickets inaccesible: {root}")
+        return
 
     with sqlite3.connect(settings.sqlite_db_path) as connection:
         connection.row_factory = sqlite3.Row
@@ -45,7 +57,12 @@ def main() -> None:
         moved: list[tuple[str, str]] = []
         for row in rows:
             source = Path(row["path"])
-            if not source.exists() or not _is_inside(source, root):
+            try:
+                exists = source.exists()
+                inside_root = _is_inside(source, root) if exists else False
+            except PermissionError:
+                continue
+            if not exists or not inside_root:
                 continue
 
             destination_dir = _month_folder(root, row["created_at"])
@@ -56,8 +73,12 @@ def main() -> None:
             if not _is_inside(destination, root):
                 raise RuntimeError(f"Destino fuera de la carpeta de tickets: {destination}")
 
-            destination_dir.mkdir(parents=True, exist_ok=True)
-            if destination.exists():
+            try:
+                destination_dir.mkdir(parents=True, exist_ok=True)
+                destination_exists = destination.exists()
+            except PermissionError:
+                continue
+            if destination_exists:
                 raise RuntimeError(f"Ya existe el archivo destino: {destination}")
 
             shutil.move(str(source), str(destination))

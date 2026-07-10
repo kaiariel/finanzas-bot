@@ -11,12 +11,26 @@ AMOUNT_RE = re.compile(
     re.IGNORECASE,
 )
 
-VALID_CATEGORIES = (
+SPOKEN_EURO_AMOUNT_RE = re.compile(
+    r"\b(?P<words>[a-záéíóúüñ\s]+?)\s+(?P<currency>euros?|euro|eur|ero)\b",
+    re.IGNORECASE,
+)
+
+HOUSEHOLD_FOOD_CATEGORY = "Hogar y Alimentación"
+
+LEGACY_HOUSEHOLD_FOOD_CATEGORIES = (
     "Alimentación",
+    "Alimentaci?n",
     "Hogar",
+    "Izhan",
+    "Hogar y Alimentacion",
+    "Hogar y Alimentaci?n",
+)
+
+VALID_CATEGORIES = (
+    HOUSEHOLD_FOOD_CATEGORY,
     "Suministros",
     "Alquiler",
-    "Izhan",
     "Salud & Cuidado",
     "Ropa",
     "Educación",
@@ -30,6 +44,53 @@ VALID_CATEGORIES = (
     "Ingresos clientes",
     "Trabajos extra",
 )
+
+SIMPLE_NUMBER_WORDS = {
+    "cero": 0,
+    "un": 1,
+    "uno": 1,
+    "una": 1,
+    "dos": 2,
+    "tres": 3,
+    "cuatro": 4,
+    "cinco": 5,
+    "seis": 6,
+    "siete": 7,
+    "ocho": 8,
+    "nueve": 9,
+    "diez": 10,
+    "once": 11,
+    "doce": 12,
+    "trece": 13,
+    "catorce": 14,
+    "quince": 15,
+    "dieciseis": 16,
+    "diecisiete": 17,
+    "dieciocho": 18,
+    "diecinueve": 19,
+    "veinte": 20,
+    "veintiuno": 21,
+    "veintiun": 21,
+    "veintiuna": 21,
+    "veintidos": 22,
+    "veintitres": 23,
+    "veinticuatro": 24,
+    "veinticinco": 25,
+    "veintiseis": 26,
+    "veintisiete": 27,
+    "veintiocho": 28,
+    "veintinueve": 29,
+}
+
+TENS_NUMBER_WORDS = {
+    "treinta": 30,
+    "cuarenta": 40,
+    "cincuenta": 50,
+    "sesenta": 60,
+    "setenta": 70,
+    "ochenta": 80,
+    "noventa": 90,
+}
 
 FIXED_CATEGORIES = {"Alquiler", "Deudas", "Ayuda familiar", "Suscripciones"}
 INCOME_CATEGORIES = {"Ingresos laborales", "Ingresos clientes", "Trabajos extra"}
@@ -98,11 +159,11 @@ CATEGORY_KEYWORDS: tuple[tuple[str, tuple[str, ...]], ...] = (
         "Ayuda familiar",
         ("paraguay", "ayuda familiar", "ayuda familia", "envio dinero", "remesa"),
     ),
-    (
-        "Suscripciones",
         (
-            "netflix",
-            "spotify",
+            "Suscripciones",
+            (
+                "netflix",
+                "spotify",
             "claude",
             "chatgpt",
             "openai",
@@ -113,18 +174,21 @@ CATEGORY_KEYWORDS: tuple[tuple[str, tuple[str, ...]], ...] = (
             "antrophic",
             "creditos",
             "créditos",
-            "capcut",
-            "hosting",
-            "suscripcion",
-            "suscripciones",
-            "app trabajo",
-            "apps trabajo",
-        ),
+                "capcut",
+                "hosting",
+                "hostinger",
+                "sered",
+                "suscripcion",
+                "suscripciones",
+                "app trabajo",
+                "apps trabajo",
+            ),
     ),
     (
-        "Izhan",
+        HOUSEHOLD_FOOD_CATEGORY,
         (
             "izhan",
+            "isan",
             "panal",
             "panales",
             "potito",
@@ -203,7 +267,7 @@ CATEGORY_KEYWORDS: tuple[tuple[str, tuple[str, ...]], ...] = (
     ),
     ("Trabajos extra", ("freelance", "trabajo puntual", "puntual", "trabajos extra", "extra")),
     (
-        "Alimentación",
+        HOUSEHOLD_FOOD_CATEGORY,
         (
             "aldi",
             "carrefour",
@@ -237,7 +301,7 @@ CATEGORY_KEYWORDS: tuple[tuple[str, tuple[str, ...]], ...] = (
         ),
     ),
     (
-        "Hogar",
+        HOUSEHOLD_FOOD_CATEGORY,
         (
             "limpieza",
             "menaje",
@@ -302,6 +366,8 @@ STORE_ALIASES: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("OpenAI", ("openai",)),
     ("Anthropic", ("anthropic", "antrophic")),
     ("Capcut", ("capcut",)),
+    ("Hostinger", ("hostinger",)),
+    ("Sered", ("sered",)),
     ("Google Cloud", ("google cloud", "cloud apps")),
     ("Endesa", ("endesa",)),
     ("Iberdrola", ("iberdrola",)),
@@ -343,6 +409,7 @@ class ParsedTransaction:
     store: str = ""
     is_fixed: bool = False
     needs_clarification: bool = False
+    inference_notes: tuple[str, ...] = ()
 
     @property
     def amount(self) -> Decimal:
@@ -379,6 +446,66 @@ def amount_to_cents(raw_amount: str) -> int:
 
     cents = (amount * Decimal("100")).quantize(Decimal("1"), rounding=ROUND_HALF_UP)
     return int(cents)
+
+
+def _spoken_number_to_int(words: str) -> int | None:
+    normalized = normalize_text(words)
+    normalized = re.sub(r"\s+", " ", normalized).strip()
+    if not normalized:
+        return None
+
+    if normalized in SIMPLE_NUMBER_WORDS:
+        return SIMPLE_NUMBER_WORDS[normalized]
+    if normalized in TENS_NUMBER_WORDS:
+        return TENS_NUMBER_WORDS[normalized]
+
+    if " y " in normalized:
+        left, right = normalized.split(" y ", 1)
+        if left in TENS_NUMBER_WORDS and right in SIMPLE_NUMBER_WORDS:
+            unit = SIMPLE_NUMBER_WORDS[right]
+            if unit < 10:
+                return TENS_NUMBER_WORDS[left] + unit
+    return None
+
+
+def _normalize_spoken_euro_amounts(text: str) -> str:
+    unit_words = "|".join(
+        re.escape(word)
+        for word in (
+            "un",
+            "uno",
+            "una",
+            "dos",
+            "tres",
+            "cuatro",
+            "cinco",
+            "seis",
+            "siete",
+            "ocho",
+            "nueve",
+        )
+    )
+    simple_words = "|".join(
+        re.escape(word)
+        for word in sorted(SIMPLE_NUMBER_WORDS, key=len, reverse=True)
+    )
+    tens_words = "|".join(
+        re.escape(word)
+        for word in sorted(TENS_NUMBER_WORDS, key=len, reverse=True)
+    )
+    pattern = re.compile(
+        rf"\b(?P<words>(?:{simple_words})|(?:{tens_words})(?:\s+y\s+(?:{unit_words}))?)\s+(?P<currency>euros?|euro|eur|ero)\b",
+        re.IGNORECASE,
+    )
+
+    def replace(match: re.Match[str]) -> str:
+        words = match.group("words")
+        number = _spoken_number_to_int(words)
+        if number is None:
+            return match.group(0)
+        return f"{number} {match.group('currency')}"
+
+    return pattern.sub(replace, text)
 
 
 def _is_installment_number(text: str, match: re.Match[str]) -> bool:
@@ -450,7 +577,7 @@ def infer_category_from_keywords(text: str, store: str) -> str | None:
             return category
 
     if store in GROCERY_STORES:
-        return "Alimentación"
+        return HOUSEHOLD_FOOD_CATEGORY
     return None
 
 
@@ -481,10 +608,6 @@ def infer_is_fixed(text: str, category: str) -> bool:
         return False
     if _contains_keyword(normalized, "seguro salud"):
         return True
-    if _contains_keyword(normalized, "musica de izhan") or _contains_keyword(
-        normalized, "música de izhan"
-    ):
-        return True
     return category in FIXED_CATEGORIES
 
 
@@ -509,11 +632,13 @@ def clean_note(text: str, match: re.Match[str]) -> str:
         note,
         flags=re.IGNORECASE,
     ).strip(" -:;,.")
-    note = re.sub(r"^(en|a|de)\s+(el|la|los|las)?\s*", "", note, flags=re.IGNORECASE)
+    note = re.sub(r"^(y|en|a|de|por)\s+(el|la|los|las)?\s*", "", note, flags=re.IGNORECASE)
+    note = re.sub(r"\s+(por|de|en)$", "", note, flags=re.IGNORECASE)
     return note or text.strip()
 
 
 def parse_transaction(text: str) -> ParsedTransaction | None:
+    text = _normalize_spoken_euro_amounts(text)
     match = find_amount_match(text)
     if not match:
         return None
@@ -529,6 +654,21 @@ def parse_transaction(text: str) -> ParsedTransaction | None:
     )
     note = clean_note(text, match)
     needs_clarification = store in {"Bizum", "Transferencia"} and detected_category is None
+    normalized_note = normalize_text(note)
+    inference_notes: list[str] = []
+
+    if detected_category is None:
+        inference_notes.append(
+            f"Categoria asumida como {category} por falta de palabras clave claras."
+        )
+    if kind == "income" and normalized_note in {"sueldo", "nomina", "cobro", "ingreso"}:
+        inference_notes.append(
+            "No se pudo deducir a que ingreso concreto del mes corresponde este cobro."
+        )
+    if kind == "expense" and normalized_note in {"suscripcion", "suscripciones", "hosting", "pago"}:
+        inference_notes.append(
+            "No se pudo deducir a que gasto fijo concreto del mes corresponde este pago."
+        )
 
     return ParsedTransaction(
         kind=kind,
@@ -540,11 +680,12 @@ def parse_transaction(text: str) -> ParsedTransaction | None:
         store=store,
         is_fixed=infer_is_fixed(text, category),
         needs_clarification=needs_clarification,
+        inference_notes=tuple(inference_notes),
     )
 
 
 def _split_inline_transactions(text: str) -> list[str]:
-    cleaned = text.strip()
+    cleaned = _normalize_spoken_euro_amounts(text).strip()
     if not cleaned:
         return []
 
@@ -557,6 +698,23 @@ def _split_inline_transactions(text: str) -> list[str]:
         for part in re.split(r";+|,(?!\d)", cleaned)
         if part.strip(" -;,.")
     ]
+    if len(parts) <= 1:
+        parts = []
+        matches = [
+            match for match in AMOUNT_RE.finditer(cleaned) if not _is_installment_number(cleaned, match)
+        ]
+        start = 0
+        for match in matches:
+            part = cleaned[start : match.end()].strip(" -;,.")
+            if part:
+                parts.append(part)
+            start = match.end()
+        tail = cleaned[start:].strip(" -;,.")
+        if tail:
+            if parts:
+                parts[-1] = f"{parts[-1]} {tail}".strip()
+            else:
+                parts.append(tail)
     return parts or [cleaned]
 
 
