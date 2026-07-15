@@ -566,6 +566,25 @@ def _review_image(settings: Settings, db: FinanceDatabase, row) -> str:
     return f"#{row['id']} imagen dudosa: OCR insuficiente para registro automatico"
 
 
+def _review_row(settings: Settings, db: FinanceDatabase, row) -> str:
+    path = Path(row["local_path"])
+    suffix = path.suffix.lower()
+    retryable_statuses = {"pending", "nuevo", "dudoso", "missing"}
+    if row["status"] in {"voice_pending", "dudoso", "missing"} and suffix in {
+        ".ogg",
+        ".oga",
+        ".mp3",
+        ".wav",
+        ".m4a",
+    }:
+        return _review_voice(settings, db, row)
+    if row["status"] in retryable_statuses and suffix == ".pdf":
+        return _review_pdf(settings, db, row)
+    if row["status"] in retryable_statuses and suffix in IMAGE_SUFFIXES:
+        return _review_image(settings, db, row)
+    return f"#{row['id']} pendiente: tipo no automatico"
+
+
 def main() -> None:
     settings = Settings.from_env()
     db = FinanceDatabase(settings.sqlite_db_path, settings.timezone)
@@ -574,18 +593,7 @@ def main() -> None:
         print("No hay pendientes.")
         return
 
-    results: list[str] = []
-    for row in rows:
-        path = Path(row["local_path"])
-        suffix = path.suffix.lower()
-        if row["status"] in {"voice_pending", "dudoso"} and suffix in {".ogg", ".oga", ".mp3", ".wav", ".m4a"}:
-            results.append(_review_voice(settings, db, row))
-        elif row["status"] in {"pending", "nuevo", "dudoso"} and suffix == ".pdf":
-            results.append(_review_pdf(settings, db, row))
-        elif row["status"] in {"pending", "nuevo", "dudoso"} and suffix in IMAGE_SUFFIXES:
-            results.append(_review_image(settings, db, row))
-        else:
-            results.append(f"#{row['id']} pendiente: tipo no automatico")
+    results = [_review_row(settings, db, row) for row in rows]
 
     generate_report(settings)
     print("\n".join(results))

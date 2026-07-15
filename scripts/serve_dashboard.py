@@ -2,9 +2,10 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import sys
-from datetime import date
+from datetime import date, datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlparse
@@ -26,6 +27,48 @@ KIND_LABELS = {
 }
 
 PROJECTION_STATUSES = {"pending", "completed", "skipped"}
+
+
+def runtime_status_payload(settings: Settings) -> dict[str, object]:
+    runtime_path = settings.data_dir / "runtime_status.json"
+    runtime: dict[str, object] = {}
+    supervisor_running = False
+    try:
+        loaded = json.loads(runtime_path.read_text(encoding="utf-8"))
+        if isinstance(loaded, dict):
+            runtime = loaded
+            updated_at = datetime.fromisoformat(str(runtime.get("updated_at")))
+            if updated_at.tzinfo is None:
+                updated_at = updated_at.replace(tzinfo=timezone.utc)
+            supervisor_running = (
+                datetime.now(timezone.utc) - updated_at.astimezone(timezone.utc)
+            ).total_seconds() <= 10
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        runtime = {}
+
+    db = FinanceDatabase(settings.sqlite_db_path, settings.timezone)
+    transactions = db.list_transactions()
+    receipts = db.list_receipts()
+    return {
+        "ok": True,
+        "supervisor": {
+            "running": supervisor_running,
+            "pid": runtime.get("supervisor_pid") if supervisor_running else None,
+            "startedAt": runtime.get("started_at") if supervisor_running else None,
+        },
+        "bot": {
+            "running": bool(runtime.get("bot_running")) if supervisor_running else None,
+            "pid": runtime.get("bot_pid") if supervisor_running else None,
+            "exitCode": runtime.get("bot_exit_code") if supervisor_running else None,
+        },
+        "dashboard": {
+            "running": True,
+            "pid": os.getpid(),
+        },
+        "pendingCount": len(db.list_pending_files()),
+        "lastTransactionAt": transactions[-1]["created_at"] if transactions else None,
+        "lastReceiptAt": receipts[-1]["created_at"] if receipts else None,
+    }
 
 
 def _parse_kind(value: object) -> str:
@@ -170,6 +213,9 @@ class DashboardHandler(BaseHTTPRequestHandler):
         path = urlparse(self.path).path
         if path in {"/", "/finanzas.html", "/reports/finanzas.html"}:
             self._send_html(render_report_html(self.settings, editable=True))
+            return
+        if path == "/api/status":
+            self._send_json(200, runtime_status_payload(self.settings))
             return
         if path == "/favicon.ico":
             self._send(204, b"", "text/plain")

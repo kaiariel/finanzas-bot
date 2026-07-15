@@ -177,7 +177,9 @@ async def record_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     if not voice:
         return
 
-    local_path = settings.voices_sync_dir / f"voice-{_timestamp(settings)}-{voice.file_unique_id}.ogg"
+    local_path = settings.resolved_voices_dir() / (
+        f"voice-{_timestamp(settings)}-{voice.file_unique_id}.ogg"
+    )
     telegram_file = await context.bot.get_file(voice.file_id)
     await telegram_file.download_to_drive(custom_path=local_path)
 
@@ -257,7 +259,7 @@ async def record_receipt(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     else:
         return
 
-    local_path = _month_dir(settings.receipts_sync_dir, settings) / (
+    local_path = _month_dir(settings.resolved_receipts_dir(), settings) / (
         f"ticket-{_timestamp(settings)}-{unique_id}{suffix}"
     )
     telegram_file = await context.bot.get_file(telegram_file_id)

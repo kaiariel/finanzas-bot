@@ -828,6 +828,25 @@ def _render_html(
       color: #fff;
     }
     .mode-actions a:hover { text-decoration: none; filter: brightness(.98); }
+    .runtime-status {
+      width: min(1440px, calc(100% - 24px));
+      margin: 14px auto 0;
+      padding: 12px 14px;
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      background: var(--panel);
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      gap: 10px 18px;
+      box-shadow: 0 8px 24px rgba(23, 33, 29, .05);
+    }
+    .runtime-status strong { margin-right: auto; }
+    .runtime-item { display: inline-flex; align-items: center; gap: 7px; color: var(--muted); font-size: 13px; }
+    .runtime-dot { width: 9px; height: 9px; border-radius: 999px; background: var(--muted); }
+    .runtime-dot.online { background: var(--accent); box-shadow: 0 0 0 3px rgba(31, 122, 90, .12); }
+    .runtime-dot.offline { background: var(--danger); box-shadow: 0 0 0 3px rgba(179, 69, 69, .12); }
+    .runtime-refresh { min-height: 30px; padding: 4px 10px; font-size: 12px; }
 
     /* Resumen con jerarquía: balance protagonista */
     .summary {
@@ -969,6 +988,7 @@ def _render_html(
     <p class="mode-hint">Generado el $generated_at</p>
     $edit_hint
   </header>
+  $runtime_status
   <main>
     <nav class="tabs" aria-label="Pestañas del panel">
       <button class="tab-button active" type="button" data-tab="dashboard">Panel inicial</button>
@@ -2511,12 +2531,46 @@ def _render_html(
       }
       const addButton = document.getElementById('addProjection');
       if (addButton && !editable) addButton.hidden = true;
+      const runtimeRefresh = document.getElementById('runtimeRefresh');
+      if (runtimeRefresh) runtimeRefresh.addEventListener('click', refreshRuntimeStatus);
+    }
+    function setRuntimeItem(id, label, state) {
+      const item = document.getElementById(id);
+      if (!item) return;
+      const dot = item.querySelector('.runtime-dot');
+      const text = item.querySelector('.runtime-text');
+      dot.className = 'runtime-dot' + (state === true ? ' online' : state === false ? ' offline' : '');
+      text.textContent = label;
+    }
+    async function refreshRuntimeStatus() {
+      if (!editable) return;
+      try {
+        const response = await fetch('/api/status', { cache: 'no-store' });
+        if (!response.ok) throw new Error('Estado no disponible');
+        const status = await response.json();
+        setRuntimeItem(
+          'runtimeBot',
+          status.bot.running === true ? 'Bot conectado' : status.bot.running === false ? 'Bot detenido' : 'Bot no supervisado',
+          status.bot.running
+        );
+        setRuntimeItem('runtimeDashboard', 'Panel conectado', true);
+        const pending = document.getElementById('runtimePending');
+        if (pending) pending.textContent = 'Pendientes: ' + status.pendingCount;
+        const updated = document.getElementById('runtimeUpdated');
+        const last = status.lastTransactionAt || status.lastReceiptAt;
+        if (updated) updated.textContent = last ? 'Ultima actividad: ' + new Date(last).toLocaleString('es-ES') : 'Sin actividad registrada';
+      } catch (error) {
+        setRuntimeItem('runtimeBot', 'Estado no disponible', false);
+        setRuntimeItem('runtimeDashboard', 'Panel sin respuesta', false);
+      }
     }
     window.addEventListener('resize', function() {
       render();
       if (!document.getElementById('projectionPanel').hidden) renderProjection();
     });
     setupEditableUi();
+    refreshRuntimeStatus();
+    if (editable) window.setInterval(refreshRuntimeStatus, 5000);
     initFilters();
     initEditForm();
     initProjectionMonths();
@@ -2542,6 +2596,18 @@ def _render_html(
             '<div class="mode-actions">'
             '<a class="primary" href="http://127.0.0.1:8765/" target="_blank" rel="noreferrer">Abrir modo edición</a>'
             '</div>'
+        ),
+        runtime_status=(
+            '<section class="runtime-status" id="runtimeStatus" aria-label="Estado de la aplicacion">'
+            '<strong>Estado de Finanzas</strong>'
+            '<span class="runtime-item" id="runtimeBot"><i class="runtime-dot"></i><span class="runtime-text">Comprobando bot...</span></span>'
+            '<span class="runtime-item" id="runtimeDashboard"><i class="runtime-dot"></i><span class="runtime-text">Comprobando panel...</span></span>'
+            '<span class="runtime-item" id="runtimePending">Pendientes: --</span>'
+            '<span class="runtime-item" id="runtimeUpdated">Ultima actividad: --</span>'
+            '<button class="secondary runtime-refresh" id="runtimeRefresh" type="button">Actualizar estado</button>'
+            '</section>'
+            if editable
+            else ""
         ),
         db_path=escape(db_path),
         transactions_json=json.dumps(transactions, ensure_ascii=False),

@@ -94,6 +94,29 @@ def test_review_voice_prefers_codex_manual_review(tmp_path) -> None:
     assert "Codex sustituye la transcripcion local" in receipt["review_notes"]
 
 
+def test_missing_image_is_retried_when_file_becomes_available(tmp_path) -> None:
+    review_pending = _load_review_pending()
+    settings = _settings(tmp_path)
+    db = FinanceDatabase(settings.sqlite_db_path, settings.timezone)
+    image_path = tmp_path / "recovered-ticket.jpg"
+    image_path.write_bytes(b"fake image bytes")
+    receipt_id = db.add_receipt(
+        local_path=str(image_path),
+        drive_file_id=None,
+        drive_url=None,
+        telegram_message_id=None,
+        caption=None,
+        status="missing",
+    )
+
+    row = db.list_pending_files()[0]
+    result = review_pending._review_row(settings, db, row)
+    receipt = _receipt_with_notes(db, receipt_id)
+
+    assert "derivado a Codex" in result
+    assert receipt["status"] == "dudoso"
+
+
 def test_signed_amount_cents_accepts_euro_symbol() -> None:
     review_pending = _load_review_pending()
 

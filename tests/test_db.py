@@ -17,6 +17,22 @@ def test_pending_statuses_include_dudoso(tmp_path) -> None:
     assert [row["id"] for row in rows] == [receipt_id]
 
 
+def test_pending_statuses_include_missing(tmp_path) -> None:
+    db = FinanceDatabase(tmp_path / "finances.db", "Europe/Madrid")
+
+    receipt_id = db.add_receipt(
+        local_path="ticket.pdf",
+        drive_file_id=None,
+        drive_url=None,
+        telegram_message_id=None,
+        caption=None,
+        status="missing",
+    )
+
+    rows = db.list_pending_files()
+    assert [row["id"] for row in rows] == [receipt_id]
+
+
 def test_find_possible_duplicate(tmp_path) -> None:
     db = FinanceDatabase(tmp_path / "finances.db", "Europe/Madrid")
     created_at = "2026-06-01T12:00:00+02:00"

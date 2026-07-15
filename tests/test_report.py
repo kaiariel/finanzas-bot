@@ -82,6 +82,18 @@ def test_report_includes_quick_status_and_trend_chart(tmp_path) -> None:
     assert 'id="cashflowGrid"' in html
 
 
+def test_editable_report_includes_live_runtime_status(tmp_path) -> None:
+    settings = _settings(tmp_path)
+
+    editable_html = render_report_html(settings, editable=True)
+    static_html = render_report_html(settings, editable=False)
+
+    assert 'id="runtimeStatus"' in editable_html
+    assert 'id="runtimeRefresh"' in editable_html
+    assert "refreshRuntimeStatus" in editable_html
+    assert 'id="runtimeStatus"' not in static_html
+
+
 def test_report_normalizes_malformed_category_labels(tmp_path) -> None:
     settings = _settings(tmp_path)
     db = FinanceDatabase(settings.sqlite_db_path, settings.timezone)

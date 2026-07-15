@@ -49,6 +49,14 @@ def _parse_bool(value: str | None, default: bool = False) -> bool:
     return normalized in {"1", "true", "yes", "si", "on"}
 
 
+def _can_prepare_dir(path: Path) -> bool:
+    try:
+        path.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        return False
+    return path.is_dir()
+
+
 @dataclass(frozen=True)
 class Settings:
     telegram_bot_token: str
@@ -108,7 +116,27 @@ class Settings:
         self.export_csv_path.parent.mkdir(parents=True, exist_ok=True)
         self.report_html_path.parent.mkdir(parents=True, exist_ok=True)
 
+    @property
+    def local_receipts_fallback_dir(self) -> Path:
+        return self.data_dir / "receipts"
+
+    @property
+    def local_voices_fallback_dir(self) -> Path:
+        return self.data_dir / "voices"
+
+    def resolved_receipts_dir(self) -> Path:
+        if _can_prepare_dir(self.receipts_sync_dir):
+            return self.receipts_sync_dir
+        _can_prepare_dir(self.local_receipts_fallback_dir)
+        return self.local_receipts_fallback_dir
+
+    def resolved_voices_dir(self) -> Path:
+        if _can_prepare_dir(self.voices_sync_dir):
+            return self.voices_sync_dir
+        _can_prepare_dir(self.local_voices_fallback_dir)
+        return self.local_voices_fallback_dir
+
     def ensure_dirs(self) -> None:
         self.ensure_core_dirs()
-        self.receipts_sync_dir.mkdir(parents=True, exist_ok=True)
-        self.voices_sync_dir.mkdir(parents=True, exist_ok=True)
+        self.resolved_receipts_dir()
+        self.resolved_voices_dir()

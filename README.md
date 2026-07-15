@@ -145,6 +145,37 @@ G:\Mi unidad\Finanzas - Tickets\2026-06 Junio
 
 ## Ejecutar el bot
 
+### Inicio recomendado en Windows
+
+Haz doble clic en `Iniciar Finanzas.cmd`. El lanzador inicia el bot y el panel,
+abre el navegador, evita instancias duplicadas y guarda los errores en `data/logs`.
+Para cerrar ambos procesos, vuelve a la ventana del lanzador y pulsa `Ctrl+C`.
+
+No es necesario activar manualmente el entorno virtual.
+
+El lanzador ejecuta `scripts/start_finance_app.py`, que coordina dos procesos
+independientes:
+
+- `run_bot.py`: recibe mensajes y tickets desde Telegram.
+- `scripts/serve_dashboard.py`: sirve el panel editable en `http://127.0.0.1:8765`.
+
+Si uno de los procesos falla, el supervisor mantiene el otro activo y muestra el
+problema en la terminal y en el panel. Los bloqueos `data/finance_app.lock` y
+`data/telegram_bot.lock` evitan iniciar dos supervisores o dos bots simultaneamente.
+
+Archivos de diagnostico:
+
+```text
+data/logs/bot.log
+data/logs/dashboard.log
+data/runtime_status.json
+```
+
+`data/runtime_status.json` es temporal y permite al panel mostrar el estado actual.
+Todos estos archivos quedan fuera de Git porque la carpeta `data/` esta ignorada.
+
+### Inicio manual
+
 ```powershell
 .\.venv\Scripts\Activate.ps1
 python run_bot.py
@@ -338,6 +369,17 @@ http://127.0.0.1:8765
 Desde el panel puedes editar movimientos y proyecciones. Los cambios se escriben en
 SQLite y regeneran el reporte HTML.
 
+Cuando el panel se inicia mediante `Iniciar Finanzas.cmd`, muestra el estado del bot,
+el servidor local, la ultima actividad registrada y la cantidad de tickets pendientes.
+El estado se actualiza cada cinco segundos y tambien puede refrescarse con el boton
+`Actualizar estado`.
+
+Estados posibles del bot:
+
+- `Bot conectado`: el supervisor confirma que el proceso sigue activo.
+- `Bot detenido`: el proceso termino; revisa `data/logs/bot.log`.
+- `Bot no supervisado`: el panel se inicio manualmente y no puede confirmar el bot.
+
 En la pestaña `Proyeccion` cada item pendiente tiene un boton rapido `✓ Pagar` o
 `✓ Cobrar` que cambia el estado con un clic, sin abrir el formulario de edicion.
 Los items ya completados muestran `↩ Pendiente` para deshacer. El cambio se aplica
@@ -507,6 +549,7 @@ El `.gitignore` debe excluir:
 .venv/
 __pycache__/
 .pytest_cache/
+.claude/settings.local.json
 data/
 reports/
 *.db
@@ -520,6 +563,7 @@ El repositorio deberia contener:
 finance_bot/
 scripts/
 tests/
+Iniciar Finanzas.cmd
 run_bot.py
 requirements.txt
 requirements-voice.txt
@@ -542,32 +586,41 @@ bases SQLite reales
 
 ## Trabajo con Git
 
-Flujo basico:
+El remoto habitual de este proyecto es `origin`. Antes de subir, confirma su URL:
 
 ```powershell
-git status
-git add README.md
-git commit -m "Update project documentation"
-git push
+git remote -v
 ```
 
-Crear una rama:
+Flujo recomendado para preparar y subir cambios mediante una rama:
+
+```powershell
+git status --short
+git diff --check
+.venv\Scripts\python.exe -B -m pytest -q
+git switch -c mejora-inicio-finanzas
+git add README.md .gitignore run_bot.py "Iniciar Finanzas.cmd" finance_bot scripts tests
+git status --short
+git diff --cached --stat
+git diff --cached
+git commit -m "Add one-click finance app launcher"
+git push -u origin mejora-inicio-finanzas
+```
+
+Luego abre un Pull Request en GitHub desde `mejora-inicio-finanzas` hacia `main`.
+Revisa el Pull Request y, cuando todo sea correcto, fusiona la rama.
+
+Si trabajas solo y prefieres subir directamente a `main`, usa:
 
 ```powershell
 git switch main
-git pull
-git switch -c mejora-reportes
+git add README.md .gitignore run_bot.py "Iniciar Finanzas.cmd" finance_bot scripts tests
+git commit -m "Add one-click finance app launcher"
+git push origin main
 ```
 
-Subir la rama:
-
-```powershell
-git add .
-git commit -m "Improve report filters"
-git push -u origin mejora-reportes
-```
-
-Luego abre un Pull Request en GitHub para revisar y unir los cambios a `main`.
+No uses `git add .` sin revisar antes `git status --short`. Nunca deben subirse `.env`,
+`data/`, `reports/`, bases SQLite, tickets reales ni configuraciones locales.
 
 Colaboradores:
 
@@ -627,3 +680,22 @@ El bot no arranca:
 - Revisa que `.env` exista.
 - Ejecuta `pip install -r requirements.txt`.
 - Prueba `python -m pytest -q`.
+- Revisa `data/logs/bot.log`.
+
+El lanzador indica que el puerto `8765` esta ocupado:
+
+- Cierra cualquier terminal donde siga ejecutandose `scripts/serve_dashboard.py`.
+- Cierra el panel anterior con `Ctrl+C` y vuelve a abrir `Iniciar Finanzas.cmd`.
+- No finalices procesos al azar: identifica primero la terminal que inicio el panel.
+
+El lanzador indica que el bot ya esta iniciado:
+
+- Ya existe otra ejecucion de `run_bot.py`.
+- Cierra la terminal anterior con `Ctrl+C`.
+- Vuelve a iniciar mediante `Iniciar Finanzas.cmd` para que bot y panel queden supervisados.
+
+El navegador no se abre automaticamente:
+
+- Comprueba que la terminal muestre `Finanzas iniciadas`.
+- Abre manualmente `http://127.0.0.1:8765`.
+- Si el panel no responde, revisa `data/logs/dashboard.log`.

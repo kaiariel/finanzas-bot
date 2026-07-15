@@ -36,7 +36,13 @@ def _can_access_dir(path: Path) -> bool:
 
 def main() -> None:
     settings = Settings.from_env()
-    root = settings.receipts_sync_dir
+    root = settings.resolved_receipts_dir()
+    using_fallback = root != settings.receipts_sync_dir
+    if using_fallback:
+        print(
+            "Carpeta de tickets configurada inaccesible: "
+            f"{settings.receipts_sync_dir}. Usando respaldo local: {root}"
+        )
     if not _can_access_dir(root):
         print(f"Carpeta de tickets inaccesible: {root}")
         return

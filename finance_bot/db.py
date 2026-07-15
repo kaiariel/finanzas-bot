@@ -25,7 +25,7 @@ from finance_bot.parser import (
 )
 
 
-REVIEW_QUEUE_STATUSES = ("nuevo", "pending", "voice_pending", "dudoso")
+REVIEW_QUEUE_STATUSES = ("nuevo", "pending", "voice_pending", "dudoso", "missing")
 
 
 @dataclass(frozen=True)

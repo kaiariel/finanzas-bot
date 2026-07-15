@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
@@ -106,3 +108,36 @@ def test_set_projection_status_rejects_bad_input(tmp_path) -> None:
     with pytest.raises(KeyError):
         serve_dashboard.set_projection_status(settings, 9999, "2026-07", "completed")
     assert db.get_projection_occurrence(template_id, "2026-07") is None
+
+
+def test_runtime_status_reports_supervisor_and_pending_files(tmp_path) -> None:
+    serve_dashboard = _load_serve_dashboard()
+    settings = _settings(tmp_path)
+    db = FinanceDatabase(settings.sqlite_db_path, settings.timezone)
+    db.add_receipt(
+        local_path="ticket.jpg",
+        drive_file_id=None,
+        drive_url=None,
+        telegram_message_id=None,
+        caption=None,
+        status="pending",
+    )
+    settings.data_dir.mkdir(parents=True, exist_ok=True)
+    (settings.data_dir / "runtime_status.json").write_text(
+        json.dumps(
+            {
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+                "started_at": datetime.now(timezone.utc).isoformat(),
+                "supervisor_pid": 100,
+                "bot_running": True,
+                "bot_pid": 101,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    status = serve_dashboard.runtime_status_payload(settings)
+
+    assert status["supervisor"]["running"] is True
+    assert status["bot"]["running"] is True
+    assert status["pendingCount"] == 1
