@@ -147,31 +147,55 @@ G:\Mi unidad\Finanzas - Tickets\2026-06 Junio
 
 ### Inicio recomendado en Windows
 
-Haz doble clic en `Iniciar Finanzas.cmd`. El lanzador inicia el bot y el panel,
-abre el navegador, evita instancias duplicadas y guarda los errores en `data/logs`.
-Para cerrar ambos procesos, vuelve a la ventana del lanzador y pulsa `Ctrl+C`.
+Haz doble clic en `Iniciar Finanzas.cmd`. El lanzador inicia el bot y el panel
+en segundo plano, abre el navegador, evita instancias duplicadas y guarda los
+errores en `data/logs`.
+
+El lanzador **espera a que el arranque se confirme** antes de dar por buena la
+puesta en marcha. Si algo falla, la ventana no se cierra: muestra el motivo, el
+codigo de salida y la ruta del registro. Ademas, si una sesion anterior quedo a
+medias (por ejemplo, cerrada desde el Administrador de tareas), cierra los
+procesos huerfanos que ocupaban el puerto y continua.
+
+| Codigo | Significado |
+| --- | --- |
+| 0 | Finanzas se inicio correctamente. |
+| 1 | El bot y el panel se detuvieron durante la sesion. |
+| 2 | Ya estaba iniciada o el puerto `8765` esta ocupado por otro programa. |
+| 3 | El panel no llego a responder; revisa `data/logs/dashboard.log`. |
+| 4 | El arranque no se confirmo en 60 segundos. |
+| 5 | Error inesperado; el registro incluye el detalle completo. |
+
+Para cerrar ambos procesos, usa `Cerrar Finanzas.cmd`, que detiene primero el
+bot y el panel y despues el supervisor, y avisa si el puerto sigue ocupado.
 
 No es necesario activar manualmente el entorno virtual.
 
-El lanzador ejecuta `scripts/start_finance_app.py`, que coordina dos procesos
-independientes:
+El lanzador ejecuta `scripts/start_finance_app.py --detached`, que deja un
+supervisor residente y coordina dos procesos independientes:
 
 - `run_bot.py`: recibe mensajes y tickets desde Telegram.
 - `scripts/serve_dashboard.py`: sirve el panel editable en `http://127.0.0.1:8765`.
 
 Si uno de los procesos falla, el supervisor mantiene el otro activo y muestra el
-problema en la terminal y en el panel. Los bloqueos `data/finance_app.lock` y
+problema en el panel y en los logs. Los bloqueos `data/finance_app.lock` y
 `data/telegram_bot.lock` evitan iniciar dos supervisores o dos bots simultaneamente.
 
 Archivos de diagnostico:
 
 ```text
+data/logs/launcher.log
 data/logs/bot.log
 data/logs/dashboard.log
 data/runtime_status.json
+data/launch_result.json
 ```
 
-`data/runtime_status.json` es temporal y permite al panel mostrar el estado actual.
+`data/logs/launcher.log` recoge todo lo que imprime el supervisor en segundo
+plano, incluidos los errores de arranque que antes se perdian.
+`data/runtime_status.json` es temporal y permite al panel mostrar el estado actual;
+el supervisor lo reescribe cada dos segundos y tolera que OneDrive o el propio
+panel lo tengan abierto en ese momento.
 Todos estos archivos quedan fuera de Git porque la carpeta `data/` esta ignorada.
 
 ### Inicio manual
@@ -684,9 +708,12 @@ El bot no arranca:
 
 El lanzador indica que el puerto `8765` esta ocupado:
 
-- Cierra cualquier terminal donde siga ejecutandose `scripts/serve_dashboard.py`.
-- Cierra el panel anterior con `Ctrl+C` y vuelve a abrir `Iniciar Finanzas.cmd`.
-- No finalices procesos al azar: identifica primero la terminal que inicio el panel.
+- Si el panel quedo huerfano de una sesion anterior, el lanzador lo cierra solo:
+  vuelve a hacer doble clic en `Iniciar Finanzas.cmd`.
+- Si el aviso persiste, ejecuta `Cerrar Finanzas.cmd` y reintenta.
+- Si sigue ocupado, el puerto lo esta usando otro programa ajeno a Finanzas.
+- No finalices procesos al azar: `Cerrar Finanzas.cmd` solo detiene los que
+  figuran en `data/runtime_status.json`.
 
 El lanzador indica que el bot ya esta iniciado:
 
