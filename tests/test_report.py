@@ -8,6 +8,55 @@ from finance_bot.parser import HOUSEHOLD_FOOD_CATEGORY, VALID_CATEGORIES
 from finance_bot.report import render_report_html
 
 
+def test_dashboard_calculations_in_javascript():
+    import shutil
+    import subprocess
+    import pytest
+    node = shutil.which("node")
+    if not node:
+        pytest.skip("Node.js is required for frontend regression checks")
+    subprocess.run([node, str(Path(__file__).with_name("dashboard_helpers.cjs"))], check=True)
+
+
+def test_projection_distinguishes_plan_from_linked_actual_and_manual_status(tmp_path):
+    from finance_bot.report import report_data
+    settings = _settings(tmp_path)
+    db = FinanceDatabase(settings.sqlite_db_path, settings.timezone)
+    month = datetime.now(db.timezone).strftime("%Y-%m")
+    template = db.upsert_projection_template(kind="income", name="Sueldo Ariel", default_amount_cents=110000, category="Ingresos laborales", start_month=month)
+    transaction = db.add_manual_transaction(kind="income", amount_cents=130000, category="Ingresos laborales", note="Sueldo Ariel", created_at=month + "-04T12:00:00+02:00")
+    manual = db.upsert_projection_template(kind="income", name="Extra", default_amount_cents=20000, category="Trabajos extra", start_month=month)
+    db.set_projection_occurrence(template_id=manual, month=month, amount_cents=20000, status="completed", note="")
+    result = report_data(settings)
+    row = next(r for r in result["projections"]["rows"] if r["month"] == month and r["templateId"] == template)
+    assert row["amountCents"] == 110000
+    assert row["actualLinkedCents"] == 130000
+    assert row["linkedTransactionIds"] == [transaction]
+    assert "El importe registrado difiere del previsto" in row["linkWarnings"]
+    assert result["projections"]["months"][0]["completedIncomeCents"] == 130000
+    assert result["projections"]["months"][0]["actualIncomeCents"] == 130000
+
+
+def test_report_script_data_cannot_close_script_element(tmp_path):
+    settings = _settings(tmp_path)
+    db = FinanceDatabase(settings.sqlite_db_path, settings.timezone)
+    db.add_manual_transaction(kind="expense", amount_cents=100, category="Ocio", note='</script><script>alert("test")</script>')
+    html = render_report_html(settings, editable=True)
+    assert '</script><script>alert("test")' not in html
+    assert '\\u003c/script>' in html
+
+
+def test_overspent_budget_does_not_reduce_pending_expenses(tmp_path):
+    from finance_bot.report import report_data
+    settings = _settings(tmp_path)
+    db = FinanceDatabase(settings.sqlite_db_path, settings.timezone)
+    month = datetime.now(db.timezone).strftime("%Y-%m")
+    db.upsert_projection_template(kind="expense", name=HOUSEHOLD_FOOD_CATEGORY, default_amount_cents=10000, category=HOUSEHOLD_FOOD_CATEGORY, start_month=month)
+    db.add_manual_transaction(kind="expense", amount_cents=15000, category=HOUSEHOLD_FOOD_CATEGORY, note="Compra", created_at=month + "-04T12:00:00+02:00")
+    result = report_data(settings)
+    assert result["projections"]["months"][0]["pendingExpenseCents"] == 0
+
+
 def _settings(tmp_path: Path) -> Settings:
     data_dir = tmp_path / "data"
     return Settings(
@@ -80,6 +129,14 @@ def test_report_includes_quick_status_and_trend_chart(tmp_path) -> None:
     assert "setProjectionStatus" in html
     assert "status-chip" in html
     assert 'id="cashflowGrid"' in html
+    assert 'id="projectionBalance"' in html
+    assert 'id="themeToggle"' in html
+    assert "finance-theme" in html
+    assert "Me falta cobrar" in html
+    assert "Me falta pagar" in html
+    assert "Ya cobrado" in html
+    assert "Ya pagado" in html
+    assert "no es el saldo del banco" in html
 
 
 def test_editable_report_includes_live_runtime_status(tmp_path) -> None:

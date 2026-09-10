@@ -8,3 +8,4 @@ reports/
 *.db
 *.sqlite
 *.csv
+.codex_tmp_tests_ui/

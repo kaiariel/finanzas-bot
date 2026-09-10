@@ -39,6 +39,13 @@ def main() -> None:
     if report_path.exists():
         shutil.copy2(report_path, html_backup)
 
+    # Conserva tambien los adjuntos locales para que el backup permita recuperar
+    # la trazabilidad completa de los movimientos y tickets.
+    for label, source in (("receipts", settings.resolved_receipts_dir()), ("voices", settings.resolved_voices_dir())):
+        if source.exists() and source.is_dir():
+            target = backup_dir / f"{label}-{stamp}"
+            shutil.copytree(source, target, dirs_exist_ok=True)
+
     print(db_backup.resolve())
 
 

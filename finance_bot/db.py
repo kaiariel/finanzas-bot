@@ -6,7 +6,7 @@ import re
 import sqlite3
 import unicodedata
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -22,6 +22,7 @@ from finance_bot.parser import (
     HOUSEHOLD_FOOD_CATEGORY,
     LEGACY_HOUSEHOLD_FOOD_CATEGORIES,
     ParsedTransaction,
+    VALID_CATEGORIES,
 )
 
 
@@ -56,6 +57,43 @@ class FinanceDatabase:
 
     def _now(self) -> str:
         return datetime.now(self.timezone).isoformat(timespec="seconds")
+
+    def log_audit(self, action: str, entity_type: str, entity_id: int | None, details: str = "") -> None:
+        with self._connect() as connection:
+            connection.execute(
+                "INSERT INTO audit_log(created_at, action, entity_type, entity_id, details) VALUES (?, ?, ?, ?, ?)",
+                (self._now(), action, entity_type, entity_id, details),
+            )
+
+    def undo_last_transaction_change(self, transaction_id: int) -> sqlite3.Row:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT id, details FROM audit_log WHERE entity_type = 'transaction' AND entity_id = ? AND action = 'update' ORDER BY id DESC LIMIT 1",
+                (transaction_id,),
+            ).fetchone()
+            if row is None:
+                raise KeyError(f"No hay cambios que deshacer para el movimiento {transaction_id}")
+            payload = json.loads(row["details"])
+            before = payload.get("before") or {}
+            columns = ["created_at", "kind", "amount_cents", "category", "note", "store", "is_fixed", "review_status", "inference_notes", "projection_template_id", "account_id", "due_date", "paid_amount_cents"]
+            available = [column for column in columns if column in before]
+            connection.execute("UPDATE transactions SET " + ", ".join(f"{column} = ?" for column in available) + " WHERE id = ?", tuple(before[column] for column in available) + (transaction_id,))
+            connection.execute("INSERT INTO audit_log(created_at, action, entity_type, entity_id, details) VALUES (?, 'undo', 'transaction', ?, ?)", (self._now(), transaction_id, json.dumps({"undid": row["id"]})))
+            restored = connection.execute("SELECT * FROM transactions WHERE id = ?", (transaction_id,)).fetchone()
+        if restored is None:
+            raise KeyError(f"No existe el movimiento {transaction_id}")
+        return restored
+
+    def set_transaction_payment(self, transaction_id: int, paid_amount_cents: int, due_date: str | None = None) -> sqlite3.Row:
+        if paid_amount_cents < 0:
+            raise ValueError("El importe pagado no puede ser negativo")
+        with self._connect() as connection:
+            connection.execute("UPDATE transactions SET paid_amount_cents = ?, due_date = ? WHERE id = ?", (paid_amount_cents, due_date, transaction_id))
+            row = connection.execute("SELECT * FROM transactions WHERE id = ?", (transaction_id,)).fetchone()
+        if row is None:
+            raise KeyError(f"No existe el movimiento {transaction_id}")
+        self.log_audit("payment", "transaction", transaction_id, f"Pagado {paid_amount_cents}")
+        return row
 
     def _init_schema(self) -> None:
         with self._connect() as connection:
@@ -105,6 +143,7 @@ class FinanceDatabase:
                     group_name TEXT NOT NULL DEFAULT '',
                     recurrence TEXT NOT NULL DEFAULT 'monthly',
                     start_month TEXT NOT NULL DEFAULT '',
+                    end_month TEXT NOT NULL DEFAULT '',
                     installment_current INTEGER,
                     installment_total INTEGER,
                     active INTEGER NOT NULL DEFAULT 1,
@@ -125,6 +164,80 @@ class FinanceDatabase:
 
                 CREATE UNIQUE INDEX IF NOT EXISTS idx_projection_templates_kind_name
                     ON projection_templates(kind, name);
+
+                CREATE TABLE IF NOT EXISTS audit_log (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    created_at TEXT NOT NULL,
+                    action TEXT NOT NULL,
+                    entity_type TEXT NOT NULL,
+                    entity_id INTEGER,
+                    details TEXT NOT NULL DEFAULT ''
+                );
+
+                CREATE TABLE IF NOT EXISTS accounts (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    created_at TEXT NOT NULL,
+                    name TEXT NOT NULL UNIQUE,
+                    account_type TEXT NOT NULL DEFAULT 'bank',
+                    opening_balance_cents INTEGER NOT NULL DEFAULT 0,
+                    currency TEXT NOT NULL DEFAULT 'EUR',
+                    active INTEGER NOT NULL DEFAULT 1
+                );
+
+                CREATE TABLE IF NOT EXISTS transfers (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    created_at TEXT NOT NULL,
+                    from_account_id INTEGER NOT NULL,
+                    to_account_id INTEGER NOT NULL,
+                    amount_cents INTEGER NOT NULL,
+                    note TEXT NOT NULL DEFAULT '',
+                    FOREIGN KEY(from_account_id) REFERENCES accounts(id),
+                    FOREIGN KEY(to_account_id) REFERENCES accounts(id)
+                );
+
+                CREATE TABLE IF NOT EXISTS budgets (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    month TEXT NOT NULL,
+                    category TEXT NOT NULL,
+                    amount_cents INTEGER NOT NULL,
+                    UNIQUE(month, category)
+                );
+
+                CREATE TABLE IF NOT EXISTS savings_goals (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    created_at TEXT NOT NULL,
+                    name TEXT NOT NULL,
+                    target_cents INTEGER NOT NULL,
+                    current_cents INTEGER NOT NULL DEFAULT 0,
+                    target_date TEXT,
+                    wallet_id INTEGER,
+                    active INTEGER NOT NULL DEFAULT 1
+                );
+
+                CREATE TABLE IF NOT EXISTS savings_settings (
+                    id INTEGER PRIMARY KEY CHECK (id = 1),
+                    current_balance_cents INTEGER NOT NULL DEFAULT 0,
+                    current_balance_date TEXT NOT NULL DEFAULT '',
+                    include_current_balance INTEGER NOT NULL DEFAULT 0,
+                    emergency_monthly_cents INTEGER NOT NULL DEFAULT 0
+                );
+
+                CREATE TABLE IF NOT EXISTS savings_wallets (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    created_at TEXT NOT NULL,
+                    name TEXT NOT NULL UNIQUE,
+                    balance_cents INTEGER NOT NULL DEFAULT 0,
+                    include_in_projection INTEGER NOT NULL DEFAULT 1,
+                    active INTEGER NOT NULL DEFAULT 1
+                );
+
+                CREATE TABLE IF NOT EXISTS import_batches (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    created_at TEXT NOT NULL,
+                    filename TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'preview',
+                    row_count INTEGER NOT NULL DEFAULT 0
+                );
                 """
             )
             self._ensure_column(connection, "transactions", "store", "TEXT NOT NULL DEFAULT ''")
@@ -143,10 +256,15 @@ class FinanceDatabase:
                 connection, "transactions", "inference_notes", "TEXT NOT NULL DEFAULT '[]'"
             )
             self._ensure_column(connection, "transactions", "projection_template_id", "INTEGER")
+            self._ensure_column(connection, "transactions", "account_id", "INTEGER")
+            self._ensure_column(connection, "transactions", "transfer_id", "INTEGER")
+            self._ensure_column(connection, "transactions", "due_date", "TEXT")
+            self._ensure_column(connection, "transactions", "paid_amount_cents", "INTEGER")
             self._ensure_column(connection, "receipts", "telegram_user_id", "INTEGER")
             self._ensure_column(connection, "receipts", "telegram_username", "TEXT")
             self._ensure_column(connection, "receipts", "telegram_full_name", "TEXT")
             self._ensure_column(connection, "receipts", "review_notes", "TEXT")
+            self._ensure_column(connection, "savings_goals", "wallet_id", "INTEGER")
             self._ensure_column(
                 connection,
                 "projection_templates",
@@ -163,6 +281,12 @@ class FinanceDatabase:
                 connection,
                 "projection_templates",
                 "start_month",
+                "TEXT NOT NULL DEFAULT ''",
+            )
+            self._ensure_column(
+                connection,
+                "projection_templates",
+                "end_month",
                 "TEXT NOT NULL DEFAULT ''",
             )
             self._ensure_column(connection, "projection_templates", "installment_current", "INTEGER")
@@ -213,21 +337,10 @@ class FinanceDatabase:
         connection.execute(
             f"""
             UPDATE projection_templates
-            SET name = ?, default_amount_cents = ?, category = ?, active = 1
+            SET name = ?, category = ?
             WHERE kind = 'expense' AND name IN ({household_placeholders})
             """,
-            (HOUSEHOLD_FOOD_CATEGORY, 60000, HOUSEHOLD_FOOD_CATEGORY, *household_names),
-        )
-        connection.execute(
-            f"""
-            UPDATE projection_occurrences
-            SET amount_cents = ?
-            WHERE template_id IN (
-                SELECT id FROM projection_templates
-                WHERE kind = 'expense' AND name = ?
-            )
-            """,
-            (60000, HOUSEHOLD_FOOD_CATEGORY),
+            (HOUSEHOLD_FOOD_CATEGORY, HOUSEHOLD_FOOD_CATEGORY, *household_names),
         )
 
         izhan_projection_names = ("Musica Izhan", "Música Izhan", "Izhan hijo")
@@ -265,6 +378,10 @@ class FinanceDatabase:
         receipt_id: int | None = None,
         review_status: str = "registered",
         duplicate_of_id: int | None = None,
+        account_id: int | None = None,
+        transfer_id: int | None = None,
+        due_date: str | None = None,
+        paid_amount_cents: int | None = None,
     ) -> int:
         with self._connect() as connection:
             cursor = connection.execute(
@@ -274,9 +391,9 @@ class FinanceDatabase:
                     store, is_fixed, source_text, receipt_local_path, receipt_drive_file_id,
                     receipt_drive_url, telegram_message_id, telegram_user_id,
                     telegram_username, telegram_full_name, receipt_id, review_status,
-                    duplicate_of_id, inference_notes
+                    duplicate_of_id, inference_notes, account_id, transfer_id, due_date, paid_amount_cents
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     self._now(),
@@ -299,6 +416,10 @@ class FinanceDatabase:
                     review_status,
                     duplicate_of_id,
                     json.dumps(list(parsed.inference_notes), ensure_ascii=False),
+                    account_id,
+                    transfer_id,
+                    due_date,
+                    paid_amount_cents if paid_amount_cents is not None else parsed.amount_cents,
                 ),
             )
             transaction_id = int(cursor.lastrowid)
@@ -327,6 +448,10 @@ class FinanceDatabase:
         receipt_id: int | None = None,
         review_status: str = "registered",
         duplicate_of_id: int | None = None,
+        account_id: int | None = None,
+        transfer_id: int | None = None,
+        due_date: str | None = None,
+        paid_amount_cents: int | None = None,
     ) -> int:
         if kind not in {"expense", "income"}:
             raise ValueError("kind debe ser 'expense' o 'income'")
@@ -339,9 +464,9 @@ class FinanceDatabase:
                     store, is_fixed, source_text, receipt_local_path, receipt_drive_file_id,
                     receipt_drive_url, telegram_message_id, telegram_user_id,
                     telegram_username, telegram_full_name, receipt_id, review_status,
-                    duplicate_of_id, inference_notes
+                    duplicate_of_id, inference_notes, account_id, transfer_id, due_date, paid_amount_cents
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     created_at or self._now(),
@@ -364,11 +489,127 @@ class FinanceDatabase:
                     review_status,
                     duplicate_of_id,
                     "[]",
+                    account_id,
+                    transfer_id,
+                    due_date,
+                    paid_amount_cents if paid_amount_cents is not None else amount_cents,
                 ),
             )
             transaction_id = int(cursor.lastrowid)
         self.auto_apply_projection_for_transaction(transaction_id)
         return transaction_id
+
+    def create_account(self, name: str, account_type: str = "bank", opening_balance_cents: int = 0) -> int:
+        name = name.strip()
+        if not name:
+            raise ValueError("El nombre de la cuenta es obligatorio")
+        with self._connect() as connection:
+            cursor = connection.execute(
+                "INSERT INTO accounts(created_at, name, account_type, opening_balance_cents) VALUES (?, ?, ?, ?)",
+                (self._now(), name, account_type, int(opening_balance_cents)),
+            )
+            return int(cursor.lastrowid)
+
+    def list_accounts(self, active_only: bool = True) -> list[sqlite3.Row]:
+        query = "SELECT * FROM accounts"
+        if active_only:
+            query += " WHERE active = 1"
+        query += " ORDER BY name"
+        with self._connect() as connection:
+            return connection.execute(query).fetchall()
+
+    def add_transfer(self, *, from_account_id: int, to_account_id: int, amount_cents: int, note: str = "", created_at: str | None = None) -> int:
+        if from_account_id == to_account_id or amount_cents <= 0:
+            raise ValueError("La transferencia debe unir dos cuentas distintas y tener importe positivo")
+        with self._connect() as connection:
+            account_ids = {row[0] for row in connection.execute("SELECT id FROM accounts WHERE active = 1 AND id IN (?, ?)", (from_account_id, to_account_id)).fetchall()}
+            if account_ids != {from_account_id, to_account_id}:
+                raise ValueError("La cuenta de origen o destino no existe")
+            cursor = connection.execute(
+                "INSERT INTO transfers(created_at, from_account_id, to_account_id, amount_cents, note) VALUES (?, ?, ?, ?, ?)",
+                (created_at or self._now(), from_account_id, to_account_id, amount_cents, note),
+            )
+            return int(cursor.lastrowid)
+
+    def account_balances(self) -> list[sqlite3.Row]:
+        with self._connect() as connection:
+            return connection.execute(
+                """
+                SELECT a.*, a.opening_balance_cents
+                    + COALESCE((SELECT SUM(t.amount_cents) FROM transfers t WHERE t.to_account_id = a.id), 0)
+                    - COALESCE((SELECT SUM(t.amount_cents) FROM transfers t WHERE t.from_account_id = a.id), 0)
+                    + COALESCE((SELECT SUM(CASE WHEN x.kind = 'income' THEN x.amount_cents ELSE -x.amount_cents END) FROM transactions x WHERE x.account_id = a.id), 0)
+                    AS balance_cents
+                FROM accounts a WHERE a.active = 1 ORDER BY a.name
+                """
+            ).fetchall()
+
+    def upsert_budget(self, month: str, category: str, amount_cents: int) -> None:
+        if amount_cents < 0:
+            raise ValueError("El presupuesto no puede ser negativo")
+        with self._connect() as connection:
+            connection.execute(
+                "INSERT INTO budgets(month, category, amount_cents) VALUES (?, ?, ?) ON CONFLICT(month, category) DO UPDATE SET amount_cents = excluded.amount_cents",
+                (month, category, amount_cents),
+            )
+
+    def list_budgets(self, month: str | None = None) -> list[sqlite3.Row]:
+        with self._connect() as connection:
+            if month:
+                return connection.execute("SELECT * FROM budgets WHERE month = ? ORDER BY category", (month,)).fetchall()
+            return connection.execute("SELECT * FROM budgets ORDER BY month, category").fetchall()
+
+    def create_savings_goal(self, name: str, target_cents: int, target_date: str | None = None, wallet_id: int | None = None) -> int:
+        if target_cents <= 0:
+            raise ValueError("El objetivo debe ser positivo")
+        with self._connect() as connection:
+            cursor = connection.execute(
+                "INSERT INTO savings_goals(created_at, name, target_cents, target_date, wallet_id) VALUES (?, ?, ?, ?, ?)",
+                (self._now(), name.strip(), target_cents, target_date, wallet_id),
+            )
+            return int(cursor.lastrowid)
+
+    def list_savings_goals(self, active_only: bool = True) -> list[sqlite3.Row]:
+        query = "SELECT * FROM savings_goals" + (" WHERE active = 1" if active_only else "") + " ORDER BY target_date, name"
+        with self._connect() as connection:
+            return connection.execute(query).fetchall()
+
+    def get_savings_settings(self) -> sqlite3.Row:
+        with self._connect() as connection:
+            connection.execute("INSERT OR IGNORE INTO savings_settings(id) VALUES (1)")
+            return connection.execute("SELECT * FROM savings_settings WHERE id = 1").fetchone()
+
+    def update_savings_settings(self, *, current_balance_cents: int, current_balance_date: str, include_current_balance: bool, emergency_monthly_cents: int) -> None:
+        if current_balance_cents < 0 or emergency_monthly_cents < 0:
+            raise ValueError("Los importes de ahorro no pueden ser negativos")
+        with self._connect() as connection:
+            connection.execute(
+                "INSERT INTO savings_settings(id, current_balance_cents, current_balance_date, include_current_balance, emergency_monthly_cents) VALUES (1, ?, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET current_balance_cents=excluded.current_balance_cents, current_balance_date=excluded.current_balance_date, include_current_balance=excluded.include_current_balance, emergency_monthly_cents=excluded.emergency_monthly_cents",
+                (current_balance_cents, current_balance_date, 1 if include_current_balance else 0, emergency_monthly_cents),
+            )
+        self.log_audit("update", "savings_settings", 1, "Saldo y reserva actualizados")
+
+    def create_savings_wallet(self, name: str, balance_cents: int, include_in_projection: bool = True) -> int:
+        if not name.strip() or balance_cents < 0:
+            raise ValueError("La cartera necesita nombre e importe válido")
+        with self._connect() as connection:
+            cursor = connection.execute("INSERT INTO savings_wallets(created_at, name, balance_cents, include_in_projection) VALUES (?, ?, ?, ?)", (self._now(), name.strip(), balance_cents, 1 if include_in_projection else 0))
+            wallet_id = int(cursor.lastrowid)
+        self.log_audit("create", "savings_wallet", wallet_id, "Cartera creada")
+        return wallet_id
+
+    def update_savings_wallet(self, wallet_id: int, *, name: str, balance_cents: int, include_in_projection: bool, active: bool = True) -> None:
+        if not name.strip() or balance_cents < 0:
+            raise ValueError("La cartera necesita nombre e importe válido")
+        with self._connect() as connection:
+            cursor = connection.execute("UPDATE savings_wallets SET name = ?, balance_cents = ?, include_in_projection = ?, active = ? WHERE id = ?", (name.strip(), balance_cents, 1 if include_in_projection else 0, 1 if active else 0, wallet_id))
+            if cursor.rowcount == 0:
+                raise KeyError(f"No existe la cartera {wallet_id}")
+        self.log_audit("update", "savings_wallet", wallet_id, "Cartera actualizada")
+
+    def list_savings_wallets(self, active_only: bool = True) -> list[sqlite3.Row]:
+        with self._connect() as connection:
+            return connection.execute("SELECT * FROM savings_wallets " + ("WHERE active = 1 " if active_only else "") + "ORDER BY name").fetchall()
 
     def add_receipt(
         self,
@@ -430,15 +671,44 @@ class FinanceDatabase:
                 (status, review_notes, receipt_id),
             )
 
+    def register_receipt_entries(self, receipt_id: int, entries: list[dict[str, object]], *, allow_existing: bool = False) -> list[int]:
+        receipt = self.get_receipt(receipt_id)
+        if receipt is None:
+            raise KeyError(f"No existe el ticket {receipt_id}")
+        if not entries:
+            raise ValueError("El ticket necesita al menos una línea")
+        if not allow_existing:
+            with self._connect() as connection:
+                if connection.execute("SELECT 1 FROM transactions WHERE receipt_id = ? LIMIT 1", (receipt_id,)).fetchone():
+                    raise ValueError("El ticket ya tiene movimientos; activa allow_existing para reemplazarlos")
+        prepared: list[tuple[object, ...]] = []
+        for entry in entries:
+            kind = str(entry.get("kind") or "expense")
+            amount = int(entry.get("amount_cents") or 0)
+            category = str(entry.get("category") or "")
+            note = str(entry.get("note") or "").strip()
+            if kind not in {"expense", "income"} or amount <= 0 or category not in VALID_CATEGORIES or not note:
+                raise ValueError("Cada línea necesita tipo, importe, categoría y descripción")
+            prepared.append((kind, amount, category, note, str(entry.get("store") or ""), bool(entry.get("is_fixed")), entry.get("created_at")))
+        created_ids: list[int] = []
+        with self._connect() as connection:
+            for kind, amount, category, note, store, is_fixed, created_at in prepared:
+                cursor = connection.execute(
+                    """INSERT INTO transactions(created_at, kind, amount_cents, currency, category, note, store, is_fixed, source_text, receipt_local_path, telegram_message_id, telegram_user_id, telegram_username, telegram_full_name, receipt_id, review_status, inference_notes, paid_amount_cents)
+                       VALUES (?, ?, ?, 'EUR', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'registered', '[]', ?)""",
+                    (created_at or self._now(), kind, amount, category, note, store, int(is_fixed), receipt["caption"] or "", receipt["local_path"], receipt["telegram_message_id"], receipt["telegram_user_id"], receipt["telegram_username"], receipt["telegram_full_name"], receipt_id, amount),
+                )
+                created_ids.append(int(cursor.lastrowid))
+            connection.execute("UPDATE receipts SET status = 'processed', review_notes = COALESCE(review_notes, '') WHERE id = ?", (receipt_id,))
+        for transaction_id in created_ids:
+            self.auto_apply_projection_for_transaction(transaction_id)
+        return created_ids
+
     def get_transaction(self, transaction_id: int) -> sqlite3.Row | None:
         with self._connect() as connection:
             return connection.execute(
                 """
-                SELECT id, created_at, kind, amount_cents, currency, category, note,
-                       store, is_fixed, source_text, receipt_local_path,
-                       telegram_user_id, telegram_username, telegram_full_name,
-                       receipt_id, review_status, duplicate_of_id,
-                       inference_notes, projection_template_id
+                SELECT *
                 FROM transactions
                 WHERE id = ?
                 """,
@@ -504,11 +774,7 @@ class FinanceDatabase:
                 raise KeyError(f"No existe el movimiento {transaction_id}")
             row = connection.execute(
                 """
-                SELECT id, created_at, kind, amount_cents, currency, category, note,
-                       store, is_fixed, source_text, receipt_local_path,
-                       telegram_user_id, telegram_username, telegram_full_name,
-                       receipt_id, review_status, duplicate_of_id,
-                       inference_notes, projection_template_id
+                SELECT *
                 FROM transactions
                 WHERE id = ?
                 """,
@@ -528,6 +794,7 @@ class FinanceDatabase:
         group_name: str = "",
         recurrence: str = "monthly",
         start_month: str = "",
+        end_month: str = "",
         installment_current: int | None = None,
         installment_total: int | None = None,
         active: bool = True,
@@ -543,16 +810,17 @@ class FinanceDatabase:
                 """
                 INSERT INTO projection_templates (
                     created_at, kind, name, default_amount_cents, category,
-                    group_name, recurrence, start_month, installment_current, installment_total,
+                    group_name, recurrence, start_month, end_month, installment_current, installment_total,
                     active, sort_order
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(kind, name) DO UPDATE SET
                     default_amount_cents = excluded.default_amount_cents,
                     category = excluded.category,
                     group_name = excluded.group_name,
                     recurrence = excluded.recurrence,
                     start_month = excluded.start_month,
+                    end_month = excluded.end_month,
                     installment_current = excluded.installment_current,
                     installment_total = excluded.installment_total,
                     active = excluded.active,
@@ -567,6 +835,7 @@ class FinanceDatabase:
                     group_name,
                     recurrence,
                     start_month,
+                    end_month,
                     installment_current,
                     installment_total,
                     1 if active else 0,
@@ -590,6 +859,7 @@ class FinanceDatabase:
         default_amount_cents: int | None = None,
         category: str | None = None,
         start_month: str | None = None,
+        end_month: str | None = None,
         installment_current: int | None = None,
         installment_total: int | None = None,
         clear_installments: bool = False,
@@ -606,6 +876,7 @@ class FinanceDatabase:
             "default_amount_cents": default_amount_cents,
             "category": category,
             "start_month": start_month,
+            "end_month": end_month,
         }
         for column, value in values.items():
             if value is not None:
@@ -644,7 +915,7 @@ class FinanceDatabase:
             row = connection.execute(
                 """
                 SELECT id, created_at, kind, name, default_amount_cents, category,
-                       group_name, recurrence, start_month, installment_current, installment_total,
+                       group_name, recurrence, start_month, end_month, installment_current, installment_total,
                        active, sort_order
                 FROM projection_templates
                 WHERE id = ?
@@ -660,7 +931,7 @@ class FinanceDatabase:
             return connection.execute(
                 """
                 SELECT id, created_at, kind, name, default_amount_cents, category,
-                       group_name, recurrence, start_month, installment_current, installment_total,
+                       group_name, recurrence, start_month, end_month, installment_current, installment_total,
                        active, sort_order
                 FROM projection_templates
                 WHERE id = ?
@@ -708,6 +979,37 @@ class FinanceDatabase:
             raise RuntimeError("No se pudo guardar el mes proyectado")
         return int(row["id"])
 
+    def end_projection_from(self, template_id: int, month: str) -> sqlite3.Row:
+        """Finish a recurring projection from ``month`` while preserving prior months."""
+        template = self.get_projection_template(template_id)
+        if template is None:
+            raise KeyError(f"No existe la proyeccion {template_id}")
+        start_month = str(template["start_month"] or month)
+        if month < start_month:
+            raise ValueError("El mes final no puede ser anterior al inicio")
+
+        if month == start_month:
+            with self._connect() as connection:
+                connection.execute("UPDATE projection_templates SET active = 0, end_month = ? WHERE id = ?", (month, template_id))
+                connection.execute(
+                    "UPDATE projection_occurrences SET status = 'skipped', note = ?, updated_at = ? WHERE template_id = ? AND month >= ?",
+                    ("Finalizado desde este mes", self._now(), template_id, month),
+                )
+        else:
+            current = datetime.strptime(month, "%Y-%m")
+            previous = (current.replace(day=1) - timedelta(days=1)).strftime("%Y-%m")
+            with self._connect() as connection:
+                connection.execute("UPDATE projection_templates SET active = 1, end_month = ? WHERE id = ?", (previous, template_id))
+                connection.execute(
+                    "UPDATE projection_occurrences SET status = 'skipped', note = ?, updated_at = ? WHERE template_id = ? AND month >= ?",
+                    ("Finalizado desde este mes", self._now(), template_id, month),
+                )
+        self.log_audit("end", "projection", template_id, f"Finalizada desde {month}")
+        updated = self.get_projection_template(template_id)
+        if updated is None:
+            raise KeyError(f"No existe la proyeccion {template_id}")
+        return updated
+
     def get_projection_occurrence(self, template_id: int, month: str) -> sqlite3.Row | None:
         with self._connect() as connection:
             return connection.execute(
@@ -725,7 +1027,7 @@ class FinanceDatabase:
             return connection.execute(
                 f"""
                 SELECT id, created_at, kind, name, default_amount_cents, category,
-                       group_name, recurrence, start_month, installment_current, installment_total,
+                       group_name, recurrence, start_month, end_month, installment_current, installment_total,
                        active, sort_order
                 FROM projection_templates
                 {where}
@@ -865,11 +1167,7 @@ class FinanceDatabase:
         with self._connect() as connection:
             return connection.execute(
                 """
-                SELECT id, created_at, kind, amount_cents, currency, category, note,
-                       store, is_fixed, source_text, receipt_local_path,
-                       telegram_user_id, telegram_username, telegram_full_name,
-                       receipt_id, review_status, duplicate_of_id,
-                       inference_notes, projection_template_id
+                SELECT *
                 FROM transactions
                 ORDER BY created_at ASC, id ASC
                 """
@@ -939,6 +1237,9 @@ class FinanceDatabase:
         month_offset = self._month_distance(start_month, month)
         if month_offset < 0:
             return False
+        end_month = str(template["end_month"] or "")
+        if end_month and month > end_month:
+            return False
         installment_current = template["installment_current"]
         installment_total = template["installment_total"]
         if installment_current and installment_total:
@@ -958,10 +1259,17 @@ class FinanceDatabase:
 
         template_tokens = set(re.findall(r"\w+", template_name))
         text_tokens = set(re.findall(r"\w+", normalized_text))
+        # A substring is not a concept: agua must not match Paraguay and
+        # a short label such as Cu must not match cuota/cuidado.
+        meaningful = {token for token in template_tokens if len(token) >= 3}
+        if not meaningful or not meaningful.intersection(text_tokens):
+            return 0
+        if len(meaningful) == 1 and self._normalize_text(str(transaction["category"] or "")) != self._normalize_text(str(template["category"] or "")):
+            return 0
         overlap = len(template_tokens & text_tokens)
         score = overlap * 18
 
-        if template_name in normalized_text:
+        if re.search(r"(?<!\w)" + re.escape(template_name) + r"(?!\w)", normalized_text):
             score += 80
         if normalized_text and normalized_text in template_name:
             score += 35

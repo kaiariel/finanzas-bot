@@ -3,15 +3,17 @@ setlocal
 cd /d "%~dp0"
 title Cerrar Finanzas
 
-if not exist ".venv\Scripts\python.exe" (
-  echo No se encontro el entorno virtual en .venv.
+set "PYTHON_EXE=.venv-working\Scripts\python.exe"
+if not exist "%PYTHON_EXE%" set "PYTHON_EXE=.venv\Scripts\python.exe"
+if not exist "%PYTHON_EXE%" (
+  echo No se encontro un Python valido en .venv o .venv-working.
   echo Revisa la instalacion antes de cerrar Finanzas.
   echo.
   pause
   exit /b 1
 )
 
-".venv\Scripts\python.exe" -B "scripts\start_finance_app.py" --stop
+"%PYTHON_EXE%" -B "scripts\start_finance_app.py" --stop
 set "CODIGO=%ERRORLEVEL%"
 if not "%CODIGO%"=="0" (
   echo.

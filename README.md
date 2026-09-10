@@ -393,6 +393,14 @@ http://127.0.0.1:8765
 Desde el panel puedes editar movimientos y proyecciones. Los cambios se escriben en
 SQLite y regeneran el reporte HTML.
 
+El panel local tambien permite crear movimientos manuales desde `Movimientos`. Cada alta
+o cambio relevante queda registrado en `audit_log` para conservar un historial tecnico
+de la operacion.
+
+La pestaña `Cuentas` permite crear cuentas, consultar saldos, hacer transferencias
+internas, guardar presupuestos por categoría y crear objetivos de ahorro. Las
+transferencias se guardan separadas y no se suman como ingresos o gastos.
+
 Cuando el panel se inicia mediante `Iniciar Finanzas.cmd`, muestra el estado del bot,
 el servidor local, la ultima actividad registrada y la cantidad de tickets pendientes.
 El estado se actualiza cada cinco segundos y tambien puede refrescarse con el boton
@@ -476,6 +484,24 @@ python scripts/backup_finances.py
 
 Crea backup de SQLite, CSV y HTML en `data/backups`.
 
+Tambien copia las carpetas locales de tickets y voces con la misma marca temporal para
+que la trazabilidad de los adjuntos pueda recuperarse junto con la base de datos.
+
+Para restaurar un backup primero comprueba que es valido y despues confirma la escritura:
+
+```powershell
+python scripts/restore_finances.py data/backups/finances-AAAAMMDD-HHMMSS.db
+python scripts/restore_finances.py data/backups/finances-AAAAMMDD-HHMMSS.db --confirm
+```
+
+Para importar un extracto CSV, la primera orden solo genera una vista previa y marca
+posibles duplicados. La segunda registra las líneas cuando no quedan coincidencias:
+
+```powershell
+python scripts/import_csv.py extracto.csv
+python scripts/import_csv.py extracto.csv --confirm
+```
+
 ```powershell
 python scripts/organize_receipts_by_month.py
 ```
@@ -540,6 +566,23 @@ Ejecutar tests:
 ```powershell
 .\.venv\Scripts\Activate.ps1
 python -m pytest -q
+```
+
+Si el Python integrado de Windows no esta disponible, usa el entorno gestionado por
+`uv`:
+
+```powershell
+uv venv --python 3.12 .venv-working
+uv pip install --python .venv-working\Scripts\python.exe -r requirements.txt
+$env:TEMP = "$PWD\.pytest-tmp"
+$env:TMP = $env:TEMP
+.venv-working\Scripts\python.exe -m pytest -q
+```
+
+El diagnostico rapido se ejecuta con:
+
+```powershell
+.venv-working\Scripts\python.exe scripts/doctor.py
 ```
 
 Comprobar que los modulos compilan:

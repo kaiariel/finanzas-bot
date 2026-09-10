@@ -1,6 +1,16 @@
 from finance_bot.db import FinanceDatabase
 
 
+def test_projection_matching_requires_complete_meaningful_words(tmp_path):
+    db = FinanceDatabase(tmp_path / "finances.db", "Europe/Madrid")
+    db.upsert_projection_template(kind="expense", name="Agua", default_amount_cents=2500, category="Suministros", start_month="2026-09")
+    db.upsert_projection_template(kind="expense", name="Cu", default_amount_cents=1500, category="Deudas", start_month="2026-09")
+    db.upsert_projection_template(kind="expense", name="Google", default_amount_cents=1200, category="Suscripciones", start_month="2026-09")
+    for note, amount, category in [("pagado factura telefonia paraguay", 5000, "Ayuda familiar"), ("seguro salud", 2300, "Salud & Cuidado"), ("ads google", 4300, "Ocio")]:
+        item = db.add_manual_transaction(kind="expense", amount_cents=amount, category=category, note=note, is_fixed=True, created_at="2026-09-04T12:00:00+02:00")
+        assert db.get_transaction(item)["projection_template_id"] is None
+
+
 def test_pending_statuses_include_dudoso(tmp_path) -> None:
     db = FinanceDatabase(tmp_path / "finances.db", "Europe/Madrid")
 
@@ -198,3 +208,25 @@ def test_income_transaction_marks_matching_projection_completed(tmp_path) -> Non
     assert occurrence["status"] == "completed"
     assert transaction is not None
     assert transaction["projection_template_id"] == template_id
+
+
+def test_accounts_transfers_and_goals_are_separate_from_income_expense(tmp_path) -> None:
+    db = FinanceDatabase(tmp_path / "finances.db", "Europe/Madrid")
+    bank = db.create_account("Banco", opening_balance_cents=10000)
+    cash = db.create_account("Efectivo")
+    db.add_transfer(from_account_id=bank, to_account_id=cash, amount_cents=2500)
+    balances = {row["name"]: row["balance_cents"] for row in db.account_balances()}
+    assert balances == {"Banco": 7500, "Efectivo": 2500}
+    db.upsert_budget("2026-09", "Ocio", 5000)
+    goal = db.create_savings_goal("Vacaciones", 100000, "2027-06-01")
+    assert db.list_budgets("2026-09")[0]["amount_cents"] == 5000
+    assert db.list_savings_goals()[0]["id"] == goal
+
+
+def test_receipt_registration_is_atomic_and_marks_processed(tmp_path) -> None:
+    db = FinanceDatabase(tmp_path / "finances.db", "Europe/Madrid")
+    receipt_id = db.add_receipt(local_path="ticket.jpg", drive_file_id=None, drive_url=None, telegram_message_id=None, caption="Ticket", status="pending")
+    ids = db.register_receipt_entries(receipt_id, [{"kind": "expense", "amount_cents": 1200, "category": "Ocio", "note": "Cafe"}])
+    assert len(ids) == 1
+    assert db.get_receipt(receipt_id)["status"] == "processed"
+    assert db.get_transaction(ids[0])["receipt_id"] == receipt_id
