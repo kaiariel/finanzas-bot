@@ -11,7 +11,7 @@ desde Codex o con OCR local.
 - Guarda fotos, PDFs y notas de voz como pendientes de revision.
 - Registra movimientos en SQLite.
 - Exporta movimientos a CSV.
-- Genera un reporte HTML con filtros, graficas, tickets enlazados y proyeccion mensual.
+- Genera un reporte HTML con filtros, graficas, tickets enlazados, proyeccion mensual y panel de ahorro.
 - Mantiene trazabilidad entre movimientos y archivos originales.
 - Permite varios usuarios autorizados.
 - Puede sincronizar tickets con Google Drive para escritorio, sin usar la API de Google Drive.
@@ -47,13 +47,18 @@ lista de movimientos hasta que se revisan y se convierten en entradas contables.
   cruce es fiable, la proyeccion queda como completada y el movimiento guarda el
   `projection_template_id`.
 - El reporte HTML incorpora filtros en la tabla de movimientos, lista de ingresos
-  filtrados, gasto diario, tendencia de 12 meses y avisos de IA cuando una categoria o
+  filtrados, gasto diario, tendencia de hasta 36 meses y avisos de IA cuando una categoria o
   proyeccion se asumio con dudas.
 - El panel editable permite marcar proyecciones como `Pagar`, `Cobrar` o `Pendiente` con
   un clic, conservando importe y nota del mes.
 - El registro manual de tickets valida todas las entradas antes de escribir, evita
   duplicar movimientos en un pendiente ya registrado salvo que se autorice, y mantiene
   el reporte actualizado.
+- El panel `Ahorro` calcula cuanto dinero podrias tener al terminar un rango de meses,
+  combinando saldo actual opcional, carteras seleccionables y ahorro previsto. Admite
+  rangos futuros de hasta 36 meses.
+- Las proyecciones admiten mes de inicio y mes final, y se pueden terminar desde un mes
+  concreto conservando los meses anteriores.
 
 ## Instalacion
 
@@ -373,7 +378,7 @@ El reporte incluye:
 - Enlaces a archivos originales.
 - Proyeccion mensual de ingresos y gastos.
 - Grafico diario de gasto para el mes filtrado.
-- Grafico de tendencia de 12 meses con balance proyectado y balance real.
+- Grafico de tendencia de hasta 36 meses con balance proyectado y balance real.
 - Pestaña `Analisis Codex` con diagnostico del mes, meses futuros en riesgo y recomendaciones basadas en movimientos, tickets y proyecciones.
 
 ## Panel local editable
@@ -397,9 +402,26 @@ El panel local tambien permite crear movimientos manuales desde `Movimientos`. C
 o cambio relevante queda registrado en `audit_log` para conservar un historial tecnico
 de la operacion.
 
-La pestaña `Cuentas` permite crear cuentas, consultar saldos, hacer transferencias
-internas, guardar presupuestos por categoría y crear objetivos de ahorro. Las
-transferencias se guardan separadas y no se suman como ingresos o gastos.
+La pestaña `Ahorro` permite elegir un mes inicial y uno final, incluidos meses futuros.
+En el mes actual usa solo cobros y pagos pendientes; en los meses posteriores usa las
+proyecciones completas. El resumen separa el saldo actual incluido, las carteras
+incluidas, el ahorro nuevo del periodo y el dinero estimado al terminar.
+
+El saldo actual es un importe manual corregible que no crea movimientos. Las carteras
+pueden crearse, editarse, incluirse o excluirse del total y archivarse. Ejemplos:
+`Emergencias`, `Viaje` y `Efectivo reservado`. El saldo actual representa dinero fuera
+de las carteras para evitar contar dos veces la misma cantidad.
+
+El panel permite guardar una reserva mensual para imprevistos, crear objetivos con
+cantidad, fecha y cartera opcional, y probar gastos o ingresos puntuales o mensuales
+con un simulador que no modifica los datos reales. El gráfico y la tabla muestran cada
+mes con ingresos, gastos, reserva, resultado y acumulado. Los accesos rápidos permiten
+ver 3, 6 o 12 meses; el rango manual admite hasta 36 meses.
+
+Las cuentas bancarias, el efectivo y las transferencias se conservan en el apartado
+plegable `Mis cuentas y transferencias`, pero no se suman automáticamente al ahorro.
+Las transferencias internas se guardan separadas y no cuentan como ingresos o gastos.
+Los presupuestos por categoría también se mantienen en un apartado plegable.
 
 Cuando el panel se inicia mediante `Iniciar Finanzas.cmd`, muestra el estado del bot,
 el servidor local, la ultima actividad registrada y la cantidad de tickets pendientes.
@@ -416,7 +438,7 @@ En la pestaña `Proyeccion` cada item pendiente tiene un boton rapido `✓ Pagar
 `✓ Cobrar` que cambia el estado con un clic, sin abrir el formulario de edicion.
 Los items ya completados muestran `↩ Pendiente` para deshacer. El cambio se aplica
 al instante sin recargar la pagina. La pestaña tambien incluye un grafico de
-tendencia de 12 meses con ingresos y gastos proyectados, balance proyectado y
+tendencia de hasta 36 meses con ingresos y gastos proyectados, balance proyectado y
 balance real registrado.
 
 Advertencia: el panel local tiene APIs de escritura. Usalo solo en tu maquina o red de
@@ -426,6 +448,10 @@ confianza.
 
 El reporte y el panel incluyen una pestaña de proyeccion para planificar meses futuros.
 Puedes tener gastos fijos, cuotas, ingresos esperados, items pagados/cobrados y omitidos.
+Cada concepto puede tener un mes de inicio y un mes final. Por ejemplo, `Marketing
+Appsol` puede estar activo de marzo a septiembre. Al editarlo puedes ampliar o reducir
+el rango, o usar `Finalizar desde este mes` para omitir los meses posteriores y
+conservar el historial anterior.
 Cuando un movimiento nuevo coincide de forma clara con una proyeccion activa del mes,
 el sistema la marca automaticamente como completada. Esto funciona tanto para ingresos
 como para gastos recurrentes, y evita tener que cerrar manualmente cada pago/cobro.
