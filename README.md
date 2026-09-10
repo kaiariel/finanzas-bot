@@ -59,6 +59,19 @@ lista de movimientos hasta que se revisan y se convierten en entradas contables.
   rangos futuros de hasta 36 meses.
 - Las proyecciones admiten mes de inicio y mes final, y se pueden terminar desde un mes
   concreto conservando los meses anteriores.
+- El HTML, CSS y JavaScript del panel se movieron a archivos propios en
+  `finance_bot/ui/` en lugar de vivir como strings dentro de `report.py`, que bajo de
+  unas 2800 a unas 440 lineas.
+- El panel ganó navegacion lateral con modo oscuro, botones de ayuda contextual por
+  seccion (`¿Qué es esto?`), revision de tickets sin salir del panel y un boton para
+  deshacer la ultima edicion de un movimiento.
+- Nuevos scripts de mantenimiento: `scripts/doctor.py` (diagnostico rapido de Python,
+  token de Telegram, integridad de SQLite y disponibilidad de `git`),
+  `scripts/import_csv.py` (importa un extracto bancario con vista previa y deteccion de
+  duplicados) y `scripts/restore_finances.py` (restaura un backup, guardando antes una
+  copia de seguridad de la base actual).
+- SQLite ahora abre cada conexion en modo `WAL` con `busy_timeout`, para tolerar mejor
+  el acceso concurrente del bot, el panel y el supervisor sobre el mismo archivo.
 
 ## Instalacion
 
@@ -379,7 +392,7 @@ El reporte incluye:
 - Proyeccion mensual de ingresos y gastos.
 - Grafico diario de gasto para el mes filtrado.
 - Grafico de tendencia de hasta 36 meses con balance proyectado y balance real.
-- Pestaña `Analisis Codex` con diagnostico del mes, meses futuros en riesgo y recomendaciones basadas en movimientos, tickets y proyecciones.
+- Pestaña `Diagnóstico` con diagnostico del mes, meses futuros en riesgo y recomendaciones basadas en movimientos, tickets y proyecciones.
 
 ## Panel local editable
 
@@ -400,7 +413,19 @@ SQLite y regeneran el reporte HTML.
 
 El panel local tambien permite crear movimientos manuales desde `Movimientos`. Cada alta
 o cambio relevante queda registrado en `audit_log` para conservar un historial tecnico
-de la operacion.
+de la operacion. Al editar un movimiento, el boton `Deshacer último cambio` revierte la
+ultima edicion registrada en `audit_log` para ese movimiento concreto.
+
+La navegacion queda en una barra lateral con las secciones `Resumen`, `Movimientos`,
+`Proyección`, `Ahorro`, `Archivos` y `Diagnóstico`. El boton `◐ Modo oscuro` de la
+barra lateral cambia el tema visual del panel; la preferencia se guarda en el
+navegador. Cada seccion tiene un boton `¿Qué es esto?` con una explicacion breve de
+para que sirve ese panel.
+
+Desde `Archivos`, un ticket pendiente se puede revisar sin salir del panel: el boton
+`Revisar y confirmar` abre un formulario donde se corrigen las lineas detectadas y,
+al confirmar, se convierten en movimientos enlazados al ticket. Es el equivalente en
+la interfaz a `scripts/register_manual_entries.py`.
 
 La pestaña `Ahorro` permite elegir un mes inicial y uno final, incluidos meses futuros.
 En el mes actual usa solo cobros y pagos pendientes; en los meses posteriores usa las
@@ -520,6 +545,11 @@ python scripts/restore_finances.py data/backups/finances-AAAAMMDD-HHMMSS.db
 python scripts/restore_finances.py data/backups/finances-AAAAMMDD-HHMMSS.db --confirm
 ```
 
+Antes de sobrescribir nada, `--confirm` guarda la base actual en
+`data/backups/pre-restore-<fecha>.db`, y si la carpeta de tickets o voces ya existe la
+mueve a `data/backups/receipts-antes-de-restaurar-<fecha>` (o `voices-...`) en vez de
+mezclarla con la del backup. Cierra el bot y el panel antes de restaurar.
+
 Para importar un extracto CSV, la primera orden solo genera una vista previa y marca
 posibles duplicados. La segunda registra las líneas cuando no quedan coincidencias:
 
@@ -605,7 +635,10 @@ $env:TMP = $env:TEMP
 .venv-working\Scripts\python.exe -m pytest -q
 ```
 
-El diagnostico rapido se ejecuta con:
+El diagnostico rapido comprueba la version de Python, que `TELEGRAM_BOT_TOKEN`
+este configurado, la integridad de SQLite (`PRAGMA quick_check`) y que `git`
+este disponible. Imprime un JSON con cada chequeo y termina con codigo 1 si
+alguno falla:
 
 ```powershell
 .venv-working\Scripts\python.exe scripts/doctor.py
@@ -640,8 +673,10 @@ El `.gitignore` debe excluir:
 ```gitignore
 .env
 .venv/
+.venv-working/
 __pycache__/
 .pytest_cache/
+.pytest-tmp/
 .claude/settings.local.json
 data/
 reports/
@@ -765,7 +800,7 @@ El analisis no parece completo:
 
 - Revisa que no queden tickets pendientes con `python scripts/list_pending.py`.
 - Regenera el reporte despues de registrar tickets o editar proyecciones.
-- Completa la pestaña `Proyeccion`; el panel `Analisis Codex` depende de esos importes para anticipar meses futuros.
+- Completa la pestaña `Proyeccion`; el panel `Diagnóstico` depende de esos importes para anticipar meses futuros.
 
 El bot no arranca:
 

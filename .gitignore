@@ -1,7 +1,13 @@
 .env
 .venv/
+.venv-working/
+.venv.broken*/
 __pycache__/
 .pytest_cache/
+.pytest-tmp/
+.pytest_tmp/
+.uv-cache/
+.import-test/
 .claude/settings.local.json
 data/
 reports/
@@ -9,3 +15,4 @@ reports/
 *.sqlite
 *.csv
 .codex_tmp_tests_ui/
+.codex_tmp_plan_render/

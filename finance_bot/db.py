@@ -51,8 +51,12 @@ class FinanceDatabase:
         self._init_schema()
 
     def _connect(self) -> sqlite3.Connection:
-        connection = sqlite3.connect(self.db_path)
+        connection = sqlite3.connect(self.db_path, timeout=10)
         connection.row_factory = sqlite3.Row
+        connection.execute("PRAGMA journal_mode = WAL")
+        connection.execute("PRAGMA synchronous = NORMAL")
+        connection.execute("PRAGMA busy_timeout = 10000")
+        connection.execute("PRAGMA foreign_keys = ON")
         return connection
 
     def _now(self) -> str:
@@ -297,7 +301,14 @@ class FinanceDatabase:
             self._ensure_column(
                 connection, "projection_templates", "sort_order", "INTEGER NOT NULL DEFAULT 0"
             )
-            self._apply_household_food_projection_migration(connection)
+            # Migraciones de datos pesadas (recorren tablas completas) se ejecutan una
+            # sola vez: _init_schema corre en cada apertura de FinanceDatabase (una por
+            # request en el panel), asi que guardarlas detras de user_version evita un
+            # UPDATE de barrido completo en cada peticion.
+            schema_version = connection.execute("PRAGMA user_version").fetchone()[0]
+            if schema_version < 1:
+                self._apply_household_food_projection_migration(connection)
+                connection.execute("PRAGMA user_version = 1")
 
     def _ensure_column(
         self, connection: sqlite3.Connection, table: str, column: str, definition: str

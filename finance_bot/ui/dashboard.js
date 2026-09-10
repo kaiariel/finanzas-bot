@@ -517,6 +517,27 @@ if (typeof document !== 'undefined') (() => {
     fillForm(form, { date: data.today, amount: '', description: '', category: data.categories[0], kind: 'expense', store: '', isFixed: 'false' });
     $('newTransactionError').hidden = true; openDialog('newTransactionModal');
   }
+  function openTransferModal() {
+    if (!data.editable) return;
+    const accounts = data.accounts || [];
+    if (accounts.length < 2) { notify('Crea al menos dos cuentas para transferir.', true); return; }
+    const form = $('transferForm'), options = accounts.map(account => [String(account.id), account.name + ' · ' + money(account.balanceCents)]);
+    setOptions(form.elements.fromAccountId, options, null);
+    setOptions(form.elements.toAccountId, options, null);
+    fillForm(form, { fromAccountId: '', toAccountId: '', amount: '', note: '' });
+    $('transferError').hidden = true; openDialog('transferModal');
+  }
+  async function submitTransfer(event) {
+    event.preventDefault(); if (busy) return;
+    const form = event.target, payload = Object.fromEntries(new FormData(form));
+    const error = $('transferError'); error.hidden = true;
+    if (payload.fromAccountId === payload.toAccountId) { error.textContent = 'Elige dos cuentas distintas.'; error.hidden = false; return; }
+    busy = true; form.querySelectorAll('button').forEach(button => { button.disabled = true; });
+    const submit = form.querySelector('[type=submit]'), label = submit.textContent; submit.textContent = 'Guardando…';
+    try { await mutate('/api/transfers', payload); closeDialog('transferModal', true); await refreshData(); notify('Transferencia guardada.'); }
+    catch (exception) { error.textContent = exception.message; error.hidden = false; }
+    finally { busy = false; form.querySelectorAll('button').forEach(button => { button.disabled = false; }); submit.textContent = label; }
+  }
   function updateDurationFields() { const form = $('projectionForm'), installments = form.elements.duration.value === 'installments'; form.querySelectorAll('[data-installment]').forEach(label => { label.hidden = !installments; label.querySelector('input').required = installments; }); }
   function openProjectionModal(id) {
     if (!data.editable) return;
@@ -626,7 +647,8 @@ if (typeof document !== 'undefined') (() => {
   document.addEventListener('click', event => { const edit = event.target.closest('[data-edit-wallet]'); if (edit) { const wallet = (data.savings?.wallets || []).find(item => item.id === Number(edit.dataset.editWallet)); if (!wallet) return; const name = window.prompt('Nombre de la cartera', wallet.name); if (!name) return; const balance = window.prompt('Saldo actual (€)', (wallet.balanceCents / 100).toFixed(2).replace('.', ',')); if (balance === null) return; const include = window.confirm('¿Incluir esta cartera en el total estimado?'); mutate('/api/savings-wallets', { id: wallet.id, name, balance, includeInProjection: include }).then(refreshData).then(() => notify('Cartera actualizada.')).catch(error => notify(error.message, true)); return; } const archive = event.target.closest('[data-archive-wallet]'); if (archive && confirm('¿Archivar esta cartera? Se conservará su historial.')) mutate('/api/savings-wallets', { id: archive.dataset.archiveWallet, archive: true }).then(refreshData).then(() => notify('Cartera archivada.')).catch(error => notify(error.message, true)); });
   $('savingsSimulator').addEventListener('submit', event => { event.preventDefault(); const payload = Object.fromEntries(new FormData(event.target)); const months = Math.max(1, [...document.querySelectorAll('#savingsTable tbody tr')].length); const amount = Math.round(Number(String(payload.amount).replace(',', '.')) * 100); const delta = payload.kind === 'expense' ? -amount * (payload.frequency === 'monthly' ? months : 1) : amount * (payload.frequency === 'monthly' ? months : 1); const base = Number($('savingsPanel').dataset.savingsFinal || 0); $('simulatorResult').textContent = 'Escenario simulado: ' + money(delta) + '. El resultado final cambiaría de ' + money(base) + ' a aproximadamente ' + money(base + delta) + '. No se ha guardado ningún movimiento.'; });
   const transferButton = document.createElement('button'); transferButton.type = 'button'; transferButton.className = 'secondary'; transferButton.textContent = 'Transferir'; $('addAccount').after(transferButton);
-  transferButton.addEventListener('click', async () => { const accounts = data.accounts || []; if (accounts.length < 2) { notify('Crea al menos dos cuentas para transferir.', true); return; } const from = window.prompt('Cuenta de origen: ' + accounts.map(account => account.id + ' = ' + account.name).join(', ')); const to = window.prompt('Cuenta de destino: ' + accounts.map(account => account.id + ' = ' + account.name).join(', ')); const amount = window.prompt('Importe de la transferencia (€)'); if (!from || !to || !amount) return; try { await mutate('/api/transfers', { fromAccountId: from, toAccountId: to, amount }); await refreshData(); notify('Transferencia guardada.'); } catch (error) { notify(error.message, true); } });
+  transferButton.addEventListener('click', openTransferModal);
+  $('transferForm').addEventListener('submit', submitTransfer);
   setOptions($('budgetForm').elements.category, data.categories, null);
   $('budgetForm').addEventListener('submit', async event => { event.preventDefault(); const payload = Object.fromEntries(new FormData(event.target)); try { await mutate('/api/budgets', payload); event.target.reset(); await refreshData(); notify('Presupuesto guardado.'); } catch (error) { notify(error.message, true); } });
   $('goalForm').addEventListener('submit', async event => { event.preventDefault(); const payload = Object.fromEntries(new FormData(event.target)); try { await mutate('/api/savings-goals', payload); event.target.reset(); await refreshData(); notify('Objetivo creado.'); } catch (error) { notify(error.message, true); } });
@@ -640,8 +662,7 @@ if (typeof document !== 'undefined') (() => {
   });
   document.addEventListener('click', event => {
     const monthStep = event.target.closest('[data-month-step]'); if (monthStep) { const [key, delta] = monthStep.dataset.monthStep.split(':'); stepMonth(key, Number(delta)); return; }
-    const detailedHelpButton = event.target.closest('[data-help]'); if (detailedHelpButton) { const help = window.financeHelp?.[detailedHelpButton.dataset.help]; if (help) { $('helpTitle').textContent = help.title; $('helpWhat').textContent = help.what; $('helpSteps').innerHTML = help.steps.map(step => '<li>' + esc(step) + '</li>').join(''); $('helpExample').textContent = help.example; openDialog('helpModal'); } return; }
-    const helpButton = event.target.closest('[data-help]'); if (helpButton) { const help = { dashboard: ['Resumen', 'Aquí ves una fotografía rápida del periodo elegido: cuánto entró, cuánto salió y en qué se fue el dinero. Los gráficos ayudan a detectar cambios.'], transactions: ['Movimientos', 'Es la lista de ingresos y gastos registrados. Puedes buscar, filtrar, editar o crear un movimiento manual.'], projection: ['Proyección', 'Sirve para anotar lo que esperas cobrar o pagar. Marcar algo como pagado solo organiza el plan; no mueve dinero del banco.'], accounts: ['Cuentas y saldos', 'Aquí separas Banco, Efectivo u otras cuentas. El saldo inicial se combina con tus movimientos y las transferencias internas no se cuentan como ingresos ni gastos.'], files: ['Archivos', 'Aquí están los tickets, fotos, documentos y audios. Puedes abrirlos, revisar sus líneas y confirmar qué movimientos representan.'], analytics: ['Diagnóstico', 'Resume avisos de calidad: tickets pendientes, gastos sin justificante, categorías dudosas y meses futuros con riesgo.'] }[helpButton.dataset.help]; if (help) { $('helpTitle').textContent = help[0]; $('helpText').textContent = help[1]; openDialog('helpModal'); } return; }
+    const helpButton = event.target.closest('[data-help]'); if (helpButton) { const help = window.financeHelp?.[helpButton.dataset.help]; if (help) { $('helpTitle').textContent = help.title; $('helpWhat').textContent = help.what; $('helpSteps').innerHTML = help.steps.map(step => '<li>' + esc(step) + '</li>').join(''); $('helpExample').textContent = help.example; openDialog('helpModal'); } return; }
     const review = event.target.closest('[data-review]'); if (review) { openReceiptReview(review.dataset.review); return; }
     const removeLine = event.target.closest('[data-remove-line]'); if (removeLine) { removeLine.closest('.receipt-review-line')?.remove(); return; }
     const button = event.target.closest('button'); if (!button) return;

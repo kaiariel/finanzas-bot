@@ -194,9 +194,23 @@ def set_projection_status(settings: Settings, template_id: int, month: str, stat
 
 class DashboardHandler(BaseHTTPRequestHandler):
     settings: Settings
+    # Hosts que este servidor acepta como destino legitimo de una escritura.
+    # No basta con comparar el header Origin contra el propio Host: con DNS
+    # rebinding, una pagina servida desde un dominio ajeno puede hacer que el
+    # navegador resuelva ese dominio a 127.0.0.1 y enviar Origin/Host iguales
+    # entre si sin que ninguno sea realmente este servidor. Se compara contra
+    # una lista fija conocida en el arranque en su lugar.
+    allowed_hosts: set[str] = set()
 
     def log_message(self, format: str, *args: object) -> None:
         return
+
+    def _origin_allowed(self) -> bool:
+        host = self.headers.get("Host", "")
+        if host not in self.allowed_hosts:
+            return False
+        origin = self.headers.get("Origin")
+        return not origin or origin == "http://" + host
 
     def _send(self, status: int, body: bytes, content_type: str) -> None:
         self.send_response(status)
@@ -257,8 +271,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
         self._send(200, body, content_type)
 
     def do_POST(self) -> None:
-        origin = self.headers.get("Origin")
-        if origin and origin != "http://" + self.headers.get("Host", ""):
+        if not self._origin_allowed():
             self._send_json(403, {"ok": False, "error": "Origen de edición no permitido."})
             return
         path = urlparse(self.path).path
@@ -417,8 +430,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
         generate_report(self.settings)
 
     def do_DELETE(self) -> None:
-        origin = self.headers.get("Origin")
-        if origin and origin != "http://" + self.headers.get("Host", ""):
+        if not self._origin_allowed():
             self._send_json(403, {"ok": False, "error": "Origen de edición no permitido."})
             return
         path = urlparse(self.path).path
@@ -638,6 +650,9 @@ def main() -> None:
     settings = Settings.from_env()
     settings.ensure_dirs()
     DashboardHandler.settings = settings
+    DashboardHandler.allowed_hosts = {f"{args.host}:{args.port}"}
+    if args.host == "127.0.0.1":
+        DashboardHandler.allowed_hosts.add(f"localhost:{args.port}")
     server = ThreadingHTTPServer((args.host, args.port), DashboardHandler)
     url = f"http://{args.host}:{args.port}"
     print(f"Panel editable: {url}")
