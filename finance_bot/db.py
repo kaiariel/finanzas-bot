@@ -21,13 +21,19 @@ from finance_bot.formatting import (
     tipo_label,
 )
 from finance_bot.parser import (
+    DEFAULT_EXPENSE_CATEGORY,
     HOUSEHOLD_FOOD_CATEGORY,
     LEGACY_HOUSEHOLD_FOOD_CATEGORIES,
     ParsedTransaction,
     VALID_CATEGORIES,
+    note_key,
+    with_learned_category,
 )
 from finance_bot.storage import inspect_database
 
+
+# Marca de los movimientos creados al marcar como pagado un concepto domiciliado.
+AUTO_REGISTER_SOURCE = "Registrado automaticamente al marcar el concepto como pagado"
 
 REVIEW_QUEUE_STATUSES = ("nuevo", "pending", "voice_pending", "dudoso", "missing")
 
@@ -94,6 +100,7 @@ class FinanceDatabase:
         with self.atomic():
             if self.telegram_message_already_stored(metadata.get("telegram_user_id"), metadata.get("telegram_message_id")):
                 return []
+            parsed_transactions = [self.apply_learned_category(parsed) for parsed in parsed_transactions]
             ids = [self.add_transaction(parsed, **metadata) for parsed in parsed_transactions]
             if ids and metadata.get("telegram_user_id") is not None and metadata.get("telegram_message_id") is not None:
                 with self._connect() as connection:
@@ -443,6 +450,20 @@ class FinanceDatabase:
             self._ensure_column(
                 connection, "projection_templates", "sort_order", "INTEGER NOT NULL DEFAULT 0"
             )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS category_rules (
+                    note_key TEXT NOT NULL,
+                    kind TEXT NOT NULL,
+                    category TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    PRIMARY KEY (note_key, kind)
+                )
+                """
+            )
+            self._ensure_column(
+                connection, "projection_templates", "auto_register", "INTEGER NOT NULL DEFAULT 0"
+            )
             # Migraciones de datos pesadas (recorren tablas completas) se ejecutan una
             # sola vez: _init_schema corre en cada apertura de FinanceDatabase (una por
             # request en el panel), asi que guardarlas detras de user_version evita un
@@ -451,6 +472,54 @@ class FinanceDatabase:
             if schema_version < 1:
                 self._apply_household_food_projection_migration(connection)
                 connection.execute("PRAGMA user_version = 1")
+            if schema_version < 2:
+                self._seed_category_rules_from_history(connection)
+                connection.execute("PRAGMA user_version = 2")
+
+    def _seed_category_rules_from_history(self, connection: sqlite3.Connection) -> None:
+        """Convierte en reglas las correcciones de categoria ya hechas en el panel."""
+        history = connection.execute(
+            "SELECT details FROM audit_log WHERE entity_type = 'transaction' AND action = 'update' ORDER BY id"
+        ).fetchall()
+        for (details,) in history:
+            try:
+                payload = json.loads(details)
+                before, after = payload["before"], payload["after"]
+            except (ValueError, KeyError, TypeError):
+                continue
+            if isinstance(before, dict) and isinstance(after, dict) and before.get("category") != after.get("category"):
+                self._store_category_rule(connection, after.get("note"), after.get("kind"), after.get("category"))
+
+    def _store_category_rule(self, connection: sqlite3.Connection, note: object, kind: object, category: object) -> None:
+        key = note_key(str(note or ""))
+        if not key or kind not in {"expense", "income"} or category not in VALID_CATEGORIES:
+            return
+        if category == DEFAULT_EXPENSE_CATEGORY:
+            connection.execute("DELETE FROM category_rules WHERE note_key = ? AND kind = ?", (key, kind))
+            return
+        connection.execute(
+            "INSERT INTO category_rules(note_key, kind, category, updated_at) VALUES (?, ?, ?, ?) "
+            "ON CONFLICT(note_key, kind) DO UPDATE SET category = excluded.category, updated_at = excluded.updated_at",
+            (key, kind, category, self._now()),
+        )
+
+    def learn_category(self, note: str, kind: str, category: str) -> None:
+        with self._connect() as connection:
+            self._store_category_rule(connection, note, kind, category)
+
+    def learned_category(self, note: str, kind: str) -> str | None:
+        key = note_key(note)
+        if not key:
+            return None
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT category FROM category_rules WHERE note_key = ? AND kind = ?", (key, kind)
+            ).fetchone()
+        return row["category"] if row else None
+
+    def apply_learned_category(self, parsed: ParsedTransaction) -> ParsedTransaction:
+        learned = self.learned_category(parsed.note, parsed.kind)
+        return with_learned_category(parsed, learned) if learned else parsed
 
     def _ensure_column(
         self, connection: sqlite3.Connection, table: str, column: str, definition: str
@@ -606,6 +675,7 @@ class FinanceDatabase:
         transfer_id: int | None = None,
         due_date: str | None = None,
         paid_amount_cents: int | None = None,
+        auto_link: bool = True,
     ) -> int:
         if kind not in {"expense", "income"}:
             raise ValueError("kind debe ser 'expense' o 'income'")
@@ -650,8 +720,75 @@ class FinanceDatabase:
                 ),
             )
             transaction_id = int(cursor.lastrowid)
-        self.auto_apply_projection_for_transaction(transaction_id)
+        if auto_link:
+            self.auto_apply_projection_for_transaction(transaction_id)
         return transaction_id
+
+    def set_projection_auto_register(self, template_id: int, enabled: bool) -> None:
+        with self._connect() as connection:
+            cursor = connection.execute(
+                "UPDATE projection_templates SET auto_register = ? WHERE id = ?", (1 if enabled else 0, template_id)
+            )
+            if cursor.rowcount == 0:
+                raise KeyError(f"No existe la proyeccion {template_id}")
+
+    def _payment_date(self, month: str) -> str:
+        """Fecha dentro del mes indicado: hoy si es el mes en curso; si no, su ultimo o primer dia."""
+        now = datetime.now(self.timezone)
+        current = now.strftime("%Y-%m")
+        if month == current:
+            return now.isoformat(timespec="seconds")
+        first = datetime.fromisoformat(month + "-01T12:00:00").replace(tzinfo=self.timezone)
+        if month > current:
+            return first.isoformat(timespec="seconds")
+        following = (first.replace(day=28) + timedelta(days=4)).replace(day=1)
+        return (following - timedelta(days=1)).isoformat(timespec="seconds")
+
+    def register_projection_payment(self, template_id: int, month: str) -> int | None:
+        """Crea el movimiento de un concepto domiciliado si ese mes aun no tiene ninguno."""
+        template = self.get_projection_template(template_id)
+        if template is None or not template["auto_register"]:
+            return None
+        with self.atomic(), self._connect() as connection:
+            linked = connection.execute(
+                "SELECT COUNT(*) FROM transactions WHERE projection_template_id = ? AND substr(created_at,1,7) = ?",
+                (template_id, month),
+            ).fetchone()[0]
+            if linked:
+                return None
+            occurrence = self.get_projection_occurrence(template_id, month)
+            amount_cents = int(occurrence["amount_cents"]) if occurrence else int(template["default_amount_cents"])
+            transaction_id = self.add_manual_transaction(
+                kind=template["kind"],
+                amount_cents=amount_cents,
+                category=template["category"],
+                note=template["name"],
+                is_fixed=True,
+                source_text=AUTO_REGISTER_SOURCE,
+                created_at=self._payment_date(month),
+                review_status="reviewed",
+                auto_link=False,
+            )
+            connection.execute(
+                "UPDATE transactions SET projection_template_id = ? WHERE id = ?", (template_id, transaction_id)
+            )
+            self.log_audit("create", "transaction", transaction_id, f"Cargo automatico del concepto {template_id} ({month})")
+        return transaction_id
+
+    def drop_auto_payments(self, template_id: int, month: str, keep: int | None = None) -> list[int]:
+        """Borra los cargos automaticos de un concepto y mes (restaurables desde audit_log)."""
+        with self._connect() as connection:
+            ids = [
+                row[0]
+                for row in connection.execute(
+                    "SELECT id FROM transactions WHERE projection_template_id = ? AND substr(created_at,1,7) = ? "
+                    "AND source_text = ? AND id IS NOT ?",
+                    (template_id, month, AUTO_REGISTER_SOURCE, keep),
+                )
+            ]
+        for transaction_id in ids:
+            self.delete_transaction(transaction_id)
+        return ids
 
     def create_account(self, name: str, account_type: str = "bank", opening_balance_cents: int = 0) -> int:
         name = name.strip()
@@ -1102,7 +1239,7 @@ class FinanceDatabase:
                 """
                 SELECT id, created_at, kind, name, default_amount_cents, category,
                        group_name, recurrence, start_month, end_month, installment_current, installment_total,
-                       active, sort_order
+                       active, sort_order, auto_register
                 FROM projection_templates
                 WHERE id = ?
                 """,
@@ -1118,7 +1255,7 @@ class FinanceDatabase:
                 """
                 SELECT id, created_at, kind, name, default_amount_cents, category,
                        group_name, recurrence, start_month, end_month, installment_current, installment_total,
-                       active, sort_order
+                       active, sort_order, auto_register
                 FROM projection_templates
                 WHERE id = ?
                 """,
@@ -1214,7 +1351,7 @@ class FinanceDatabase:
                 f"""
                 SELECT id, created_at, kind, name, default_amount_cents, category,
                        group_name, recurrence, start_month, end_month, installment_current, installment_total,
-                       active, sort_order
+                       active, sort_order, auto_register
                 FROM projection_templates
                 {where}
                 ORDER BY kind DESC, sort_order ASC, name ASC
@@ -1408,6 +1545,7 @@ class FinanceDatabase:
         note = str(occurrence["note"]) if occurrence is not None else ""
         if not note.strip():
             note = f"Marcado automaticamente por movimiento #{transaction_id}: {row['note']}"
+        self.drop_auto_payments(template_id, month, keep=transaction_id)
         self.set_projection_occurrence(
             template_id=template_id,
             month=month,

@@ -285,3 +285,60 @@ def test_transaction_delete_and_restore_http_routes(tmp_path) -> None:
         server.shutdown()
         server.server_close()
         worker.join()
+
+
+def test_auto_register_concept_creates_and_removes_its_movement(tmp_path) -> None:
+    module = _load_serve_dashboard()
+    settings = _settings(tmp_path)
+    db = FinanceDatabase(settings.sqlite_db_path, settings.timezone, create=True)
+    template = db.upsert_projection_template(
+        kind="expense", name="Netflix", default_amount_cents=1299,
+        category="Suscripciones", start_month="2026-01",
+    )
+    plain = db.upsert_projection_template(
+        kind="expense", name="Gimnasio", default_amount_cents=3000,
+        category="Ocio", start_month="2026-01",
+    )
+    db.set_projection_auto_register(template, True)
+
+    def linked(template_id: int) -> list:
+        return [row for row in db.list_transactions() if row["projection_template_id"] == template_id]
+
+    module.set_projection_status(settings, template, "2026-08", "completed")
+    [created] = linked(template)
+    assert created["amount_cents"] == 1299
+    assert created["category"] == "Suscripciones"
+    assert created["created_at"].startswith("2026-08-31")  # mes pasado: ultimo dia
+    assert created["review_status"] == "reviewed"
+
+    # Marcarlo otra vez no duplica el cargo.
+    module.set_projection_status(settings, template, "2026-08", "completed")
+    assert len(linked(template)) == 1
+
+    module.set_projection_status(settings, template, "2026-08", "pending")
+    assert linked(template) == []
+
+    # Un concepto sin la marca sigue sin crear movimientos.
+    module.set_projection_status(settings, plain, "2026-08", "completed")
+    assert linked(plain) == []
+
+
+def test_real_movement_replaces_the_automatic_one(tmp_path) -> None:
+    module = _load_serve_dashboard()
+    settings = _settings(tmp_path)
+    db = FinanceDatabase(settings.sqlite_db_path, settings.timezone, create=True)
+    template = db.upsert_projection_template(
+        kind="expense", name="Netflix", default_amount_cents=1299,
+        category="Suscripciones", start_month="2026-01",
+    )
+    db.set_projection_auto_register(template, True)
+    module.set_projection_status(settings, template, "2026-08", "completed")
+
+    real = db.add_manual_transaction(
+        kind="expense", amount_cents=1299, category="Suscripciones", note="Netflix",
+        is_fixed=True, created_at="2026-08-12T10:00:00+02:00",
+    )
+
+    linked = [row["id"] for row in db.list_transactions() if row["projection_template_id"] == template]
+    assert linked == [real]
+    assert db.get_projection_occurrence(template, "2026-08")["status"] == "completed"

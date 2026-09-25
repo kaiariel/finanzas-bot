@@ -347,3 +347,37 @@ def test_delete_transaction_errors_are_explicit(tmp_path) -> None:
     db.restore_deleted_transaction(transaction_id)
     with pytest.raises(ValueError):
         db.restore_deleted_transaction(transaction_id)
+
+
+def test_telegram_transactions_use_categories_learned_from_corrections(tmp_path) -> None:
+    from finance_bot.parser import parse_transactions
+
+    db = FinanceDatabase(tmp_path / "finances.db", "Europe/Madrid", create=True)
+    db.learn_category("Coworking", "expense", "Alquiler")
+
+    [first] = db.add_telegram_transactions(parse_transactions("gasto 100 coworking"), telegram_user_id=1, telegram_message_id=1)
+    [other] = db.add_telegram_transactions(parse_transactions("ingreso 100 coworking"), telegram_user_id=1, telegram_message_id=2)
+
+    assert db.get_transaction(first)["category"] == "Alquiler"
+    assert db.get_transaction(first)["inference_notes"] == "[]"
+    # La regla es de gastos: no se aplica a un ingreso con el mismo texto.
+    assert db.get_transaction(other)["category"] == "Trabajos extra"
+
+
+def test_category_rules_are_seeded_from_past_panel_corrections(tmp_path) -> None:
+    import json
+    import sqlite3
+
+    path = tmp_path / "finances.db"
+    db = FinanceDatabase(path, "Europe/Madrid", create=True)
+    db.log_audit("update", "transaction", 1, json.dumps({
+        "before": {"category": "Ocio", "note": "Enviado a mamá", "kind": "expense"},
+        "after": {"category": "Ayuda familiar", "note": "Enviado a mamá", "kind": "expense"},
+    }))
+    with sqlite3.connect(path) as connection:
+        connection.execute("DELETE FROM category_rules")
+        connection.execute("PRAGMA user_version = 1")
+
+    reopened = FinanceDatabase(path, "Europe/Madrid")
+
+    assert reopened.learned_category("enviado a mama", "expense") == "Ayuda familiar"

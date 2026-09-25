@@ -190,6 +190,11 @@ def set_projection_status(settings: Settings, template_id: int, month: str, stat
         status=status,
         note=note,
     )
+    if status == "completed":
+        db.register_projection_payment(template_id, month)
+    else:
+        # Volver a pendiente u omitir deshace el cargo automatico de ese mes.
+        db.drop_auto_payments(template_id, month)
     db.log_audit("status", "projection", template_id, f"Mes {month}: {status}")
     generate_report(settings)
 
@@ -587,8 +592,13 @@ class DashboardHandler(BaseHTTPRequestHandler):
             for snapshot in projection_snapshots:
                 occurrence = db.get_projection_occurrence(snapshot["templateId"], snapshot["month"])
                 snapshot["after"] = dict(occurrence) if occurrence else None
+            if new_link:
+                db.drop_auto_payments(new_link, new_month, keep=transaction_id)
             db.log_audit("update", "transaction", transaction_id,
                          json.dumps({"before": dict(existing), "after": values, "projections": projection_snapshots}, ensure_ascii=False, default=str))
+            if values["category"] != existing["category"]:
+                # La proxima vez que llegue este mismo concepto por Telegram se usa esta categoria.
+                db.learn_category(values["note"], values["kind"], values["category"])
         generate_report(self.settings)
 
     def _update_projection(
@@ -638,8 +648,19 @@ class DashboardHandler(BaseHTTPRequestHandler):
             status=_parse_projection_status(payload.get("status")),
             note=_text(payload.get("note")),
         )
+        self._apply_auto_register(db, template_id, month, payload)
         db.log_audit("update", "projection", template_id, f"Mes {month}")
         generate_report(self.settings)
+
+    @staticmethod
+    def _apply_auto_register(db: FinanceDatabase, template_id: int, month: str, payload: dict[str, object]) -> None:
+        if "autoRegister" not in payload:
+            return
+        db.set_projection_auto_register(template_id, _parse_bool(payload.get("autoRegister")))
+        occurrence = db.get_projection_occurrence(template_id, month)
+        if occurrence is not None and occurrence["status"] == "completed":
+            # Al activarlo sobre un mes ya pagado, se registra su movimiento.
+            db.register_projection_payment(template_id, month)
 
     def _create_projection(self, payload: dict[str, object]) -> None:
         db = FinanceDatabase(self.settings.sqlite_db_path, self.settings.timezone)
@@ -680,6 +701,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
             status=_parse_projection_status(payload.get("status")),
             note=_text(payload.get("note")),
         )
+        self._apply_auto_register(db, template_id, month, payload)
         generate_report(self.settings)
 
     def _delete_projection_month(self, template_id: int, month: str) -> None:

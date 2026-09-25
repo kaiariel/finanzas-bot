@@ -11,7 +11,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from finance_bot.config import Settings
 from finance_bot.db import FinanceDatabase
-from finance_bot.parser import VALID_CATEGORIES, amount_to_cents
+from finance_bot.parser import DEFAULT_EXPENSE_CATEGORY, VALID_CATEGORIES, amount_to_cents
 from finance_bot.report import generate_report
 
 
@@ -35,7 +35,7 @@ def read_rows(path: Path) -> list[dict[str, object]]:
             kind = _value(raw, "Tipo", "type", "kind").lower()
             kind = "income" if kind in {"income", "ingreso", "entrada"} else "expense"
             amount = amount_to_cents(_value(raw, "Cantidad", "Importe", "amount"))
-            category = _value(raw, "Categoría", "Categoria", "category") or "Ocio"
+            category = _value(raw, "Categoría", "Categoria", "category") or DEFAULT_EXPENSE_CATEGORY
             if category not in VALID_CATEGORIES:
                 raise ValueError(f"Línea {number}: categoría no válida: {category}")
             date = _value(raw, "Fecha", "date") or datetime.now().strftime("%Y-%m-%d")

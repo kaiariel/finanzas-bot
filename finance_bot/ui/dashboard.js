@@ -37,6 +37,7 @@ if (typeof document !== 'undefined') (() => {
   'use strict';
   const $ = id => document.getElementById(id);
   let data = JSON.parse($('initialData').textContent);
+  document.querySelectorAll('.nav-icon[data-icon]').forEach(node => { node.innerHTML = iconSvg(node.dataset.icon); });
   const money = cents => new Intl.NumberFormat('es-ES', { style: 'currency', currency: 'EUR' }).format(cents / 100);
   const esc = value => String(value ?? '').replace(/[&<>"']/g, char => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#039;' }[char]));
   const monthName = key => key ? new Intl.DateTimeFormat('es-ES', { month: 'long', year: 'numeric', timeZone: 'UTC' }).format(new Date(key + '-15T12:00:00Z')) : 'Todo el historial';
@@ -50,8 +51,7 @@ if (typeof document !== 'undefined') (() => {
   const shortMonth = key => new Intl.DateTimeFormat('es-ES', { month: 'short', timeZone: 'UTC' }).format(new Date(key + '-15T12:00:00Z')).replace('.', '');
   const compactMoney = cents => new Intl.NumberFormat('es-ES', { notation: 'compact', maximumFractionDigits: 1 }).format(cents / 100) + ' €';
   /* Cuadro de color de la fila: dos letras de la categoría bastan para reconocerla de un vistazo. */
-  const initials = row => String(row.category || row.description || '?').trim().slice(0, 2).toUpperCase();
-  const avatar = row => '<span class="avatar ' + row.kind + '" aria-hidden="true">' + esc(initials(row)) + '</span>';
+  const avatar = row => '<span class="avatar ' + row.kind + '" title="' + esc(row.category || 'Sin categoría') + '">' + categoryIcon(row.category) + '</span>';
   const swatch = index => 'var(--c' + (index % 8 + 1) + ')';
   const pending = row => ['nuevo', 'pending', 'voice_pending', 'dudoso', 'missing'].includes(row.status);
   const filterIds = { month: 'monthFilter', search: 'searchFilter', category: 'tableCategoryFilter', type: 'typeFilter', user: 'userFilter', fixed: 'fixedFilter', receipt: 'receiptFilter', store: 'storeFilter' };
@@ -98,7 +98,11 @@ if (typeof document !== 'undefined') (() => {
     setOptions($('userFilter'), unique([...data.transactions, ...data.receipts].map(row => row.user)), 'Todas', state.user);
     const projectionMonths = data.projections.months.map(row => [row.monthKey, monthName(row.monthKey)]);
     setOptions($('projectionMonth'), projectionMonths, null, state.projectionMonth);
-    setOptions($('analyticsMonth'), unique([...months, ...projectionMonths.map(row => row[0])]).reverse().map(key => [key, monthName(key)]), null, state.analyticsMonth);
+    // Diagnóstico: meses con registros y, como mucho, los tres siguientes (antes llegaba a 2029).
+    const [todayYear, todayMonth] = data.today.split('-').map(Number), horizon = new Date(todayYear, todayMonth + 2, 1);
+    const lastAnalyticsMonth = horizon.getFullYear() + '-' + String(horizon.getMonth() + 1).padStart(2, '0');
+    setOptions($('analyticsMonth'), unique([...months, ...projectionMonths.map(row => row[0])]).filter(key => key <= lastAnalyticsMonth).reverse().map(key => [key, monthName(key)]), null, state.analyticsMonth);
+    if (!$('analyticsMonth').value) { state.analyticsMonth = data.today.slice(0, 7); $('analyticsMonth').value = state.analyticsMonth; }
     if (!$('projectionMonth').value) { state.projectionMonth = data.projections.months[0]?.monthKey || ''; $('projectionMonth').value = state.projectionMonth; }
     if (!$('savingsEndMonth').value || !data.projections.months.some(row => row.monthKey === state.savingsEndMonth)) state.savingsEndMonth = addMonths(data.today.slice(0, 7), 2);
     if (!$('savingsStartMonth')) $('savingsEndMonth').parentElement.insertAdjacentHTML('beforebegin', '<label>Desde el mes<input id="savingsStartMonth" type="month"></label>');
@@ -170,7 +174,8 @@ if (typeof document !== 'undefined') (() => {
     state.tab = tab;
     document.querySelectorAll('[data-panel]').forEach(panel => { panel.hidden = panel.dataset.panel !== tab; });
     document.querySelectorAll('[data-tab]').forEach(button => { if (button.dataset.tab === tab) button.setAttribute('aria-current', 'page'); else button.removeAttribute('aria-current'); });
-    $('viewTitle').textContent = { dashboard: 'Resumen', transactions: 'Movimientos', projection: 'Proyección', savings: 'Ahorro', files: 'Archivos', analytics: 'Diagnóstico' }[tab];
+    const [eyebrow, title] = { dashboard: ['Panel', 'Resumen'], transactions: ['El detalle', 'Movimientos'], projection: ['Plan del hogar', 'Proyección mensual'], savings: ['Dinero para tus objetivos', 'Ahorro'], files: ['Justificantes y audios', 'Archivos'], analytics: ['Calidad y previsión', 'Diagnóstico'] }[tab];
+    $('viewEyebrow').textContent = eyebrow; $('viewTitle').textContent = title;
     $('globalFilters').hidden = ['projection', 'savings', 'analytics'].includes(tab);
     $('moreFilters').hidden = !state.more; $('toggleFilters').setAttribute('aria-expanded', String(state.more)); $('toggleFilters').textContent = state.more ? 'Menos filtros' : 'Más filtros';
     render(); saveState(); if (scroll) window.scrollTo({ top: 0 });
@@ -223,7 +228,7 @@ if (typeof document !== 'undefined') (() => {
       const estimate = projectionEstimate(forecast);
       $('closingEstimate').textContent = money(estimate);
       $('closingEstimate').className = estimate < 0 ? 'expense' : 'income';
-      $('closingEstimateMeta').textContent = 'Resultado registrado + cobros pendientes − pagos pendientes';
+      $('closingEstimateMeta').innerHTML = closingBreakdown(forecast);
     } else {
       $('closingEstimate').textContent = 'Sin previsión disponible';
       $('closingEstimate').className = '';
@@ -332,28 +337,31 @@ if (typeof document !== 'undefined') (() => {
     const categories = grouped ? unique(row.children.map(r => r.category)).join(', ') : row.category;
     return '<article class="movement"><div class="movement-main">' + avatar(row) + '<time datetime="' + row.dateIso + '">' + esc(row.date) + '</time><div><div class="movement-title">' + esc(title) + '</div><div class="movement-meta"><span data-meta="category">' + esc(categories) + '</span><span data-meta="store">' + esc(row.store || 'Sin comercio') + '</span><span data-meta="user">' + esc(row.user) + '</span><span>' + (row.isFixed ? 'Fijo' : 'Variable') + '</span>' + attachment + (row.inferenceNotes.length ? '<span class="expense">Revisar clasificación</span>' : '') + '</div></div><div class="movement-amount ' + row.kind + '">' + (row.kind === 'expense' ? '−' : '+') + esc(money(row.amountCents)) + '</div>' + (!grouped ? '<button class="secondary" data-edit="' + row.id + '">' + (data.editable ? 'Editar' : 'Ver detalle') + '</button>' : '') + '</div>' + (grouped ? '<details><summary>Ver productos y editar líneas</summary>' + row.children.map(movementRow).join('') + '</details>' : '') + '</article>';
   }
+  function closingBreakdown(summary) {
+    // El cierre es una suma: se muestra la cuenta entera para que no haya cifras sueltas que cuadrar.
+    const registered = summary.actualIncomeCents - summary.actualExpenseCents;
+    const part = (label, amount, className = '') => '<span class="closing-part"><small>' + esc(label) + '</small><b class="' + className + '">' + esc(money(amount)) + '</b></span>';
+    // Cada signo va pegado a su importe para que al partirse la línea no quede colgando.
+    const step = (sign, label, text, amount) => '<span class="closing-step"><span class="closing-op" aria-label="' + text + '">' + sign + '</span>' + part(label, amount) + '</span>';
+    return part('Registrado hasta hoy', registered, registered < 0 ? 'expense' : 'income')
+      + step('+', 'Por cobrar', 'más', summary.pendingIncomeCents)
+      + step('−', 'Por pagar', 'menos', summary.pendingExpenseCents);
+  }
   function metric(label, amount, detail = '') { return '<article class="metric"><span>' + esc(label) + '</span><strong class="' + (amount < 0 ? 'expense' : '') + '">' + esc(money(amount)) + '</strong><small>' + esc(detail) + '</small></article>'; }
   function renderProjection() {
     const month = state.projectionMonth, summary = data.projections.months.find(row => row.monthKey === month);
-    if (!summary) { $('projectionBalance').innerHTML = empty('Sin proyección para este mes.'); $('projectionSummary').innerHTML = ''; $('cashflowGrid').innerHTML = ''; $('projectionBody').innerHTML = ''; return; }
+    if (!summary) { $('projectionBalance').innerHTML = empty('Sin proyección para este mes.'); $('cashflowGrid').innerHTML = ''; $('projectionBody').innerHTML = ''; return; }
     const monthRows = data.projections.rows.filter(row => row.month === month);
     const all = monthRows.filter(row => row.status !== 'skipped'), estimate = projectionEstimate(summary);
     const pendingIncome = projectionFlowEntries(all, 'income', 'pending');
     const pendingExpense = projectionFlowEntries(all, 'expense', 'pending');
     const completedIncome = projectionFlowEntries(all, 'income', 'completed');
     const completedExpense = projectionFlowEntries(all, 'expense', 'completed');
-    const dueIncome = pendingIncome.reduce((total, entry) => total + entry.amount, 0);
-    const dueExpense = pendingExpense.reduce((total, entry) => total + entry.amount, 0);
-    const pendingDifference = dueIncome - dueExpense;
-    const balanceTone = pendingDifference < 0 ? 'negative' : pendingDifference > 0 ? 'positive' : 'neutral';
-    const balanceTitle = pendingDifference < 0
-      ? 'Lo que falta cobrar no cubre todos los pagos: faltan ' + money(-pendingDifference)
-      : pendingDifference > 0
-        ? 'Después de cubrir los pagos pendientes, quedarían ' + money(pendingDifference)
-        : 'Los cobros pendientes cubren exactamente los pagos pendientes';
-    $('projectionBalance').className = 'pending-balance ' + balanceTone;
-    $('projectionBalance').innerHTML = '<span class="balance-icon" aria-hidden="true">' + (pendingDifference < 0 ? '−' : pendingDifference > 0 ? '+' : '=') + '</span><div><strong>' + esc(balanceTitle) + '</strong><p>Por cobrar: ' + esc(money(dueIncome)) + ' · Por pagar: ' + esc(money(dueExpense)) + '. Compara solo lo pendiente de ' + esc(monthName(month)) + '; no es el saldo del banco.</p></div>';
-    $('projectionSummary').innerHTML = metric('Resultado del plan completo', summary.projectedBalanceCents, 'Todo lo previsto para el mes') + metric('Resultado registrado hasta hoy', summary.actualBalanceCents, 'Solo movimientos que ya registraste') + metric('Resultado estimado al terminar' + (all.some(row => row.linkWarnings.length) ? ' · por revisar' : ''), estimate, 'Registrado + cobros pendientes − pagos pendientes');
+    const toReview = all.some(row => row.linkWarnings.length);
+    $('projectionBalance').innerHTML = '<div><span class="eyebrow">CIERRE ESTIMADO · ' + esc(monthName(month).toUpperCase()) + (toReview ? ' · CON AVISOS' : '') + '</span>'
+      + '<strong class="' + (estimate < 0 ? 'expense' : 'income') + '">' + esc(money(estimate)) + '</strong>'
+      + '<div class="closing-breakdown">' + closingBreakdown(summary) + '</div>'
+      + '<small>Plan completo del mes: ' + esc(money(summary.projectedBalanceCents)) + ' (todo lo previsto, pagado o no); no es el saldo del banco.</small></div>';
     $('cashflowGrid').innerHTML = flowCard('Me falta cobrar', pendingIncome, 'pending-income', '+', 'Marcar como cobrado')
       + flowCard('Me falta pagar', pendingExpense, 'pending-expense', '−', 'Marcar como pagado')
       + flowCard('Ya cobrado', completedIncome, 'completed completed-income', '✓', 'Volver a pendiente')
@@ -603,7 +611,7 @@ if (typeof document !== 'undefined') (() => {
     if (!data.editable) return;
     const row = data.projections.rows.find(row => row.templateId === Number(id) && row.month === state.projectionMonth), form = $('projectionForm');
     setOptions(form.elements.category, data.categories, null);
-    fillForm(form, { id: row?.templateId || '', month: state.projectionMonth, name: row?.name || '', kind: row?.kind || 'expense', category: row?.category || data.categories[0], amount: row ? (row.amountCents / 100).toFixed(2).replace('.', ',') : '', status: row?.status || 'pending', duration: row?.installmentTotal ? row.installmentTotal === 1 ? 'once' : 'installments' : 'monthly', startMonth: row?.startMonth || state.projectionMonth, endMonth: row?.endMonth || '', updateDefault: 'false', installmentCurrent: row?.installmentCurrent || '', installmentTotal: row?.installmentTotal || '', note: row?.storedNote || '' });
+    fillForm(form, { id: row?.templateId || '', month: state.projectionMonth, name: row?.name || '', kind: row?.kind || 'expense', category: row?.category || data.categories[0], amount: row ? (row.amountCents / 100).toFixed(2).replace('.', ',') : '', status: row?.status || 'pending', duration: row?.installmentTotal ? row.installmentTotal === 1 ? 'once' : 'installments' : 'monthly', startMonth: row?.startMonth || state.projectionMonth, endMonth: row?.endMonth || '', updateDefault: 'false', installmentCurrent: row?.installmentCurrent || '', installmentTotal: row?.installmentTotal || '', note: row?.storedNote || '', autoRegister: Boolean(row?.autoRegister) });
     $('projectionEditTitle').textContent = row ? 'Editar concepto' : 'Añadir concepto'; $('projectionEditContext').textContent = 'Mes de los importes y del estado: ' + monthName(state.projectionMonth); $('projectionError').hidden = true;
     updateDurationFields(); openDialog('projectionModal');
   }
@@ -620,6 +628,7 @@ if (typeof document !== 'undefined') (() => {
     event.preventDefault(); if (busy) return;
     const form = event.target, payload = Object.fromEntries(new FormData(form));
     payload.isFixed = payload.isFixed === 'true'; payload.updateDefault = payload.updateDefault === 'true';
+    if (projection) payload.autoRegister = Boolean(form.elements.autoRegister?.checked);
     payload.reviewed = Boolean(form.elements.reviewed?.checked); payload.removeAttachment = Boolean(form.elements.removeAttachment?.checked);
     if (payload.removeAttachment) payload.receiptId = '';
     const error = $(projection ? 'projectionError' : 'editError'), dialog = projection ? 'projectionModal' : 'editModal';

@@ -40,6 +40,7 @@ VALID_CATEGORIES = (
     "Transporte",
     "Ocio",
     "Ahorro",
+    "Sin clasificar",
     "Ingresos laborales",
     "Ingresos clientes",
     "Trabajos extra",
@@ -94,7 +95,9 @@ TENS_NUMBER_WORDS = {
 
 FIXED_CATEGORIES = {"Alquiler", "Deudas", "Ayuda familiar", "Suscripciones"}
 INCOME_CATEGORIES = {"Ingresos laborales", "Ingresos clientes", "Trabajos extra"}
-DEFAULT_EXPENSE_CATEGORY = "Ocio"
+# Sin pistas no se adivina: "Ocio" como comodin inflaba esa categoria con
+# envios familiares, coworking o publicidad. Lo dudoso queda a la vista.
+DEFAULT_EXPENSE_CATEGORY = "Sin clasificar"
 DEFAULT_INCOME_CATEGORY = "Trabajos extra"
 CLIENT_REIMBURSABLE_EXPENSE_PHRASES = (
     "facebook ads",
@@ -420,6 +423,27 @@ def normalize_text(text: str) -> str:
     lowered = text.strip().lower()
     normalized = unicodedata.normalize("NFKD", lowered)
     return "".join(ch for ch in normalized if not unicodedata.combining(ch))
+
+
+def note_key(note: str) -> str:
+    """Clave estable de un concepto: sin tildes, mayusculas ni signos."""
+    return " ".join(re.findall(r"\w+", normalize_text(note or "")))
+
+
+def with_learned_category(parsed: "ParsedTransaction", category: str) -> "ParsedTransaction":
+    """Aplica una categoria que el usuario ya corrigio para este mismo concepto."""
+    if category == parsed.category or category not in VALID_CATEGORIES:
+        return parsed
+    notes = tuple(
+        note for note in parsed.inference_notes
+        if not note.startswith("Categoria asumida") and "es de gastos" not in note
+    )
+    return replace(
+        parsed,
+        category=category,
+        is_fixed=infer_is_fixed(parsed.source_text, category),
+        inference_notes=notes,
+    )
 
 
 def _contains_keyword(normalized_text: str, keyword: str) -> bool:

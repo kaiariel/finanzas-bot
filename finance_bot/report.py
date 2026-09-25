@@ -335,6 +335,7 @@ def _projection_payload(
             rows.append(
                 {
                     "templateId": template["id"],
+                    "autoRegister": bool(template["auto_register"]),
                     "linkedTransactionIds": [t["id"] for t in linked],
                     "actualLinkedCents": actual_linked,
                     "linkWarnings": link_warnings,
@@ -437,7 +438,9 @@ def render_report_html(settings: Settings, *, editable: bool = False) -> str:
     assets = Path(__file__).with_name("ui")
     return Template((assets / "dashboard.html").read_text(encoding="utf-8")).substitute(
         css=(assets / "dashboard.css").read_text(encoding="utf-8"),
-        js=(assets / "dashboard.js").read_text(encoding="utf-8"),
+        js=(assets / "icons.js").read_text(encoding="utf-8")
+        + "\n"
+        + (assets / "dashboard.js").read_text(encoding="utf-8"),
         data=json.dumps(data, ensure_ascii=False).replace("<", "\\u003c"),
         runtime=('<div id="runtimeStatus" class="runtime" role="status"><span id="runtimeText">Comprobando conexión…</span>'
                  '<button id="runtimeRefresh" class="quiet">Actualizar estado</button></div>') if editable else '',

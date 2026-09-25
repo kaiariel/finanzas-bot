@@ -36,6 +36,24 @@ lista de movimientos hasta que se revisan y se convierten en entradas contables.
 
 ## Cambios recientes
 
+- `Resumen` y `Proyección` muestran una sola cifra principal, el **cierre estimado del
+  mes**, con su cuenta a la vista: registrado hasta hoy + por cobrar − por pagar. El
+  plan completo del mes aparece como dato secundario.
+- Los gastos sin palabras clave claras van a `Sin clasificar` (antes caían en `Ocio`).
+  Además, el bot **aprende de tus correcciones**: si en el panel cambias la categoría
+  de un movimiento, la próxima vez que llegue ese mismo concepto por Telegram se
+  guarda con la categoría corregida. Al actualizar, las correcciones ya hechas se
+  convierten en reglas (tabla `category_rules`).
+- Un ingreso nunca hereda una categoría de gasto: pasa a `Trabajos extra` con un aviso.
+- Los conceptos de la proyección pueden marcarse como **domiciliados**: al marcarlos
+  como pagados se registra su movimiento automáticamente, al volver a pendiente se
+  quita, y si luego llega el movimiento real lo sustituye sin contarlo dos veces.
+- Los movimientos se pueden **eliminar** desde el formulario de edición, con opción de
+  deshacer (la fila completa queda guardada en `audit_log`).
+- `Diagnóstico` agrupa los avisos repetidos y ya no marca cada producto de un ticket
+  como vínculo sospechoso del presupuesto `Hogar y Alimentación`.
+- El panel carga unas tres veces más rápido, usa iconos por categoría y en móvil muestra
+  las seis secciones sin scroll oculto.
 - La revision de imagenes y audios ahora prefiere Codex por defecto: `review_pending.py`
   marca esos pendientes como `dudoso` para revision manual, y el OCR/transcripcion local
   queda como alternativa con `PREFER_CODEX_MEDIA_REVIEW=0`.
@@ -446,7 +464,10 @@ SQLite y regeneran el reporte HTML.
 El panel local tambien permite crear movimientos manuales desde `Movimientos`. Cada alta
 o cambio relevante queda registrado en `audit_log` para conservar un historial tecnico
 de la operacion. Al editar un movimiento, el boton `Deshacer último cambio` revierte la
-ultima edicion registrada en `audit_log` para ese movimiento concreto.
+ultima edicion registrada en `audit_log` para ese movimiento concreto. El boton
+`Eliminar` borra el movimiento y muestra `Deshacer` durante unos segundos; la fila
+completa queda en `audit_log`, asi que tambien puede restaurarse con
+`POST /api/transactions/<id>/restore`.
 
 La navegacion queda en una barra lateral con las secciones `Resumen`, `Movimientos`,
 `Proyección`, `Ahorro`, `Archivos` y `Diagnóstico`. El boton `◐ Modo oscuro` de la
@@ -512,6 +533,12 @@ conservar el historial anterior.
 Cuando un movimiento nuevo coincide de forma clara con una proyeccion activa del mes,
 el sistema la marca automaticamente como completada. Esto funciona tanto para ingresos
 como para gastos recurrentes, y evita tener que cerrar manualmente cada pago/cobro.
+
+Los conceptos que se cobran solos (suscripciones, recibos domiciliados) pueden
+marcarse con `Se cobra o paga automáticamente` al editarlos. Al pulsar `Marcar como
+pagado` se crea su movimiento con el importe del mes, y `Volver a pendiente` lo
+elimina. Si despues registras el cargo real por Telegram y se vincula al concepto, el
+movimiento automatico se borra para no contarlo dos veces.
 
 La proyeccion `Hogar y Alimentación` actua como presupuesto variable: el reporte calcula
 cuanto se ha gastado realmente en esa categoria durante el mes y cuanto queda disponible

@@ -206,3 +206,23 @@ def test_income_keyword_category_is_kept() -> None:
 
     assert parsed is not None
     assert not any("es de gastos" in note for note in parsed.inference_notes)
+
+
+def test_unknown_expense_is_left_unclassified() -> None:
+    parsed = parse_transaction("gasto 40 regalo cumpleanos")
+
+    assert parsed is not None
+    assert parsed.category == "Sin clasificar"
+    assert any("Sin clasificar" in note for note in parsed.inference_notes)
+
+
+def test_learned_category_replaces_the_guess_and_its_warning() -> None:
+    from finance_bot.parser import note_key, with_learned_category
+
+    parsed = parse_transaction("gasto 100 Coworking!")
+    learned = with_learned_category(parsed, "Alquiler")
+
+    assert note_key("  Cóworking! ") == "coworking"
+    assert learned.category == "Alquiler"
+    assert learned.is_fixed is True
+    assert not learned.inference_notes
