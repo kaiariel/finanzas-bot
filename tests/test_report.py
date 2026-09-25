@@ -255,3 +255,72 @@ def test_household_envelope_does_not_flag_every_grocery_line(tmp_path) -> None:
     # Solo el movimiento de otra categoria es un vinculo sospechoso; el gasto
     # distinto del presupuesto es normal en un sobre.
     assert row["linkWarnings"] == [f"Revisar vínculo con movimiento #{wrong}"]
+
+
+def test_weekly_envelope_does_not_carry_over_unspent_money() -> None:
+    from datetime import date
+
+    from finance_bot.report import weekly_envelope
+
+    # Viernes 25/09/2026. Semana: lunes 21 a domingo 27.
+    today = date(2026, 9, 25)
+    spent = {"2026-09-15": 1000, "2026-09-21": 3000, "2026-09-24": 1500}
+
+    result = weekly_envelope(12000, "2026-09", today, spent)
+
+    # Lo no gastado la semana anterior no suma: esta semana quedan 120 - 45 = 75 €.
+    assert result["weekSpentCents"] == 4500
+    assert result["weekLeftCents"] == 7500
+    # Resto del mes: 75 € de esta semana + 3/7 de 120 € (lunes 28 a miercoles 30).
+    assert result["pendingCents"] == 7500 + round(12000 * 3 / 7)
+    assert result["planCents"] == round(12000 * 30 / 7)
+
+
+def test_weekly_envelope_overspent_week_and_other_months() -> None:
+    from datetime import date
+
+    from finance_bot.report import weekly_envelope
+
+    today = date(2026, 9, 25)
+    overspent = {"2026-09-22": 20000}
+
+    # Semana ya superada: no resta de las siguientes.
+    assert weekly_envelope(12000, "2026-09", today, overspent)["pendingCents"] == round(12000 * 3 / 7)
+    assert weekly_envelope(12000, "2026-08", today, {})["pendingCents"] == 0
+    assert weekly_envelope(12000, "2026-10", today, {})["pendingCents"] == round(12000 * 31 / 7)
+
+
+def test_weekly_envelope_counts_week_days_from_previous_month() -> None:
+    from datetime import date
+
+    from finance_bot.report import weekly_envelope
+
+    # Jueves 01/10/2026: la semana empezo el lunes 28/09 y ese gasto cuenta.
+    result = weekly_envelope(12000, "2026-10", date(2026, 10, 1), {"2026-09-28": 10000})
+
+    assert result["weekLeftCents"] == 2000
+    # Quedan jueves a domingo (4 de 4 dias de la semana dentro del mes) + 4 semanas completas
+    # (5 a 25 de octubre) + 26 a 31 (6 dias).
+    assert result["pendingCents"] == round(2000 + 12000 * 3 + 12000 * 6 / 7)
+
+
+def test_household_projection_uses_weekly_budget_when_set(tmp_path) -> None:
+    from finance_bot.report import report_data
+
+    settings = _settings(tmp_path)
+    db = FinanceDatabase(settings.sqlite_db_path, settings.timezone, create=True)
+    month = datetime.now(ZoneInfo(settings.timezone)).strftime("%Y-%m")
+    template = db.upsert_projection_template(
+        kind="expense", name=HOUSEHOLD_FOOD_CATEGORY, default_amount_cents=60000,
+        category=HOUSEHOLD_FOOD_CATEGORY, start_month=month,
+    )
+    db.set_projection_weekly_budget(template, 12000)
+
+    row = next(
+        r for r in report_data(settings)["projections"]["rows"]
+        if r["month"] == month and r["templateId"] == template
+    )
+
+    assert row["weeklyBudgetCents"] == 12000
+    assert row["amountCents"] < 60000  # el plan sale del semanal, no del importe mensual
+    assert 0 <= row["remainingBudgetCents"] <= row["amountCents"]

@@ -597,6 +597,20 @@ La proyeccion `Hogar y Alimentación` actua como presupuesto variable: el report
 cuanto se ha gastado realmente en esa categoria durante el mes y cuanto queda disponible
 respecto al importe proyectado.
 
+Si al editarla indicas un **presupuesto semanal** (por ejemplo 120 €), el calculo cambia:
+
+- La semana va de lunes a domingo. Lo que no gastas en una semana **no se acumula**
+  para la siguiente, y si una semana te pasas tampoco resta de las demas.
+- Lo que queda por gastar en el mes es lo que falta de la semana en curso (120 € menos
+  lo gastado desde el lunes, nunca negativo) mas 120 € por cada semana restante, a
+  prorrata si una semana queda partida entre dos meses. Asi el cierre estimado no
+  cuenta como pendiente dinero que en la practica no vas a gastar.
+- Lo previsto para un mes completo es semanal × dias del mes / 7 (unos 514 € con 120 €
+  en un mes de 30 dias).
+- La tarjeta `Me falta pagar` muestra lo gastado en la semana actual.
+
+Si dejas el campo vacio, vuelve al calculo mensual clasico.
+
 Cargar o reponer la plantilla inicial:
 
 ```powershell

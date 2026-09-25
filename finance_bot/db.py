@@ -464,6 +464,7 @@ class FinanceDatabase:
             self._ensure_column(
                 connection, "projection_templates", "auto_register", "INTEGER NOT NULL DEFAULT 0"
             )
+            self._ensure_column(connection, "projection_templates", "weekly_budget_cents", "INTEGER")
             # Migraciones de datos pesadas (recorren tablas completas) se ejecutan una
             # sola vez: _init_schema corre en cada apertura de FinanceDatabase (una por
             # request en el panel), asi que guardarlas detras de user_version evita un
@@ -728,6 +729,16 @@ class FinanceDatabase:
         with self._connect() as connection:
             cursor = connection.execute(
                 "UPDATE projection_templates SET auto_register = ? WHERE id = ?", (1 if enabled else 0, template_id)
+            )
+            if cursor.rowcount == 0:
+                raise KeyError(f"No existe la proyeccion {template_id}")
+
+    def set_projection_weekly_budget(self, template_id: int, weekly_cents: int | None) -> None:
+        if weekly_cents is not None and weekly_cents <= 0:
+            raise ValueError("El presupuesto semanal debe ser mayor que cero.")
+        with self._connect() as connection:
+            cursor = connection.execute(
+                "UPDATE projection_templates SET weekly_budget_cents = ? WHERE id = ?", (weekly_cents, template_id)
             )
             if cursor.rowcount == 0:
                 raise KeyError(f"No existe la proyeccion {template_id}")
@@ -1239,7 +1250,7 @@ class FinanceDatabase:
                 """
                 SELECT id, created_at, kind, name, default_amount_cents, category,
                        group_name, recurrence, start_month, end_month, installment_current, installment_total,
-                       active, sort_order, auto_register
+                       active, sort_order, auto_register, weekly_budget_cents
                 FROM projection_templates
                 WHERE id = ?
                 """,
@@ -1255,7 +1266,7 @@ class FinanceDatabase:
                 """
                 SELECT id, created_at, kind, name, default_amount_cents, category,
                        group_name, recurrence, start_month, end_month, installment_current, installment_total,
-                       active, sort_order, auto_register
+                       active, sort_order, auto_register, weekly_budget_cents
                 FROM projection_templates
                 WHERE id = ?
                 """,
@@ -1351,7 +1362,7 @@ class FinanceDatabase:
                 f"""
                 SELECT id, created_at, kind, name, default_amount_cents, category,
                        group_name, recurrence, start_month, end_month, installment_current, installment_total,
-                       active, sort_order, auto_register
+                       active, sort_order, auto_register, weekly_budget_cents
                 FROM projection_templates
                 {where}
                 ORDER BY kind DESC, sort_order ASC, name ASC

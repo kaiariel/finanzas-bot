@@ -4,7 +4,7 @@ import json
 import os
 import re
 import unicodedata
-from datetime import datetime
+from datetime import date, datetime, timedelta
 from difflib import get_close_matches
 from pathlib import Path
 from string import Template
@@ -167,6 +167,43 @@ def _receipt_payload(rows, aliases: dict[int, str]) -> list[dict[str, object]]:
     return receipts
 
 
+def weekly_envelope(
+    weekly_cents: int, month: str, today: date, spent_by_day: dict[str, int]
+) -> dict[str, int]:
+    """Sobre semanal (lunes a domingo) sin arrastre entre semanas.
+
+    Devuelve lo previsto para el mes (semanal x dias / 7) y lo que queda por gastar:
+    lo que falta de la semana en curso (nunca negativo: lo no gastado no pasa a la
+    siguiente) mas el semanal completo de las semanas restantes, a prorrata si una
+    semana cae entre dos meses.
+    """
+    first = date.fromisoformat(month + "-01")
+    last = (first.replace(day=28) + timedelta(days=4)).replace(day=1) - timedelta(days=1)
+    plan = round(weekly_cents * last.day / 7)
+    week_start = today - timedelta(days=today.weekday())
+    week_spent = sum(
+        spent_by_day.get((week_start + timedelta(days=offset)).isoformat(), 0)
+        for offset in range(today.weekday() + 1)
+    )
+    week_left = max(0, weekly_cents - week_spent)
+    if last < today:
+        pending = 0
+    elif first > today:
+        pending = plan
+    else:
+        week_end = week_start + timedelta(days=6)
+        days_left_in_week = (week_end - today).days + 1
+        days_left_in_month = (min(week_end, last) - today).days + 1
+        pending = week_left * days_left_in_month / days_left_in_week
+        start = week_end + timedelta(days=1)
+        while start <= last:
+            days = min(7, (last - start).days + 1)
+            pending += weekly_cents * days / 7
+            start += timedelta(days=7)
+        pending = round(pending)
+    return {"planCents": plan, "pendingCents": pending, "weekSpentCents": week_spent, "weekLeftCents": week_left}
+
+
 def _add_months(date_value: datetime, months: int) -> datetime:
     month_index = date_value.month - 1 + months
     year = date_value.year + month_index // 12
@@ -192,6 +229,7 @@ def _projection_payload(
     db: FinanceDatabase, transactions: list[dict[str, object]], month_count: int = 36
 ) -> dict[str, object]:
     start = datetime.now(db.timezone).replace(day=1)
+    today = datetime.now(db.timezone).date()
     months = [_add_months(start, index).strftime("%Y-%m") for index in range(month_count)]
     templates = db.list_projection_templates()
     overrides = {
@@ -204,7 +242,11 @@ def _projection_payload(
         for month in months
     }
     actual_expense_by_month_category = {month: {} for month in months}
+    household_spent_by_day: dict[str, int] = {}
     for transaction in transactions:
+        if transaction["kind"] == "expense" and transaction["category"] == HOUSEHOLD_FOOD_CATEGORY:
+            day = str(transaction["dateIso"])
+            household_spent_by_day[day] = household_spent_by_day.get(day, 0) + int(transaction["amountCents"])
         month = str(transaction["monthKey"])
         kind = str(transaction["kind"])
         if month in actual_by_month and kind in actual_by_month[month]:
@@ -282,9 +324,17 @@ def _projection_payload(
             )
             actual_spent_cents = 0
             remaining_budget_cents = amount_cents
+            weekly_cents = template["weekly_budget_cents"] if tracks_actual_category else None
+            envelope = None
             if tracks_actual_category:
                 actual_spent_cents = actual_expense_by_month_category[month].get(category, 0)
                 remaining_budget_cents = amount_cents - actual_spent_cents
+            if weekly_cents:
+                # Presupuesto semanal: lo previsto sale del semanal y lo pendiente no
+                # arrastra lo que sobro de semanas anteriores.
+                envelope = weekly_envelope(int(weekly_cents), month, today, household_spent_by_day)
+                amount_cents = envelope["planCents"]
+                remaining_budget_cents = envelope["pendingCents"]
             summary = summaries[month]
             linked = [t for t in transactions if t["projectionTemplateId"] == template["id"]
                       and t["monthKey"] == month]
@@ -325,7 +375,14 @@ def _projection_payload(
                 summary[key] += max(0, amount_cents - actual_linked)
 
             display_note = note
-            if tracks_actual_category:
+            if envelope and month == today.strftime("%Y-%m"):
+                budget_note = (
+                    f"Esta semana: {format_euro(envelope['weekSpentCents'])} de {format_euro(int(weekly_cents))} · "
+                    f"queda por gastar en el mes: {format_euro(remaining_budget_cents)}"
+                )
+            elif envelope:
+                budget_note = f"{format_euro(int(weekly_cents))} por semana"
+            elif tracks_actual_category:
                 budget_note = (
                     f"Gastado real: {format_euro(actual_spent_cents)} · "
                     f"falta: {format_euro(remaining_budget_cents)}"
@@ -356,6 +413,8 @@ def _projection_payload(
                     "note": display_note,
                     "storedNote": note,
                     "tracksActualCategory": tracks_actual_category,
+                    "weeklyBudgetCents": int(weekly_cents) if weekly_cents else None,
+                    "weekSpentCents": envelope["weekSpentCents"] if envelope else None,
                     "actualSpentCents": actual_spent_cents,
                     "actualSpent": format_euro(actual_spent_cents),
                     "remainingBudgetCents": remaining_budget_cents,

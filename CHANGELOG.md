@@ -3,6 +3,18 @@
 Registro de cambios funcionales, del más reciente al más antiguo. El detalle de uso
 de cada función está en el [README](README.md).
 
+## 2026-09-25 · Presupuesto semanal para Hogar y Alimentación
+
+- El sobre de `Hogar y Alimentación` admite un **presupuesto semanal** (columna
+  `projection_templates.weekly_budget_cents`), de lunes a domingo y **sin arrastre**:
+  lo que no se gasta una semana no se suma a la siguiente.
+- Lo pendiente del mes pasa a ser lo que falta de la semana en curso más el semanal
+  de las semanas restantes (a prorrata en semanas partidas). Antes era el importe
+  mensual menos lo gastado, así que a final de mes seguía mostrando cientos de euros
+  pendientes y el cierre estimado salía demasiado pesimista.
+- Lo previsto del mes se calcula como semanal × días / 7. Campo nuevo en el formulario
+  del concepto; vacío mantiene el cálculo mensual.
+
 ## 2026-09-25 · Cifra de cierre única, categorías que aprenden y conceptos domiciliados
 
 ### Panel

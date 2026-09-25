@@ -649,8 +649,16 @@ class DashboardHandler(BaseHTTPRequestHandler):
             note=_text(payload.get("note")),
         )
         self._apply_auto_register(db, template_id, month, payload)
+        self._apply_weekly_budget(db, template_id, payload)
         db.log_audit("update", "projection", template_id, f"Mes {month}")
         generate_report(self.settings)
+
+    @staticmethod
+    def _apply_weekly_budget(db: FinanceDatabase, template_id: int, payload: dict[str, object]) -> None:
+        if "weeklyBudget" not in payload:
+            return
+        raw = str(payload.get("weeklyBudget") or "").strip()
+        db.set_projection_weekly_budget(template_id, _parse_amount(raw) if raw else None)
 
     @staticmethod
     def _apply_auto_register(db: FinanceDatabase, template_id: int, month: str, payload: dict[str, object]) -> None:

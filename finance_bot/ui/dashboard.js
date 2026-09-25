@@ -379,7 +379,8 @@ if (typeof document !== 'undefined') (() => {
     const entries = [];
     rows.filter(row => row.kind === kind).forEach(row => {
       if (row.tracksActualCategory) {
-        if (bucket === 'pending' && row.remainingBudgetCents > 0) entries.push({ row, amount: row.remainingBudgetCents, name: row.name + ' · por gastar' });
+        const week = row.weeklyBudgetCents && row.month === data.today.slice(0, 7) ? ' (esta semana ' + money(row.weekSpentCents) + ' de ' + money(row.weeklyBudgetCents) + ')' : '';
+        if (bucket === 'pending' && row.remainingBudgetCents > 0) entries.push({ row, amount: row.remainingBudgetCents, name: row.name + ' · por gastar' + week });
         if (bucket === 'completed' && row.actualSpentCents > 0) entries.push({ row, amount: row.actualSpentCents, name: row.name + ' · ya gastado' });
         return;
       }
@@ -611,7 +612,9 @@ if (typeof document !== 'undefined') (() => {
     if (!data.editable) return;
     const row = data.projections.rows.find(row => row.templateId === Number(id) && row.month === state.projectionMonth), form = $('projectionForm');
     setOptions(form.elements.category, data.categories, null);
-    fillForm(form, { id: row?.templateId || '', month: state.projectionMonth, name: row?.name || '', kind: row?.kind || 'expense', category: row?.category || data.categories[0], amount: row ? (row.amountCents / 100).toFixed(2).replace('.', ',') : '', status: row?.status || 'pending', duration: row?.installmentTotal ? row.installmentTotal === 1 ? 'once' : 'installments' : 'monthly', startMonth: row?.startMonth || state.projectionMonth, endMonth: row?.endMonth || '', updateDefault: 'false', installmentCurrent: row?.installmentCurrent || '', installmentTotal: row?.installmentTotal || '', note: row?.storedNote || '', autoRegister: Boolean(row?.autoRegister) });
+    fillForm(form, { id: row?.templateId || '', month: state.projectionMonth, name: row?.name || '', kind: row?.kind || 'expense', category: row?.category || data.categories[0], amount: row ? (row.amountCents / 100).toFixed(2).replace('.', ',') : '', status: row?.status || 'pending', duration: row?.installmentTotal ? row.installmentTotal === 1 ? 'once' : 'installments' : 'monthly', startMonth: row?.startMonth || state.projectionMonth, endMonth: row?.endMonth || '', updateDefault: 'false', installmentCurrent: row?.installmentCurrent || '', installmentTotal: row?.installmentTotal || '', note: row?.storedNote || '', autoRegister: Boolean(row?.autoRegister), weeklyBudget: row?.weeklyBudgetCents ? (row.weeklyBudgetCents / 100).toFixed(2).replace('.', ',') : '' });
+    // El presupuesto semanal solo tiene sentido en el sobre por categoría; deshabilitado no se envía.
+    const envelope = Boolean(row?.tracksActualCategory); form.querySelector('[data-envelope]').hidden = !envelope; form.elements.weeklyBudget.disabled = !envelope;
     $('projectionEditTitle').textContent = row ? 'Editar concepto' : 'Añadir concepto'; $('projectionEditContext').textContent = 'Mes de los importes y del estado: ' + monthName(state.projectionMonth); $('projectionError').hidden = true;
     updateDurationFields(); openDialog('projectionModal');
   }
