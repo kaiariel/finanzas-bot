@@ -36,6 +36,8 @@ lista de movimientos hasta que se revisan y se convierten en entradas contables.
 
 ## Cambios recientes
 
+El historial fechado y completo está en [CHANGELOG.md](CHANGELOG.md). Resumen:
+
 - `Resumen` y `Proyección` muestran una sola cifra principal, el **cierre estimado del
   mes**, con su cuenta a la vista: registrado hasta hoy + por cobrar − por pagar. El
   plan completo del mes aparece como dato secundario.
@@ -309,6 +311,31 @@ ingreso 250 trabajo extra
 El parser tambien tolera importes hablados sencillos, por ejemplo `spotify veintidos euros`
 o `gasto treinta y cinco euros mercadona`.
 
+Como se elige la categoria:
+
+1. Si ya corregiste antes ese mismo concepto en el panel, se usa tu correccion (ver
+   `Categorias aprendidas` mas abajo).
+2. Si no, se buscan palabras clave (`mercadona` → `Hogar y Alimentación`, `netflix` →
+   `Suscripciones`...).
+3. Si no hay pistas, un gasto queda en `Sin clasificar` y un ingreso en
+   `Trabajos extra`, siempre con un aviso en `Diagnóstico` para revisarlo.
+
+Un ingreso nunca recibe una categoria de gasto: `ingreso 30 venta ropa` se guarda en
+`Trabajos extra`, no en `Ropa`.
+
+### Categorias aprendidas
+
+Cuando cambias la categoria de un movimiento desde el panel, se guarda una regla en la
+tabla `category_rules` con el concepto normalizado (sin tildes, mayusculas ni signos) y
+el tipo. Si mañana envias `gasto 100 coworking` y la ultima vez lo corregiste a
+`Alquiler`, se registra directamente en `Alquiler` y sin aviso.
+
+- La regla solo se aplica al mismo texto exacto y al mismo tipo (gasto o ingreso).
+- Para cambiarla basta con corregir otro movimiento de ese concepto: gana la ultima.
+- Corregirlo a `Sin clasificar` borra la regla.
+- Al actualizar a esta version, las correcciones ya hechas en `audit_log` se
+  convierten en reglas una sola vez (migracion de esquema v2).
+
 Gastos pagados por adelantado para clientes:
 
 ```text
@@ -522,6 +549,32 @@ balance real registrado.
 Advertencia: el panel local tiene APIs de escritura. Usalo solo en tu maquina o red de
 confianza.
 
+### API del panel
+
+Todas las rutas escuchan en `127.0.0.1:8765`. Las escrituras rechazan peticiones con
+un `Origin` o `Host` ajenos al propio panel. Casi todos los cambios quedan en
+`audit_log` (los presupuestos no) y regeneran el reporte.
+
+| Metodo | Ruta | Uso |
+| --- | --- | --- |
+| GET | `/api/status` | Estado del bot, panel, pendientes y ultima copia. |
+| GET | `/api/data` | Todos los datos que pinta el panel. |
+| GET | `/api/attachments/(transactions\|receipts)/<id>` | Archivo adjunto registrado. |
+| POST | `/api/transactions` | Crear un movimiento. |
+| POST | `/api/transactions/<id>` | Editar un movimiento (aprende la categoria si cambia). |
+| DELETE | `/api/transactions/<id>` | Eliminar un movimiento (restaurable). |
+| POST | `/api/transactions/<id>/restore` | Restaurar el ultimo borrado de ese movimiento. |
+| POST | `/api/transactions/<id>/undo` | Deshacer su ultima edicion. |
+| POST | `/api/transactions/<id>/payment` | Registrar un pago parcial. |
+| POST | `/api/receipts/<id>/review` | Confirmar las lineas de un ticket. |
+| POST | `/api/projections` | Crear un concepto de la proyeccion. |
+| POST | `/api/projections/<id>/<AAAA-MM>` | Editar un concepto en un mes. |
+| POST | `/api/projections/<id>/<AAAA-MM>/status` | Marcar pagado, pendiente u omitido. |
+| POST / DELETE | `/api/projections/<id>/<AAAA-MM>/from` | Finalizar el concepto desde ese mes. |
+| DELETE | `/api/projections/<id>/<AAAA-MM>` | Omitir el concepto ese mes. |
+| POST | `/api/accounts`, `/api/transfers`, `/api/budgets` | Cuentas, transferencias y presupuestos. |
+| POST | `/api/savings-goals`, `/api/savings-settings`, `/api/savings-wallets` | Ahorro. |
+
 ## Proyecciones
 
 El reporte y el panel incluyen una pestaña de proyeccion para planificar meses futuros.
@@ -662,6 +715,7 @@ Suscripciones
 Transporte
 Ocio
 Ahorro
+Sin clasificar
 Ingresos laborales
 Ingresos clientes
 Trabajos extra
@@ -675,6 +729,25 @@ Deudas
 Ayuda familiar
 Suscripciones
 ```
+
+### Tablas de la base
+
+| Tabla | Contenido |
+| --- | --- |
+| `transactions` | Movimientos. `projection_template_id` los vincula a un concepto; `source_text` guarda el texto original (o la marca de cargo automatico). |
+| `receipts` | Tickets, PDFs y audios recibidos, con su estado de revision. |
+| `projection_templates` | Conceptos de la proyeccion. `auto_register = 1` indica domiciliado. |
+| `projection_occurrences` | Importe, estado y nota de un concepto en un mes concreto. |
+| `category_rules` | Categorias aprendidas de tus correcciones (concepto normalizado + tipo). |
+| `audit_log` | Historial de cambios: `create`, `update`, `undo`, `delete`, `restore`, `status`, `review`, `payment`, `end`. Un `delete` guarda la fila completa. |
+| `telegram_messages` | Mensajes de Telegram ya procesados, para no registrarlos dos veces. |
+| `accounts`, `transfers`, `budgets` | Cuentas, transferencias internas y presupuestos. |
+| `savings_settings`, `savings_wallets`, `savings_goals` | Panel de ahorro. |
+| `finance_meta`, `import_batches` | Marca de instalacion nueva e importaciones CSV. |
+
+`PRAGMA user_version` indica la version del esquema: 1 consolido las categorias de
+hogar y 2 creo `category_rules` a partir del historial. Las migraciones corren una
+sola vez al abrir la base.
 
 ## Probar el proyecto
 
@@ -825,6 +898,27 @@ Copy-Item .env.example .env
 Cada colaborador debe usar su propio `.env` y sus propios datos locales.
 
 ## Problemas comunes
+
+Faltan tickets que envie con la compu apagada:
+
+- Telegram solo guarda 24 horas los mensajes que el bot no ha recogido. Lo enviado
+  antes de ese margen no llega y no se puede recuperar desde el bot.
+- El bot avisa por Telegram del rango de fechas afectado al volver a conectarse;
+  reenvia esos tickets.
+- Para acortar el hueco, activa el arranque automatico (`--install-autostart`).
+
+Un concepto se sigue clasificando mal:
+
+- Corrige la categoria de uno de esos movimientos en el panel: se guarda como regla
+  y se aplica a los siguientes.
+- Si una regla aprendida es incorrecta, corrigela igual; gana la ultima correccion.
+
+Un gasto domiciliado aparece dos veces:
+
+- El cargo automatico solo se sustituye si el movimiento real se vincula al mismo
+  concepto y mes. Abre el movimiento real y elige el concepto en `Proyección
+  vinculada`; el automatico se borrara solo.
+- Tambien puedes eliminar el automatico desde su formulario (`Eliminar`).
 
 Los tickets no aparecen en movimientos:
 
