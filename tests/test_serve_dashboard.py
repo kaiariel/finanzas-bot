@@ -57,7 +57,7 @@ def _template(db: FinanceDatabase) -> int:
 def test_transaction_link_edit_is_validated_before_writes_and_can_unlink(tmp_path):
     module = _load_serve_dashboard()
     settings = _settings(tmp_path)
-    db = FinanceDatabase(settings.sqlite_db_path, settings.timezone)
+    db = FinanceDatabase(settings.sqlite_db_path, settings.timezone, create=True)
     template = _template(db)
     transaction = db.add_manual_transaction(kind="expense", amount_cents=65500, category="Alquiler", note="Alquiler", created_at="2026-07-04T12:00:00+02:00")
     handler = object.__new__(module.DashboardHandler)
@@ -72,6 +72,12 @@ def test_transaction_link_edit_is_validated_before_writes_and_can_unlink(tmp_pat
     assert db.get_transaction(transaction)["review_status"] == "reviewed"
     assert db.get_projection_occurrence(template, "2026-07")["status"] == "pending"
 
+    restored = db.undo_last_transaction_change(transaction)
+    assert restored["note"] == "Alquiler"
+    assert restored["projection_template_id"] == template
+    assert restored["review_status"] == "registered"
+    assert db.get_projection_occurrence(template, "2026-07")["status"] == "completed"
+
 
 def test_attachment_http_routes_only_serve_registered_media(tmp_path):
     from http.server import ThreadingHTTPServer
@@ -80,7 +86,7 @@ def test_attachment_http_routes_only_serve_registered_media(tmp_path):
     from urllib.error import HTTPError
     module = _load_serve_dashboard()
     settings = _settings(tmp_path)
-    db = FinanceDatabase(settings.sqlite_db_path, settings.timezone)
+    db = FinanceDatabase(settings.sqlite_db_path, settings.timezone, create=True)
     path = tmp_path / "ticket.pdf"
     path.write_bytes(b"%PDF-1.4 test")
     receipt = db.add_receipt(local_path=str(path), drive_file_id=None, drive_url=None, telegram_message_id=None, caption=None, status="processed")
@@ -110,10 +116,41 @@ def test_attachment_http_routes_only_serve_registered_media(tmp_path):
         worker.join()
 
 
+def test_read_routes_reject_untrusted_host_header(tmp_path) -> None:
+    from http.client import HTTPConnection
+    from http.server import ThreadingHTTPServer
+    from threading import Thread
+
+    module = _load_serve_dashboard()
+    settings = _settings(tmp_path)
+    FinanceDatabase(settings.sqlite_db_path, settings.timezone, create=True)
+
+    class Handler(module.DashboardHandler):
+        allowed_hosts = set()
+
+    Handler.settings = settings
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    worker = Thread(target=server.serve_forever, daemon=True)
+    worker.start()
+    try:
+        connection = HTTPConnection("127.0.0.1", server.server_port)
+        connection.putrequest("GET", "/api/data", skip_host=True)
+        connection.putheader("Host", "evil.example")
+        connection.endheaders()
+        response = connection.getresponse()
+        assert response.status == 403
+        response.read()
+        connection.close()
+    finally:
+        server.shutdown()
+        server.server_close()
+        worker.join()
+
+
 def test_set_projection_status_marks_completed_with_default_amount(tmp_path) -> None:
     serve_dashboard = _load_serve_dashboard()
     settings = _settings(tmp_path)
-    db = FinanceDatabase(settings.sqlite_db_path, settings.timezone)
+    db = FinanceDatabase(settings.sqlite_db_path, settings.timezone, create=True)
     template_id = _template(db)
 
     serve_dashboard.set_projection_status(settings, template_id, "2026-07", "completed")
@@ -128,7 +165,7 @@ def test_set_projection_status_marks_completed_with_default_amount(tmp_path) -> 
 def test_set_projection_status_preserves_month_amount_and_note(tmp_path) -> None:
     serve_dashboard = _load_serve_dashboard()
     settings = _settings(tmp_path)
-    db = FinanceDatabase(settings.sqlite_db_path, settings.timezone)
+    db = FinanceDatabase(settings.sqlite_db_path, settings.timezone, create=True)
     template_id = _template(db)
     db.set_projection_occurrence(
         template_id=template_id,
@@ -156,7 +193,7 @@ def test_set_projection_status_preserves_month_amount_and_note(tmp_path) -> None
 def test_set_projection_status_rejects_bad_input(tmp_path) -> None:
     serve_dashboard = _load_serve_dashboard()
     settings = _settings(tmp_path)
-    db = FinanceDatabase(settings.sqlite_db_path, settings.timezone)
+    db = FinanceDatabase(settings.sqlite_db_path, settings.timezone, create=True)
     template_id = _template(db)
 
     with pytest.raises(ValueError):
@@ -169,7 +206,7 @@ def test_set_projection_status_rejects_bad_input(tmp_path) -> None:
 def test_runtime_status_reports_supervisor_and_pending_files(tmp_path) -> None:
     serve_dashboard = _load_serve_dashboard()
     settings = _settings(tmp_path)
-    db = FinanceDatabase(settings.sqlite_db_path, settings.timezone)
+    db = FinanceDatabase(settings.sqlite_db_path, settings.timezone, create=True)
     db.add_receipt(
         local_path="ticket.jpg",
         drive_file_id=None,
@@ -197,3 +234,54 @@ def test_runtime_status_reports_supervisor_and_pending_files(tmp_path) -> None:
     assert status["supervisor"]["running"] is True
     assert status["bot"]["running"] is True
     assert status["pendingCount"] == 1
+
+
+def test_transaction_delete_and_restore_http_routes(tmp_path) -> None:
+    from http.server import ThreadingHTTPServer
+    from threading import Thread
+    from urllib.error import HTTPError
+    from urllib.request import Request, urlopen
+
+    module = _load_serve_dashboard()
+    settings = _settings(tmp_path)
+    db = FinanceDatabase(settings.sqlite_db_path, settings.timezone, create=True)
+    transaction_id = db.add_manual_transaction(
+        kind="expense", amount_cents=990, category="Ocio", note="cine",
+        created_at="2026-09-05T12:00:00+02:00",
+    )
+
+    class Handler(module.DashboardHandler):
+        pass
+
+    Handler.settings = settings
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    worker = Thread(target=server.serve_forever, daemon=True)
+    worker.start()
+    base = "http://127.0.0.1:" + str(server.server_port)
+
+    def call(method: str, path: str, origin: str | None = None) -> int:
+        headers = {"Content-Type": "application/json"}
+        if origin:
+            headers["Origin"] = origin
+        request = Request(base + path, data=b"{}", method=method, headers=headers)
+        try:
+            with urlopen(request) as response:
+                return response.status
+        except HTTPError as error:
+            return error.code
+
+    try:
+        # Otro origen no puede borrar datos.
+        assert call("DELETE", f"/api/transactions/{transaction_id}", origin="http://evil.test") == 403
+        assert db.get_transaction(transaction_id) is not None
+
+        assert call("DELETE", f"/api/transactions/{transaction_id}") == 200
+        assert db.get_transaction(transaction_id) is None
+        assert call("DELETE", f"/api/transactions/{transaction_id}") == 404
+
+        assert call("POST", f"/api/transactions/{transaction_id}/restore") == 200
+        assert db.get_transaction(transaction_id)["note"] == "cine"
+    finally:
+        server.shutdown()
+        server.server_close()
+        worker.join()

@@ -21,7 +21,7 @@ def test_dashboard_calculations_in_javascript():
 def test_projection_distinguishes_plan_from_linked_actual_and_manual_status(tmp_path):
     from finance_bot.report import report_data
     settings = _settings(tmp_path)
-    db = FinanceDatabase(settings.sqlite_db_path, settings.timezone)
+    db = FinanceDatabase(settings.sqlite_db_path, settings.timezone, create=True)
     month = datetime.now(db.timezone).strftime("%Y-%m")
     template = db.upsert_projection_template(kind="income", name="Sueldo Ariel", default_amount_cents=110000, category="Ingresos laborales", start_month=month)
     transaction = db.add_manual_transaction(kind="income", amount_cents=130000, category="Ingresos laborales", note="Sueldo Ariel", created_at=month + "-04T12:00:00+02:00")
@@ -39,7 +39,7 @@ def test_projection_distinguishes_plan_from_linked_actual_and_manual_status(tmp_
 
 def test_report_script_data_cannot_close_script_element(tmp_path):
     settings = _settings(tmp_path)
-    db = FinanceDatabase(settings.sqlite_db_path, settings.timezone)
+    db = FinanceDatabase(settings.sqlite_db_path, settings.timezone, create=True)
     db.add_manual_transaction(kind="expense", amount_cents=100, category="Ocio", note='</script><script>alert("test")</script>')
     html = render_report_html(settings, editable=True)
     assert '</script><script>alert("test")' not in html
@@ -49,7 +49,7 @@ def test_report_script_data_cannot_close_script_element(tmp_path):
 def test_overspent_budget_does_not_reduce_pending_expenses(tmp_path):
     from finance_bot.report import report_data
     settings = _settings(tmp_path)
-    db = FinanceDatabase(settings.sqlite_db_path, settings.timezone)
+    db = FinanceDatabase(settings.sqlite_db_path, settings.timezone, create=True)
     month = datetime.now(db.timezone).strftime("%Y-%m")
     db.upsert_projection_template(kind="expense", name=HOUSEHOLD_FOOD_CATEGORY, default_amount_cents=10000, category=HOUSEHOLD_FOOD_CATEGORY, start_month=month)
     db.add_manual_transaction(kind="expense", amount_cents=15000, category=HOUSEHOLD_FOOD_CATEGORY, note="Compra", created_at=month + "-04T12:00:00+02:00")
@@ -80,7 +80,7 @@ def _settings(tmp_path: Path) -> Settings:
 
 def test_report_includes_codex_analytics_panel(tmp_path) -> None:
     settings = _settings(tmp_path)
-    db = FinanceDatabase(settings.sqlite_db_path, settings.timezone)
+    db = FinanceDatabase(settings.sqlite_db_path, settings.timezone, create=True)
     db.add_manual_transaction(
         kind="expense",
         amount_cents=1250,
@@ -112,7 +112,7 @@ def test_report_includes_codex_analytics_panel(tmp_path) -> None:
 
 def test_report_includes_quick_status_and_trend_chart(tmp_path) -> None:
     settings = _settings(tmp_path)
-    db = FinanceDatabase(settings.sqlite_db_path, settings.timezone)
+    db = FinanceDatabase(settings.sqlite_db_path, settings.timezone, create=True)
     db.upsert_projection_template(
         kind="expense",
         name="Alquiler",
@@ -141,6 +141,7 @@ def test_report_includes_quick_status_and_trend_chart(tmp_path) -> None:
 
 def test_editable_report_includes_live_runtime_status(tmp_path) -> None:
     settings = _settings(tmp_path)
+    FinanceDatabase(settings.sqlite_db_path, settings.timezone, create=True)
 
     editable_html = render_report_html(settings, editable=True)
     static_html = render_report_html(settings, editable=False)
@@ -153,7 +154,7 @@ def test_editable_report_includes_live_runtime_status(tmp_path) -> None:
 
 def test_report_normalizes_malformed_category_labels(tmp_path) -> None:
     settings = _settings(tmp_path)
-    db = FinanceDatabase(settings.sqlite_db_path, settings.timezone)
+    db = FinanceDatabase(settings.sqlite_db_path, settings.timezone, create=True)
     transaction_id = db.add_manual_transaction(
         kind="expense",
         amount_cents=954,
@@ -171,7 +172,7 @@ def test_report_normalizes_malformed_category_labels(tmp_path) -> None:
 
 def test_report_includes_ai_alert_logic_for_unmatched_or_uncertain_rows(tmp_path) -> None:
     settings = _settings(tmp_path)
-    db = FinanceDatabase(settings.sqlite_db_path, settings.timezone)
+    db = FinanceDatabase(settings.sqlite_db_path, settings.timezone, create=True)
     db.add_manual_transaction(
         kind="income",
         amount_cents=120000,
@@ -190,7 +191,7 @@ def test_report_includes_ai_alert_logic_for_unmatched_or_uncertain_rows(tmp_path
 
 def test_household_food_projection_tracks_actual_spend(tmp_path) -> None:
     settings = _settings(tmp_path)
-    db = FinanceDatabase(settings.sqlite_db_path, settings.timezone)
+    db = FinanceDatabase(settings.sqlite_db_path, settings.timezone, create=True)
     month = datetime.now(ZoneInfo(settings.timezone)).strftime("%Y-%m")
     db.upsert_projection_template(
         kind="expense",
@@ -212,3 +213,45 @@ def test_household_food_projection_tracks_actual_spend(tmp_path) -> None:
     assert '"tracksActualCategory": true' in html
     assert '"actualSpentCents": 17500' in html
     assert '"remainingBudgetCents": 42500' in html
+
+
+def test_household_envelope_does_not_flag_every_grocery_line(tmp_path) -> None:
+    from finance_bot.report import report_data
+
+    settings = _settings(tmp_path)
+    db = FinanceDatabase(settings.sqlite_db_path, settings.timezone, create=True)
+    month = datetime.now(ZoneInfo(settings.timezone)).strftime("%Y-%m")
+    template = db.upsert_projection_template(
+        kind="expense",
+        name=HOUSEHOLD_FOOD_CATEGORY,
+        default_amount_cents=60000,
+        category=HOUSEHOLD_FOOD_CATEGORY,
+        start_month=month,
+    )
+    grocery = db.add_manual_transaction(
+        kind="expense",
+        amount_cents=185,
+        category=HOUSEHOLD_FOOD_CATEGORY,
+        note="Fresa platano 120 g",
+        created_at=month + "-08T12:00:00+02:00",
+    )
+    wrong = db.add_manual_transaction(
+        kind="expense",
+        amount_cents=4000,
+        category="Ocio",
+        note="cine",
+        created_at=month + "-09T12:00:00+02:00",
+    )
+    for transaction_id in (grocery, wrong):
+        db.update_transaction(transaction_id, projection_template_id=template)
+
+    row = next(
+        r
+        for r in report_data(settings)["projections"]["rows"]
+        if r["month"] == month and r["templateId"] == template
+    )
+
+    assert set(row["linkedTransactionIds"]) == {grocery, wrong}
+    # Solo el movimiento de otra categoria es un vinculo sospechoso; el gasto
+    # distinto del presupuesto es normal en un sobre.
+    assert row["linkWarnings"] == [f"Revisar vínculo con movimiento #{wrong}"]

@@ -164,3 +164,39 @@ def test_parser_accepts_stop_flag() -> None:
 
     assert start_app.build_parser().parse_args(["--stop"]).stop is True
     assert start_app.build_parser().parse_args([]).stop is False
+
+
+def test_restart_policy_backs_off_and_resets_after_a_stable_run() -> None:
+    start_app = _load_start_finance_app()
+    policy = start_app.RestartPolicy()
+
+    waits = [policy.schedule(now=0.0, ran_for=1.0) for _ in range(10)]
+
+    assert waits[:3] == [5.0, 10.0, 20.0]
+    assert max(waits) == start_app.RESTART_MAX_DELAY_SECONDS
+    assert policy.schedule(now=100.0, ran_for=start_app.STABLE_RUN_SECONDS) == 5.0
+    assert not policy.due(104.0)
+    assert policy.due(105.0)
+
+
+def test_rotate_log_keeps_the_previous_file(tmp_path) -> None:
+    start_app = _load_start_finance_app()
+    log_path = tmp_path / "bot.log"
+    log_path.write_text("x" * 20, encoding="utf-8")
+
+    start_app._rotate_log(log_path, max_bytes=100)
+    assert log_path.exists()
+
+    start_app._rotate_log(log_path, max_bytes=10)
+    assert not log_path.exists()
+    assert (tmp_path / "bot.log.1").read_text(encoding="utf-8") == "x" * 20
+
+
+def test_autostart_script_starts_detached_without_browser(tmp_path) -> None:
+    start_app = _load_start_finance_app()
+
+    script = start_app._autostart_script(tmp_path / "pythonw.exe")
+
+    assert f'cd /d "{start_app.ROOT}"' in script
+    assert "--detached --no-browser" in script
+    assert start_app.build_parser().parse_args(["--install-autostart"]).install_autostart

@@ -18,7 +18,7 @@ def test_register_manual_entries_rejects_invalid_payload_without_partial_writes(
     receipt_dir = tmp_path / "receipts"
     voice_dir = tmp_path / "voices"
 
-    db = FinanceDatabase(db_path, "Europe/Madrid")
+    db = FinanceDatabase(db_path, "Europe/Madrid", create=True)
     receipt_id = db.add_receipt(
         local_path=str(receipt_dir / "ticket.jpg"),
         drive_file_id=None,
@@ -68,6 +68,8 @@ def test_register_manual_entries_rejects_invalid_payload_without_partial_writes(
             "RECEIPTS_SYNC_DIR": str(receipt_dir),
             "VOICES_SYNC_DIR": str(voice_dir),
             "TIMEZONE": "Europe/Madrid",
+            # Fija la salida del script para no depender de la consola que lance pytest.
+            "PYTHONIOENCODING": "utf-8",
         }
     )
 
@@ -76,7 +78,10 @@ def test_register_manual_entries_rejects_invalid_payload_without_partial_writes(
         str(Path(__file__).resolve().parents[1] / "scripts" / "register_manual_entries.py"),
         str(payload_path),
     ]
-    result = subprocess.run(command, capture_output=True, text=True, env=env, check=False)
+    # encoding explicito: los scripts escriben en UTF-8 aunque la consola sea cp1252.
+    result = subprocess.run(
+        command, capture_output=True, text=True, encoding="utf-8", env=env, check=False
+    )
 
     assert result.returncode != 0
     assert "Categoría no válida" in result.stderr or "Categoría no válida" in result.stdout

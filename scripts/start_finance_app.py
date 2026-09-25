@@ -10,7 +10,7 @@ import sys
 import time
 import traceback
 import webbrowser
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from urllib.error import URLError
@@ -20,6 +20,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from finance_bot.config import Settings
 from finance_bot.process_lock import AlreadyRunningError, SingleInstance
+from finance_bot.storage import inspect_database, DatabaseUnavailableError
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -27,7 +28,6 @@ DETACHED_ENV_VAR = "FINANCE_APP_DETACHED"
 
 # Codigos de salida
 EXIT_OK = 0
-EXIT_PROCESSES_DOWN = 1
 EXIT_ALREADY_RUNNING = 2
 EXIT_DASHBOARD_FAILED = 3
 EXIT_NO_CONFIRMATION = 4
@@ -40,12 +40,21 @@ REPLACE_ATTEMPTS = 8
 REPLACE_DELAY_SECONDS = 0.05
 LAUNCH_TIMEOUT_SECONDS = 60.0
 
+# Si el bot o el panel se caen (p. ej. sin red al encender la compu), el
+# supervisor los relanza con espera creciente en lugar de dejarlos muertos.
+RESTART_MIN_DELAY_SECONDS = 5.0
+RESTART_MAX_DELAY_SECONDS = 300.0
+STABLE_RUN_SECONDS = 300.0
+LOG_ROTATE_BYTES = 5 * 1024 * 1024
+AUTOSTART_FILENAME = "Finanzas.cmd"
+
 
 @dataclass
 class ManagedProcess:
     name: str
     process: subprocess.Popen
     log_handle: object
+    started_monotonic: float = field(default_factory=time.monotonic)
 
     @property
     def running(self) -> bool:
@@ -55,6 +64,25 @@ class ManagedProcess:
         close = getattr(self.log_handle, "close", None)
         if close:
             close()
+
+
+@dataclass
+class RestartPolicy:
+    """Espera creciente entre reinicios; vuelve al minimo tras una ejecucion estable."""
+
+    delay: float = RESTART_MIN_DELAY_SECONDS
+    next_attempt: float | None = None
+
+    def schedule(self, now: float, ran_for: float) -> float:
+        if ran_for >= STABLE_RUN_SECONDS:
+            self.delay = RESTART_MIN_DELAY_SECONDS
+        wait = self.delay
+        self.next_attempt = now + wait
+        self.delay = min(self.delay * 2, RESTART_MAX_DELAY_SECONDS)
+        return wait
+
+    def due(self, now: float) -> bool:
+        return self.next_attempt is not None and now >= self.next_attempt
 
 
 def _now_iso() -> str:
@@ -182,8 +210,19 @@ def _write_json_file(path: Path, payload: dict[str, object]) -> None:
         raise last_error if last_error else OSError(f"No se pudo escribir {path}")
 
 
+def _rotate_log(log_path: Path, max_bytes: int = LOG_ROTATE_BYTES) -> None:
+    """Conserva solo el registro actual y el anterior para que no crezcan sin limite."""
+    try:
+        if log_path.stat().st_size < max_bytes:
+            return
+        log_path.replace(log_path.with_name(log_path.name + ".1"))
+    except OSError:
+        pass
+
+
 def _start_process(name: str, command: list[str], log_path: Path) -> ManagedProcess:
     log_path.parent.mkdir(parents=True, exist_ok=True)
+    _rotate_log(log_path)
     log_handle = log_path.open("a", encoding="utf-8")
     log_handle.write(f"\n[{datetime.now().isoformat(timespec='seconds')}] Inicio de {name}\n")
     log_handle.flush()
@@ -424,7 +463,16 @@ def _stop_running_app(args: argparse.Namespace, settings: Settings) -> int:
     payload = _read_json_file(status_path)
     stopped: list[str] = []
 
-    # Primero los hijos: al verlos caidos el supervisor termina por su cuenta.
+    # Primero el supervisor: si siguiera vivo, relanzaria al bot y al panel.
+    supervisor_pid = payload.get("supervisor_pid")
+    if _is_managed_pid(supervisor_pid):
+        assert isinstance(supervisor_pid, int)
+        _kill_pid(supervisor_pid)
+        deadline = time.monotonic() + 5.0
+        while time.monotonic() < deadline and _process_is_running(supervisor_pid):
+            time.sleep(0.2)
+        stopped.append(f"supervisor (PID {supervisor_pid})")
+
     for key, label in (("bot_pid", "bot"), ("dashboard_pid", "panel")):
         pid = payload.get(key)
         if not _is_managed_pid(pid):
@@ -432,16 +480,6 @@ def _stop_running_app(args: argparse.Namespace, settings: Settings) -> int:
         assert isinstance(pid, int)
         _kill_pid(pid)
         stopped.append(f"{label} (PID {pid})")
-
-    supervisor_pid = payload.get("supervisor_pid")
-    if _process_is_running(supervisor_pid):
-        assert isinstance(supervisor_pid, int)
-        deadline = time.monotonic() + 5.0
-        while time.monotonic() < deadline and _process_is_running(supervisor_pid):
-            time.sleep(0.2)
-        if _is_managed_pid(supervisor_pid):
-            _kill_pid(supervisor_pid)
-        stopped.append(f"supervisor (PID {supervisor_pid})")
 
     if not stopped:
         print("Finanzas no estaba iniciada.")
@@ -471,6 +509,7 @@ def _run_supervisor(args: argparse.Namespace, settings: Settings) -> int:
     started_at = _now_iso()
     bot: ManagedProcess | None = None
     dashboard: ManagedProcess | None = None
+    backup: ManagedProcess | None = None
     status_warning_shown = False
 
     def fail(code: int, message: str) -> int:
@@ -502,21 +541,20 @@ def _run_supervisor(args: argparse.Namespace, settings: Settings) -> int:
             '"Cerrar Finanzas.cmd" y vuelve a intentarlo.',
         )
 
+    dashboard_command = [
+        sys.executable,
+        "-B",
+        str(ROOT / "scripts" / "serve_dashboard.py"),
+        "--host",
+        args.host,
+        "--port",
+        str(args.port),
+    ]
+    bot_command = [sys.executable, "-B", str(ROOT / "run_bot.py")]
+
     try:
         with SingleInstance(lock_path, "La aplicacion de finanzas ya esta iniciada."):
-            dashboard = _start_process(
-                "panel",
-                [
-                    sys.executable,
-                    "-B",
-                    str(ROOT / "scripts" / "serve_dashboard.py"),
-                    "--host",
-                    args.host,
-                    "--port",
-                    str(args.port),
-                ],
-                logs_dir / "dashboard.log",
-            )
+            dashboard = _start_process("panel", dashboard_command, logs_dir / "dashboard.log")
             write_status()
             if not _wait_for_dashboard(url, dashboard):
                 return fail(
@@ -525,11 +563,7 @@ def _run_supervisor(args: argparse.Namespace, settings: Settings) -> int:
                 )
 
             if not args.dashboard_only:
-                bot = _start_process(
-                    "bot",
-                    [sys.executable, "-B", str(ROOT / "run_bot.py")],
-                    logs_dir / "bot.log",
-                )
+                bot = _start_process("bot", bot_command, logs_dir / "bot.log")
 
             write_status()
             _safe_write_launch_result(
@@ -548,20 +582,45 @@ def _run_supervisor(args: argparse.Namespace, settings: Settings) -> int:
             print(f"Logs: {logs_dir.resolve()}")
             print("Pulsa Ctrl+C para cerrar.")
 
-            bot_warning_shown = False
-            dashboard_warning_shown = False
+            bot_restarts = RestartPolicy()
+            dashboard_restarts = RestartPolicy()
+            next_backup = 0.0
+
+            def keep_alive(
+                current: ManagedProcess | None,
+                policy: RestartPolicy,
+                command: list[str],
+                log_name: str,
+            ) -> ManagedProcess | None:
+                if current is None or current.running:
+                    return current
+                now = time.monotonic()
+                if policy.next_attempt is None:
+                    wait = policy.schedule(now, now - current.started_monotonic)
+                    print(
+                        f"{_now_iso()} {current.name} se detuvo (codigo "
+                        f"{current.process.returncode}). Reintento en {wait:.0f}s. "
+                        f"Revisa {logs_dir / log_name}"
+                    )
+                    return current
+                if not policy.due(now):
+                    return current
+                current.close_log()
+                policy.next_attempt = None
+                print(f"{_now_iso()} Reiniciando {current.name}...")
+                return _start_process(current.name, command, logs_dir / log_name)
+
             while True:
+                if time.monotonic() >= next_backup and (backup is None or not backup.running):
+                    if backup:
+                        backup.close_log()
+                    backup = _start_process("backup", [sys.executable, "-B", str(ROOT / "scripts" / "backup_finances.py"), "--if-due"], logs_dir / "backup.log")
+                    next_backup = time.monotonic() + 3600
+                bot = keep_alive(bot, bot_restarts, bot_command, "bot.log")
+                dashboard = keep_alive(
+                    dashboard, dashboard_restarts, dashboard_command, "dashboard.log"
+                )
                 write_status()
-                if bot and not bot.running and not bot_warning_shown:
-                    print(f"El bot se detuvo. Revisa {logs_dir / 'bot.log'}")
-                    bot_warning_shown = True
-                if dashboard and not dashboard.running and not dashboard_warning_shown:
-                    print(f"El panel se detuvo. Revisa {logs_dir / 'dashboard.log'}")
-                    dashboard_warning_shown = True
-                if (bot is None or not bot.running) and (
-                    dashboard is None or not dashboard.running
-                ):
-                    return EXIT_PROCESSES_DOWN
                 time.sleep(STATUS_INTERVAL_SECONDS)
     except AlreadyRunningError as exc:
         return fail(EXIT_ALREADY_RUNNING, str(exc))
@@ -574,12 +633,51 @@ def _run_supervisor(args: argparse.Namespace, settings: Settings) -> int:
     finally:
         _stop_process(bot)
         _stop_process(dashboard)
+        _stop_process(backup)
         try:
             _write_runtime_status(
                 status_path, started_at=started_at, bot=bot, dashboard=dashboard
             )
         except OSError:
             pass
+
+
+def _startup_dir() -> Path:
+    appdata = os.environ.get("APPDATA")
+    if not appdata:
+        raise OSError("No se encontro APPDATA; el arranque automatico solo existe en Windows.")
+    return Path(appdata) / "Microsoft" / "Windows" / "Start Menu" / "Programs" / "Startup"
+
+
+def _autostart_script(python_exe: Path) -> str:
+    # pythonw no abre consola; --no-browser evita que el panel salte en cada inicio.
+    return (
+        "@echo off\r\n"
+        f'cd /d "{ROOT}"\r\n'
+        f'start "" "{python_exe}" -B "scripts\\start_finance_app.py" --detached --no-browser\r\n'
+    )
+
+
+def _install_autostart() -> int:
+    python_exe = Path(sys.executable)
+    windowless = python_exe.with_name("pythonw.exe")
+    if windowless.exists():
+        python_exe = windowless
+    target = _startup_dir() / AUTOSTART_FILENAME
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(_autostart_script(python_exe), encoding="utf-8")
+    print(f"Finanzas arrancara sola al iniciar sesion en Windows ({target}).")
+    return EXIT_OK
+
+
+def _remove_autostart() -> int:
+    target = _startup_dir() / AUTOSTART_FILENAME
+    if target.exists():
+        target.unlink()
+        print("Arranque automatico desactivado.")
+    else:
+        print("El arranque automatico no estaba activado.")
+    return EXIT_OK
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -598,11 +696,25 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Detiene la aplicacion que este iniciada y libera el puerto.",
     )
+    parser.add_argument(
+        "--install-autostart",
+        action="store_true",
+        help="Inicia Finanzas automaticamente al iniciar sesion en Windows.",
+    )
+    parser.add_argument(
+        "--remove-autostart",
+        action="store_true",
+        help="Desactiva el inicio automatico.",
+    )
     return parser
 
 
 def main() -> int:
     args = build_parser().parse_args()
+    if args.install_autostart:
+        return _install_autostart()
+    if args.remove_autostart:
+        return _remove_autostart()
 
     # Toda la configuracion usa rutas relativas, asi que el directorio de trabajo
     # debe ser la raiz del proyecto aunque el acceso directo se lance desde otro sitio.
@@ -612,6 +724,11 @@ def main() -> int:
 
     if args.stop:
         return _stop_running_app(args, settings)
+    try:
+        inspect_database(settings.sqlite_db_path, check_integrity=True)
+    except DatabaseUnavailableError as exc:
+        print(str(exc))
+        return EXIT_UNEXPECTED
     if _should_relaunch_detached(args.detached):
         return _run_detached(args, settings)
     return _run_supervisor(args, settings)

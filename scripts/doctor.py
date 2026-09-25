@@ -8,7 +8,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from finance_bot.config import Settings
-from finance_bot.db import FinanceDatabase
+from finance_bot.storage import inspect_database, read_backup_status
 
 
 def main() -> int:
@@ -17,11 +17,9 @@ def main() -> int:
     checks.append({"name": "Python", "ok": sys.version_info >= (3, 11), "detail": sys.version.split()[0]})
     checks.append({"name": "Token de Telegram", "ok": bool(settings.telegram_bot_token), "detail": "configurado" if settings.telegram_bot_token else "falta en .env"})
     try:
-        settings.ensure_dirs()
-        db = FinanceDatabase(settings.sqlite_db_path, settings.timezone)
-        with db._connect() as connection:
-            integrity = connection.execute("PRAGMA quick_check").fetchone()[0]
-        checks.append({"name": "SQLite", "ok": integrity == "ok", "detail": integrity})
+        health = inspect_database(settings.sqlite_db_path, check_integrity=True)
+        checks.append({"name": "SQLite", "ok": True, "detail": health})
+        checks.append({"name": "Última copia verificada", "ok": bool(read_backup_status(settings.data_dir)), "detail": read_backup_status(settings.data_dir).get("verifiedAt", "Sin copia verificada")})
     except Exception as exc:
         checks.append({"name": "SQLite", "ok": False, "detail": str(exc)})
     checks.append({"name": "Git", "ok": shutil.which("git") is not None, "detail": "disponible" if shutil.which("git") else "no encontrado"})

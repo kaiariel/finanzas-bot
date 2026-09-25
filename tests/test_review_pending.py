@@ -47,7 +47,7 @@ def _receipt_with_notes(db: FinanceDatabase, receipt_id: int):
 def test_review_image_prefers_codex_manual_review(tmp_path) -> None:
     review_pending = _load_review_pending()
     settings = _settings(tmp_path)
-    db = FinanceDatabase(settings.sqlite_db_path, settings.timezone)
+    db = FinanceDatabase(settings.sqlite_db_path, settings.timezone, create=True)
     image_path = tmp_path / "ticket.jpg"
     image_path.write_bytes(b"fake image bytes")
     receipt_id = db.add_receipt(
@@ -72,7 +72,7 @@ def test_review_image_prefers_codex_manual_review(tmp_path) -> None:
 def test_review_voice_prefers_codex_manual_review(tmp_path) -> None:
     review_pending = _load_review_pending()
     settings = _settings(tmp_path)
-    db = FinanceDatabase(settings.sqlite_db_path, settings.timezone)
+    db = FinanceDatabase(settings.sqlite_db_path, settings.timezone, create=True)
     audio_path = tmp_path / "voice.ogg"
     audio_path.write_bytes(b"fake audio bytes")
     receipt_id = db.add_receipt(
@@ -97,7 +97,7 @@ def test_review_voice_prefers_codex_manual_review(tmp_path) -> None:
 def test_missing_image_is_retried_when_file_becomes_available(tmp_path) -> None:
     review_pending = _load_review_pending()
     settings = _settings(tmp_path)
-    db = FinanceDatabase(settings.sqlite_db_path, settings.timezone)
+    db = FinanceDatabase(settings.sqlite_db_path, settings.timezone, create=True)
     image_path = tmp_path / "recovered-ticket.jpg"
     image_path.write_bytes(b"fake image bytes")
     receipt_id = db.add_receipt(

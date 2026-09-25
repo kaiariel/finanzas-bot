@@ -1,52 +1,20 @@
-from __future__ import annotations
-
-import shutil
-import sqlite3
-import sys
-from datetime import datetime
 from pathlib import Path
+import argparse
+import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-
 from finance_bot.config import Settings
-from finance_bot.db import FinanceDatabase
-from finance_bot.report import generate_report
+from finance_bot.storage import create_backup, ensure_recent_backup
 
 
-def main() -> None:
+def main():
+    parser = argparse.ArgumentParser(description="Copia verificada de la base y los adjuntos")
+    parser.add_argument("--if-due", action="store_true")
+    args = parser.parse_args()
     settings = Settings.from_env()
-    settings.data_dir.mkdir(parents=True, exist_ok=True)
-    settings.sqlite_db_path.parent.mkdir(parents=True, exist_ok=True)
-    settings.export_csv_path.parent.mkdir(parents=True, exist_ok=True)
-    settings.report_html_path.parent.mkdir(parents=True, exist_ok=True)
-    backup_dir = settings.data_dir / "backups"
-    backup_dir.mkdir(parents=True, exist_ok=True)
-
-    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-    db_backup = backup_dir / f"finances-{stamp}.db"
-    csv_backup = backup_dir / f"movimientos-{stamp}.csv"
-    html_backup = backup_dir / f"finanzas-{stamp}.html"
-
-    with sqlite3.connect(settings.sqlite_db_path) as source:
-        with sqlite3.connect(db_backup) as target:
-            source.backup(target)
-
-    FinanceDatabase(settings.sqlite_db_path, settings.timezone).export_csv(settings.export_csv_path)
-    if settings.export_csv_path.exists():
-        shutil.copy2(settings.export_csv_path, csv_backup)
-
-    report_path = generate_report(settings)
-    if report_path.exists():
-        shutil.copy2(report_path, html_backup)
-
-    # Conserva tambien los adjuntos locales para que el backup permita recuperar
-    # la trazabilidad completa de los movimientos y tickets.
-    for label, source in (("receipts", settings.resolved_receipts_dir()), ("voices", settings.resolved_voices_dir())):
-        if source.exists() and source.is_dir():
-            target = backup_dir / f"{label}-{stamp}"
-            shutil.copytree(source, target, dirs_exist_ok=True)
-
-    print(db_backup.resolve())
+    result = ensure_recent_backup(settings) if args.if_due else create_backup(settings)
+    print(f"Copia verificada: {result['database']}")
+    print(f"Registros: {result['counts']}")
 
 
 if __name__ == "__main__":

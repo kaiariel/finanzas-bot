@@ -189,3 +189,20 @@ def test_transaction_table_format() -> None:
         "|-----|-------|-------------|-----------|----------|------|--------|---------|\n"
         "| Junio | 01/06/2026 | mercadona comida | Hogar y Alimentación | 12,50 € | Egreso | Mercadona | No |"
     )
+
+
+def test_income_never_keeps_an_expense_category() -> None:
+    for text in ("ingreso 100 dinero Izhan", "ingreso 30 venta ropa", "+20 mercadona"):
+        parsed = parse_transaction(text)
+
+        assert parsed is not None
+        assert parsed.kind == "income"
+        assert parsed.category == "Trabajos extra", text
+        assert any("es de gastos" in note for note in parsed.inference_notes)
+
+
+def test_income_keyword_category_is_kept() -> None:
+    parsed = parse_transaction("ingreso 1200 nomina")
+
+    assert parsed is not None
+    assert not any("es de gastos" in note for note in parsed.inference_notes)

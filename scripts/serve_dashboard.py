@@ -18,6 +18,7 @@ from finance_bot.db import FinanceDatabase
 from finance_bot.formatting import parse_created_at
 from finance_bot.parser import VALID_CATEGORIES, amount_to_cents
 from finance_bot.report import generate_report, render_report_html, report_data
+from finance_bot.storage import DatabaseUnavailableError, inspect_database, read_backup_status
 
 
 KIND_LABELS = {
@@ -73,6 +74,7 @@ def runtime_status_payload(settings: Settings) -> dict[str, object]:
         "pendingCount": int(pending_count),
         "lastTransactionAt": last_transaction[0] if last_transaction else None,
         "lastReceiptAt": last_receipt[0] if last_receipt else None,
+        "lastBackupAt": read_backup_status(settings.data_dir).get("verifiedAt"),
     }
 
 
@@ -207,10 +209,19 @@ class DashboardHandler(BaseHTTPRequestHandler):
 
     def _origin_allowed(self) -> bool:
         host = self.headers.get("Host", "")
-        if host not in self.allowed_hosts:
+        if not self._host_allowed():
             return False
         origin = self.headers.get("Origin")
         return not origin or origin == "http://" + host
+
+    def _host_allowed(self) -> bool:
+        allowed = self.allowed_hosts
+        if not allowed:
+            address, port = self.server.server_address[:2]
+            allowed = {f"{address}:{port}"}
+            if address == "127.0.0.1":
+                allowed.add(f"localhost:{port}")
+        return self.headers.get("Host", "") in allowed
 
     def _send(self, status: int, body: bytes, content_type: str) -> None:
         self.send_response(status)
@@ -232,6 +243,22 @@ class DashboardHandler(BaseHTTPRequestHandler):
         self._send(200, html.encode("utf-8"), "text/html; charset=utf-8")
 
     def do_GET(self) -> None:
+        if not self._host_allowed():
+            self._send_json(403, {"ok": False, "error": "Destino de consulta no permitido."})
+            return
+        try:
+            self._get()
+        except DatabaseUnavailableError as exc:
+            if urlparse(self.path).path.startswith("/api/"):
+                self._send_json(503, {"ok": False, "error": str(exc)})
+            else:
+                import html
+                self._send(503, ("<!doctype html><html lang='es'><meta charset='utf-8'><title>Revisar base de finanzas</title>"
+                    "<body style='font:18px system-ui;max-width:720px;margin:80px auto;padding:24px'>"
+                    "<h1>No podemos mostrar tus finanzas</h1><p>La base de datos no está disponible. "
+                    "Tus cifras no se han sustituido por ceros.</p><p>" + html.escape(str(exc)) + "</p></body></html>").encode(), "text/html; charset=utf-8")
+
+    def _get(self) -> None:
         path = urlparse(self.path).path
         if path in {"/", "/finanzas.html", "/reports/finanzas.html"}:
             self._send_html(render_report_html(self.settings, editable=True))
@@ -277,6 +304,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
         path = urlparse(self.path).path
         match = re.fullmatch(r"/api/transactions/(\d+)", path)
         undo_match = re.fullmatch(r"/api/transactions/(\d+)/undo", path)
+        restore_match = re.fullmatch(r"/api/transactions/(\d+)/restore", path)
         payment_match = re.fullmatch(r"/api/transactions/(\d+)/payment", path)
         create_transaction = path == "/api/transactions"
         create_account = path == "/api/accounts"
@@ -290,7 +318,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
         projection_end_match = re.fullmatch(r"/api/projections/(\d+)/(\d{4}-\d{2})/from", path)
         projection_match = re.fullmatch(r"/api/projections/(\d+)/(\d{4}-\d{2})", path)
         projection_create = path == "/api/projections"
-        if not match and not undo_match and not payment_match and not create_transaction and not create_account and not create_transfer and not create_budget and not create_goal and not savings_settings and not savings_wallet and not receipt_review and not status_match and not projection_end_match and not projection_match and not projection_create:
+        if not match and not undo_match and not restore_match and not payment_match and not create_transaction and not create_account and not create_transfer and not create_budget and not create_goal and not savings_settings and not savings_wallet and not receipt_review and not status_match and not projection_end_match and not projection_match and not projection_create:
             self._send_json(404, {"ok": False, "error": "Ruta no encontrada."})
             return
 
@@ -346,6 +374,10 @@ class DashboardHandler(BaseHTTPRequestHandler):
             elif undo_match:
                 db = FinanceDatabase(self.settings.sqlite_db_path, self.settings.timezone)
                 db.undo_last_transaction_change(int(undo_match.group(1)))
+                generate_report(self.settings)
+            elif restore_match:
+                db = FinanceDatabase(self.settings.sqlite_db_path, self.settings.timezone)
+                db.restore_deleted_transaction(int(restore_match.group(1)))
                 generate_report(self.settings)
             elif payment_match:
                 db = FinanceDatabase(self.settings.sqlite_db_path, self.settings.timezone)
@@ -425,6 +457,10 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 "is_fixed": _parse_bool(item.get("isFixed")),
                 "created_at": created_at,
             })
+        if str(payload.get("expectedTotal") or "").strip():
+            expected = _parse_amount(payload["expectedTotal"])
+            if expected <= 0 or sum(row["amount_cents"] for row in normalized) != expected:
+                raise ValueError("La suma de las líneas no coincide con el total del justificante. Revisa los importes.")
         transaction_ids = db.register_receipt_entries(receipt_id, normalized, allow_existing=_parse_bool(payload.get("allowExisting")))
         db.log_audit("review", "receipt", receipt_id, json.dumps({"transactions": transaction_ids}, ensure_ascii=False))
         generate_report(self.settings)
@@ -436,10 +472,17 @@ class DashboardHandler(BaseHTTPRequestHandler):
         path = urlparse(self.path).path
         projection_end_match = re.fullmatch(r"/api/projections/(\d+)/(\d{4}-\d{2})/from", path)
         projection_match = re.fullmatch(r"/api/projections/(\d+)/(\d{4}-\d{2})", path)
-        if not projection_match and not projection_end_match:
+        transaction_match = re.fullmatch(r"/api/transactions/(\d+)", path)
+        if not projection_match and not projection_end_match and not transaction_match:
             self._send_json(404, {"ok": False, "error": "Ruta no encontrada."})
             return
         try:
+            if transaction_match:
+                db = FinanceDatabase(self.settings.sqlite_db_path, self.settings.timezone)
+                db.delete_transaction(int(transaction_match.group(1)))
+                generate_report(self.settings)
+                self._send_json(200, {"ok": True})
+                return
             selected = projection_end_match or projection_match
             assert selected is not None
             template_id = int(selected.group(1))
@@ -493,6 +536,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
         }
         if values["amount_cents"] <= 0:
             raise ValueError("El importe debe ser mayor que cero; usa el tipo para indicar ingreso o gasto.")
+        if existing["paid_amount_cents"] == existing["amount_cents"]:
+            values["paid_amount_cents"] = values["amount_cents"]
         if "userId" in payload:
             user_id = int(payload["userId"]) if str(payload["userId"] or "") else None
             users = {r["telegram_user_id"]: r for r in db.list_transactions() if r["telegram_user_id"] is not None}
@@ -521,7 +566,14 @@ class DashboardHandler(BaseHTTPRequestHandler):
         if new_link is not None and (not template or template["kind"] != values["kind"] or not db._projection_applies_to_month(template, new_month)):
             raise ValueError("La proyección no corresponde al tipo o mes. Selecciona otra o desvincúlala.")
         values["projection_template_id"] = new_link
-        with db._connect() as connection:
+        with db.atomic(), db._connect() as connection:
+            if dict(db.get_transaction(transaction_id)) != dict(existing):
+                raise ValueError("Este movimiento cambió mientras lo editabas. Actualiza los datos y vuelve a intentarlo.")
+            keys = {(link, month) for link, month in ((old_link, old_month), (new_link, new_month)) if link}
+            projection_snapshots = []
+            for link, month in sorted(keys):
+                occurrence = db.get_projection_occurrence(link, month)
+                projection_snapshots.append({"templateId": link, "month": month, "before": dict(occurrence) if occurrence else None})
             connection.execute("UPDATE transactions SET " + ", ".join(key + " = ?" for key in values) + " WHERE id = ?", (*values.values(), transaction_id))
             if old_link and (old_link != new_link or old_month != new_month):
                 remaining = connection.execute("SELECT COUNT(*) FROM transactions WHERE projection_template_id = ? AND substr(created_at,1,7) = ?", (old_link, old_month)).fetchone()[0]
@@ -532,7 +584,11 @@ class DashboardHandler(BaseHTTPRequestHandler):
                     VALUES (?, ?, ?, 'completed', ?, ?) ON CONFLICT(template_id,month)
                     DO UPDATE SET status = 'completed', updated_at = excluded.updated_at""",
                     (new_link, new_month, template["default_amount_cents"], f"Vinculado manualmente al movimiento #{transaction_id}", db._now()))
-        db.log_audit("update", "transaction", transaction_id, json.dumps({"before": dict(existing), "after": values}, ensure_ascii=False, default=str))
+            for snapshot in projection_snapshots:
+                occurrence = db.get_projection_occurrence(snapshot["templateId"], snapshot["month"])
+                snapshot["after"] = dict(occurrence) if occurrence else None
+            db.log_audit("update", "transaction", transaction_id,
+                         json.dumps({"before": dict(existing), "after": values, "projections": projection_snapshots}, ensure_ascii=False, default=str))
         generate_report(self.settings)
 
     def _update_projection(
@@ -648,6 +704,7 @@ def main() -> None:
     args = parser.parse_args()
 
     settings = Settings.from_env()
+    inspect_database(settings.sqlite_db_path, check_integrity=True)
     settings.ensure_dirs()
     DashboardHandler.settings = settings
     DashboardHandler.allowed_hosts = {f"{args.host}:{args.port}"}

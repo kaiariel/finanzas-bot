@@ -110,7 +110,7 @@ ALLOWED_TELEGRAM_USER_IDS=
 TELEGRAM_USER_NAMES=
 
 DATA_DIR=data
-SQLITE_DB_PATH=data/finances.db
+SQLITE_DB_PATH=%USERPROFILE%\FinanzasLocal\finances.db
 EXPORT_CSV_PATH=data/movimientos.csv
 REPORT_HTML_PATH=reports/finanzas.html
 TIMEZONE=Europe/Madrid
@@ -126,6 +126,13 @@ VOICE_TRANSCRIPTION_COMPUTE_TYPE=int8
 
 TESSERACT_CMD=
 ```
+
+> **La base de datos no debe vivir dentro de OneDrive.** OneDrive sincroniza
+> tambien los archivos auxiliares de SQLite (`-wal` y `-shm`) y puede corromper
+> `finances.db`. Apunta `SQLITE_DB_PATH` a una carpeta local común, por ejemplo
+> `%USERPROFILE%\FinanzasLocal\finances.db`. Las copias de
+> seguridad (`scripts/backup_finances.py`) siguen guardandose en `data/backups`,
+> dentro de OneDrive, que es justo lo que interesa respaldar.
 
 Para crear el bot:
 
@@ -178,14 +185,38 @@ procesos huerfanos que ocupaban el puerto y continua.
 | Codigo | Significado |
 | --- | --- |
 | 0 | Finanzas se inicio correctamente. |
-| 1 | El bot y el panel se detuvieron durante la sesion. |
 | 2 | Ya estaba iniciada o el puerto `8765` esta ocupado por otro programa. |
 | 3 | El panel no llego a responder; revisa `data/logs/dashboard.log`. |
 | 4 | El arranque no se confirmo en 60 segundos. |
 | 5 | Error inesperado; el registro incluye el detalle completo. |
 
 Para cerrar ambos procesos, usa `Cerrar Finanzas.cmd`, que detiene primero el
-bot y el panel y despues el supervisor, y avisa si el puerto sigue ocupado.
+supervisor (para que no los relance) y despues el bot y el panel, y avisa si el
+puerto sigue ocupado.
+
+### Arranque automatico con Windows
+
+Telegram solo guarda **24 horas** los mensajes que el bot no ha recogido. Si la
+compu esta apagada mas tiempo, los tickets enviados antes de ese margen se
+pierden y no hay forma de recuperarlos desde el bot. Para acortar ese hueco,
+activa el inicio automatico al iniciar sesion (sin consola y sin abrir el
+navegador):
+
+```powershell
+.venv-working\Scripts\python.exe scripts\start_finance_app.py --install-autostart
+```
+
+Se desactiva con `--remove-autostart`.
+
+Al arrancar, el bot:
+
+- espera a que haya red en lugar de cerrarse si Windows aun no conecto;
+- procesa los mensajes acumulados con la **fecha en que se enviaron** (no la de
+  procesado), asi que un ticket del 31 no cae en el mes siguiente;
+- ignora mensajes que ya registro (Telegram los reentrega si el bot se cerro de
+  golpe) y los mensajes editados;
+- si detecta que estuvo apagado mas de 24 h (`data/bot_heartbeat.json`), avisa
+  por Telegram del rango de fechas cuyos mensajes hay que reenviar.
 
 No es necesario activar manualmente el entorno virtual.
 
@@ -195,8 +226,9 @@ supervisor residente y coordina dos procesos independientes:
 - `run_bot.py`: recibe mensajes y tickets desde Telegram.
 - `scripts/serve_dashboard.py`: sirve el panel editable en `http://127.0.0.1:8765`.
 
-Si uno de los procesos falla, el supervisor mantiene el otro activo y muestra el
-problema en el panel y en los logs. Los bloqueos `data/finance_app.lock` y
+Si uno de los procesos se cae, el supervisor mantiene el otro activo y lo
+relanza con una espera creciente (5 s, 10 s, 20 s... hasta 5 min). Los logs se
+rotan al superar 5 MB (se conserva el anterior como `.log.1`). Los bloqueos `data/finance_app.lock` y
 `data/telegram_bot.lock` evitan iniciar dos supervisores o dos bots simultaneamente.
 
 Archivos de diagnostico:
@@ -533,7 +565,9 @@ Arranca el panel local editable.
 python scripts/backup_finances.py
 ```
 
-Crea backup de SQLite, CSV y HTML en `data/backups`.
+Crea una copia consistente de SQLite y un manifiesto con recuentos y SHA-256 en
+`data/backups`. El supervisor comprueba cada hora si hace falta una nueva y
+conserva como máximo una copia verificada al día.
 
 Tambien copia las carpetas locales de tickets y voces con la misma marca temporal para
 que la trazabilidad de los adjuntos pueda recuperarse junto con la base de datos.

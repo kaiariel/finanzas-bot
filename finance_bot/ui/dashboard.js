@@ -75,9 +75,14 @@ if (typeof document !== 'undefined') (() => {
     return window.matchMedia?.('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
   }
   function saveState() { try { sessionStorage.setItem('finance-ui-v2', JSON.stringify(state)); } catch (_) {} }
-  function notify(message, error = false) {
+  function notify(message, error = false, action = null) {
     clearTimeout(toastTimer); $('toast').textContent = message; $('toast').className = 'toast' + (error ? ' error' : ''); $('toast').hidden = false;
-    if (!error) toastTimer = setTimeout(() => { $('toast').hidden = true; }, 5000);
+    if (action) {
+      const button = document.createElement('button'); button.type = 'button'; button.textContent = action.label;
+      button.addEventListener('click', async () => { $('toast').hidden = true; try { await action.run(); } catch (failure) { notify(failure.message, true); } });
+      $('toast').append(' ', button);
+    }
+    if (!error) toastTimer = setTimeout(() => { $('toast').hidden = true; }, action ? 10000 : 5000);
   }
   function setOptions(select, values, first, selected) {
     select.innerHTML = (first === null ? '' : '<option value="">' + esc(first) + '</option>') + values.map(item => {
@@ -110,10 +115,11 @@ if (typeof document !== 'undefined') (() => {
     $('fileStatus').value = state.fileStatus; $('projectionStatusFilter').value = state.projectionStatus;
     $('requireReceipts').checked = state.requireReceipts;
     document.querySelectorAll('[data-column]').forEach(input => { input.checked = state.columns[input.dataset.column] !== false; $('transactionsBody').classList.toggle('hide-' + input.dataset.column, !input.checked); });
-    $('addProjection').hidden = !data.editable; $('addTransaction').hidden = !data.editable; $('refreshData').hidden = !data.editable;
+    $('addProjection').hidden = !data.editable; $('addTransaction').hidden = !data.editable; $('quickAddTransaction').hidden = !data.editable; $('refreshData').hidden = !data.editable;
     $('updatedAt').textContent = 'Datos al ' + data.generatedAt + (data.editable ? '' : ' · copia de consulta');
     $('storeNames').innerHTML = unique(data.transactions.map(row => row.store)).map(store => '<option value="' + esc(store) + '"></option>').join('');
-    const goalForm = $('goalForm'); if (goalForm && !goalForm.elements.walletId) goalForm.querySelector('button[type=submit]').insertAdjacentHTML('beforebegin', '<select name="walletId"><option value="">Sin cartera</option></select>'); if (goalForm?.elements.walletId) setOptions(goalForm.elements.walletId, (data.savings?.wallets || []).filter(wallet => wallet.active).map(wallet => [String(wallet.id), wallet.name]), 'Sin cartera');
+    const goalForm = $('goalForm'); if (goalForm && !goalForm.elements.walletId) goalForm.querySelector('button[type=submit]').insertAdjacentHTML('beforebegin', '<select name="walletId" aria-label="Cartera vinculada"><option value="">Sin cartera</option></select>'); if (goalForm?.elements.walletId) setOptions(goalForm.elements.walletId, (data.savings?.wallets || []).filter(wallet => wallet.active).map(wallet => [String(wallet.id), wallet.name]), 'Sin cartera');
+    if (!$('budgetForm').elements.month.value) $('budgetForm').elements.month.value = data.today.slice(0, 7);
     addPanelHelpButtons();
     showTab(state.tab, false);
   }
@@ -209,7 +215,20 @@ if (typeof document !== 'undefined') (() => {
     $('ticketCoverage').textContent = expenses.length ? Math.round(justified.length / expenses.length * 100) + '% · ' + justified.length + '/' + expenses.length + ' líneas' : 'Sin gastos';
     // Status is a separate files-view choice, not a hidden dashboard filter.
     const fileStatus = state.fileStatus; state.fileStatus = ''; const files = filteredFiles(); state.fileStatus = fileStatus;
-    $('pendingCount').textContent = files.filter(pending).length;
+    const pendingFiles = files.filter(pending).length;
+    $('pendingCount').textContent = pendingFiles;
+    $('quickPendingCount').textContent = pendingFiles ? '· ' + pendingFiles : '';
+    const forecast = data.projections.months.find(row => row.monthKey === state.month);
+    if (forecast) {
+      const estimate = projectionEstimate(forecast);
+      $('closingEstimate').textContent = money(estimate);
+      $('closingEstimate').className = estimate < 0 ? 'expense' : 'income';
+      $('closingEstimateMeta').textContent = 'Resultado registrado + cobros pendientes − pagos pendientes';
+    } else {
+      $('closingEstimate').textContent = 'Sin previsión disponible';
+      $('closingEstimate').className = '';
+      $('closingEstimateMeta').textContent = 'Añade cobros y pagos esperados en Proyección.';
+    }
     for (const kind of ['income', 'expense']) {
       const node = $(kind + 'Delta'); node.textContent = '';
       if (!state.month) continue;
@@ -236,6 +255,17 @@ if (typeof document !== 'undefined') (() => {
     const incomes = rows.filter(row => row.kind === 'income').sort((a, b) => b.createdAt.localeCompare(a.createdAt));
     $('incomeListTotal').textContent = money(total.income); $('incomeList').innerHTML = incomes.map(compactRow).join('') || empty('Sin ingresos registrados en este filtro.');
     drawDailyExpenseChart(expenses); drawCategoryChart(expenses);
+  }
+  function alertNotice(alert) {
+    // El aviso cita el movimiento concreto (#575); abrir ese y no el primero vinculado.
+    const cited = /#(\d+)/.exec(alert.text), id = cited ? cited[1] : alert.id;
+    return notice(alert.title, alert.text, 'warn', id ? '<button class="secondary" data-edit="' + id + '">Revisar movimiento</button>' : '<button class="secondary" data-review-projection="' + alert.projection + '">Revisar concepto</button>');
+  }
+  function alertsHtml(alerts) {
+    // Tres o mas avisos con el mismo mensaje se muestran como un grupo plegable.
+    const groups = new Map();
+    alerts.forEach(alert => { const key = alert.text.replace(/#\d+/g, '#'); if (!groups.has(key)) groups.set(key, []); groups.get(key).push(alert); });
+    return [...groups.values()].map(items => items.length < 3 ? items.map(alertNotice).join('') : '<details class="alert-group"><summary><strong>' + items.length + ' avisos</strong> · ' + esc(items[0].text.replace(/\s*#\d+/g, '')) + '</summary>' + items.map(alertNotice).join('') + '</details>').join('');
   }
   function notice(title, text, tone = '', action = '') { return '<div class="notice ' + tone + '"><strong>' + esc(title) + '</strong><p>' + esc(text) + '</p>' + action + '</div>'; }
   function compactRow(row) { return '<div class="compact-row"><div>' + avatar(row) + '<div><button data-edit="' + row.id + '">' + esc(row.description) + '</button><small>' + esc(row.date + ' · ' + row.user) + '</small></div></div><strong class="' + row.kind + '">' + (row.kind === 'expense' ? '−' : '+') + esc(money(row.amountCents)) + '</strong></div>'; }
@@ -297,7 +327,7 @@ if (typeof document !== 'undefined') (() => {
   }
   function movementRow(row) {
     const grouped = row.children?.length > 1;
-    const title = grouped ? (row.store || 'Compra / archivo') + ' · ' + row.children.length + ' líneas del filtro' : row.description;
+    const title = grouped ? (row.store || 'Compra / archivo') + ' · ' + row.children.length + (row.children.length === 1 ? ' producto' : ' productos') : row.description;
     const attachment = row.receipt ? '<button class="quiet" data-attachment="transactions:' + row.id + '">' + esc(row.fileAvailable ? 'Ver ' + row.attachmentType : 'Adjunto no disponible') + '</button>' : '<span>Sin adjunto</span>';
     const categories = grouped ? unique(row.children.map(r => r.category)).join(', ') : row.category;
     return '<article class="movement"><div class="movement-main">' + avatar(row) + '<time datetime="' + row.dateIso + '">' + esc(row.date) + '</time><div><div class="movement-title">' + esc(title) + '</div><div class="movement-meta"><span data-meta="category">' + esc(categories) + '</span><span data-meta="store">' + esc(row.store || 'Sin comercio') + '</span><span data-meta="user">' + esc(row.user) + '</span><span>' + (row.isFixed ? 'Fijo' : 'Variable') + '</span>' + attachment + (row.inferenceNotes.length ? '<span class="expense">Revisar clasificación</span>' : '') + '</div></div><div class="movement-amount ' + row.kind + '">' + (row.kind === 'expense' ? '−' : '+') + esc(money(row.amountCents)) + '</div>' + (!grouped ? '<button class="secondary" data-edit="' + row.id + '">' + (data.editable ? 'Editar' : 'Ver detalle') + '</button>' : '') + '</div>' + (grouped ? '<details><summary>Ver productos y editar líneas</summary>' + row.children.map(movementRow).join('') + '</details>' : '') + '</article>';
@@ -435,7 +465,7 @@ if (typeof document !== 'undefined') (() => {
     if (ending.length) recommendations.push(notice('Cuotas próximas a terminar', ending.map(row => row.name + ': ' + row.remainingLabel.toLowerCase()).join(' · ')));
     $('analyticsRecommendations').innerHTML = recommendations.join('');
     $('analyticsAiAlertsCount').textContent = alerts.length + ' avisos';
-    $('analyticsAiAlerts').innerHTML = alerts.map(alert => notice(alert.title, alert.text, 'warn', alert.id ? '<button class="secondary" data-edit="' + alert.id + '">Revisar movimiento</button>' : '<button class="secondary" data-review-projection="' + alert.projection + '">Revisar concepto</button>')).join('') || empty('Sin avisos de interpretación o conciliación en este mes.');
+    $('analyticsAiAlerts').innerHTML = alertsHtml(alerts) || empty('Sin avisos de interpretación o conciliación en este mes.');
     $('analyticsFutureBody').innerHTML = data.projections.months.filter(row => row.monthKey >= month).map(row => '<div class="compact-row"><div>' + esc(monthName(row.monthKey)) + '<small>Ingresos ' + esc(money(row.projectedIncomeCents)) + ' · gastos ' + esc(money(row.projectedExpenseCents)) + '</small></div><strong class="' + (row.projectedBalanceCents < 0 ? 'expense' : 'income') + '">' + esc(money(row.projectedBalanceCents)) + '</strong></div>').join('') || empty('Sin meses futuros proyectados.');
   }
   function renderReceipts() {
@@ -445,7 +475,8 @@ if (typeof document !== 'undefined') (() => {
       const rows = data.transactions.filter(row => row.receipt === file.path);
       const currentCaption = file.status === 'processed' ? (rows.length ? rows.length + (rows.length === 1 ? ' línea registrada · ' : ' líneas registradas · ') + money(sum(rows)) : 'Procesado · sin movimientos vinculados') : (file.caption || 'Archivo pendiente de revisión');
       const visual = file.attachmentType === 'imagen' && file.fileAvailable ? '<img loading="lazy" src="' + esc(file.url) + '" alt="Miniatura del archivo #' + file.id + '">' : '<div class="file-thumb" aria-hidden="true">' + (file.attachmentType === 'audio' ? 'AUDIO' : 'DOC') + '</div>';
-      return '<article class="file-card">' + visual + '<h3>' + esc(currentCaption) + '</h3><span class="status-chip ' + (file.status === 'processed' ? 'completed' : 'pending') + '">' + esc(file.fileAvailable ? labels[file.status] || file.status : 'Archivo no disponible') + '</span><p class="muted small">#' + file.id + ' · ' + esc(file.user + ' · recibido ' + file.date) + '</p><button class="secondary" data-attachment="receipts:' + file.id + '">Ver ' + esc(file.attachmentType) + '</button><button class="quiet" data-review="' + file.id + '">Revisar y confirmar</button>' + (rows.length ? '<details><summary>Movimientos vinculados (' + rows.length + ')</summary>' + rows.map(row => '<button class="quiet" data-edit="' + row.id + '">' + esc(row.description + ' · ' + money(row.amountCents)) + '</button>').join('') + '</details>' : '') + '<details><summary>Historial y ubicación</summary><p>' + esc(file.caption) + '</p><p>' + esc(file.reviewNotes) + '</p><code>' + esc(file.path) + '</code></details></article>';
+      const reviewAction = rows.length ? '' : '<button class="quiet" data-review="' + file.id + '">Revisar y confirmar</button>';
+      return '<article class="file-card">' + visual + '<h3>' + esc(currentCaption) + '</h3><span class="status-chip ' + (file.status === 'processed' ? 'completed' : 'pending') + '">' + esc(file.fileAvailable ? labels[file.status] || file.status : 'Archivo no disponible') + '</span><p class="muted small">#' + file.id + ' · ' + esc(file.user + ' · recibido ' + file.date) + '</p><button class="secondary" data-attachment="receipts:' + file.id + '">Ver ' + esc(file.attachmentType) + '</button>' + reviewAction + (rows.length ? '<details><summary>Movimientos vinculados (' + rows.length + ')</summary>' + rows.map(row => '<button class="quiet" data-edit="' + row.id + '">' + esc(row.description + ' · ' + money(row.amountCents)) + '</button>').join('') + '</details>' : '') + '<details><summary>Historial y ubicación</summary><p>' + esc(file.caption) + '</p><p>' + esc(file.reviewNotes) + '</p><code>' + esc(file.path) + '</code></details></article>';
     }).join('') || empty('No hay archivos para estos filtros.');
     $('moreFiles').hidden = files.length <= state.filesShown;
   }
@@ -473,11 +504,23 @@ if (typeof document !== 'undefined') (() => {
     $('savingsSummary').innerHTML = metric('Dinero estimado al terminar', finalAmount, deficit ? 'Te faltaría ' + money(-finalAmount) : 'Saldo incluido + ahorro previsto') + metric('Ahorro nuevo del periodo', generated, 'Ingresos pendientes − gastos pendientes − reserva') + metric('Saldo actual incluido', currentIncluded, savings.includeCurrentBalance ? 'Actualizado ' + (savings.currentBalanceDate || 'sin fecha') : 'No incluido') + metric('Carteras incluidas', walletsTotal, wallets.filter(wallet => wallet.includeInProjection).length + ' cartera(s) seleccionada(s)');
     $('savingsSettingsForm').elements.currentBalance.value = (savings.currentBalanceCents / 100).toFixed(2).replace('.', ','); $('savingsSettingsForm').elements.currentBalanceDate.value = savings.currentBalanceDate || data.today; $('savingsSettingsForm').elements.includeCurrentBalance.checked = savings.includeCurrentBalance; $('savingsSettingsForm').elements.emergencyMonthly.value = (savings.emergencyMonthlyCents / 100).toFixed(2).replace('.', ',');
     $('walletsBody').innerHTML = wallets.map(wallet => '<div class="compact-row"><div><strong>' + esc(wallet.name) + '</strong><small>' + (wallet.includeInProjection ? 'Incluida en el total' : 'Solo informativa') + '</small></div><span>' + esc(money(wallet.balanceCents)) + '</span><button class="quiet" data-edit-wallet="' + wallet.id + '">Editar</button><button class="quiet" data-archive-wallet="' + wallet.id + '">Archivar</button></div>').join('') || empty('Todavía no tienes carteras.');
-    $('savingsChart').innerHTML = '<p class="savings-period-note">Del ' + esc(monthName(start)) + ' al ' + esc(monthName(end)) + '. En el mes actual se usan solo cobros y pagos pendientes; después, las previsiones completas.</p>' + (rows.length ? '<div class="chart-bars">' + rows.map(row => '<div class="chart-bar"><span style="height:' + Math.max(4, Math.min(100, Math.abs(row.accumulated) / Math.max(1, Math.abs(finalAmount || 1)) * 100)) + '%" class="' + (row.accumulated < 0 ? 'expense' : 'income') + '"></span><small>' + esc(shortMonth(row.monthKey)) + '</small></div>').join('') + '</div>' : empty('No hay previsiones hasta ese mes.'));
+    $('savingsChart').innerHTML = '<p class="savings-period-note">Del ' + esc(monthName(start)) + ' al ' + esc(monthName(end)) + '. En el mes actual se usan solo cobros y pagos pendientes; después, las previsiones completas.</p>' + savingsLineChart(rows);
     $('savingsTable').className = 'savings-table'; $('savingsTable').innerHTML = rows.length ? '<table><thead><tr><th>Mes</th><th>Ingresos</th><th>Gastos</th><th>Reserva</th><th>Resultado</th><th>Acumulado</th></tr></thead><tbody>' + rows.map(row => '<tr><td>' + esc(monthName(row.monthKey)) + '</td><td>' + esc(money(row.income)) + '</td><td>' + esc(money(row.expense)) + '</td><td>' + esc(money(row.reserve)) + '</td><td class="' + (row.result < 0 ? 'expense' : 'income') + '">' + esc(money(row.result)) + '</td><td>' + esc(money(row.accumulated)) + '</td></tr>').join('') + '</tbody></table>' : '';
-    $('goalsBody').innerHTML = (data.savingsGoals || []).map(goal => { const missing = Math.max(0, goal.targetCents - goal.currentCents); const reached = rows.find(row => row.accumulated >= missing); return '<p><strong>' + esc(goal.name) + '</strong> · faltan ' + esc(money(missing)) + (goal.targetDate ? ' · fecha ' + esc(goal.targetDate) : '') + (reached ? ' · se alcanzaría en ' + esc(monthName(reached.monthKey)) : '') + '</p>'; }).join('') || empty('Todavía no hay objetivos.');
+    $('goalsBody').innerHTML = (data.savingsGoals || []).map(goal => { const wallet = (savings.wallets || []).find(item => item.id === goal.walletId); const current = wallet ? wallet.balanceCents : goal.currentCents; const missing = Math.max(0, goal.targetCents - current); const reached = rows.find(row => row.accumulated >= missing); const percent = Math.min(100, Math.round(current / Math.max(1, goal.targetCents) * 100)); return '<div class="goal-card"><div class="goal-head"><div><strong>' + esc(goal.name) + '</strong><small>' + esc(wallet ? 'Cartera: ' + wallet.name : 'Progreso manual') + (goal.targetDate ? ' · objetivo ' + esc(goal.targetDate) : '') + '</small></div><strong>' + percent + '%</strong></div><div class="progress-track"><span style="width:' + percent + '%"></span></div><div class="progress-meta"><span>' + esc(money(current)) + ' de ' + esc(money(goal.targetCents)) + '</span><span>' + (missing ? 'Faltan ' + esc(money(missing)) : 'Objetivo alcanzado') + (reached && missing ? ' · posible en ' + esc(shortMonth(reached.monthKey)) : '') + '</span></div></div>'; }).join('') || empty('Todavía no hay objetivos.');
     $('accountsBody').innerHTML = (data.accounts || []).map(account => '<article class="file-card"><h3>' + esc(account.name) + '</h3><p class="muted small">' + esc(account.type) + '</p><strong>' + esc(money(account.balanceCents)) + '</strong></article>').join('') || empty('Añade tu primera cuenta.');
-    $('budgetsBody').innerHTML = (data.budgets || []).map(budget => '<p><strong>' + esc(budget.month) + '</strong> · ' + esc(budget.category) + ' · ' + esc(money(budget.amountCents)) + '</p>').join('') || empty('Todavía no hay presupuestos.');
+    $('budgetsBody').innerHTML = (data.budgets || []).map(budget => { const spent = data.transactions.filter(row => row.monthKey === budget.month && row.kind === 'expense' && row.category === budget.category).reduce((total, row) => total + row.amountCents, 0); const percent = Math.round(spent / Math.max(1, budget.amountCents) * 100); const remaining = budget.amountCents - spent; return '<div class="budget-card"><div class="budget-head"><div><strong>' + esc(budget.category) + '</strong><small>' + esc(monthName(budget.month)) + '</small></div><strong>' + percent + '%</strong></div><div class="progress-track ' + (remaining < 0 ? 'over' : '') + '"><span style="width:' + Math.min(100, percent) + '%"></span></div><div class="progress-meta"><span>Gastado ' + esc(money(spent)) + ' de ' + esc(money(budget.amountCents)) + '</span><span class="' + (remaining < 0 ? 'expense' : '') + '">' + (remaining < 0 ? 'Exceso ' + esc(money(-remaining)) : 'Disponible ' + esc(money(remaining))) + '</span></div></div>'; }).join('') || empty('Todavía no hay presupuestos.');
+  }
+  function savingsLineChart(rows) {
+    if (!rows.length) return empty('No hay previsiones hasta ese mes.');
+    const width = Math.max(620, rows.length * 92), height = 235, left = 64, right = 24, top = 28, bottom = 42;
+    const values = rows.map(row => row.accumulated), min = Math.min(0, ...values), max = Math.max(0, ...values), range = Math.max(1, max - min);
+    const x = index => rows.length === 1 ? width / 2 : left + index * (width - left - right) / (rows.length - 1);
+    const y = value => top + (max - value) / range * (height - top - bottom);
+    const points = rows.map((row, index) => x(index).toFixed(1) + ',' + y(row.accumulated).toFixed(1)).join(' ');
+    const ticks = [max, max - range / 2, min].map(value => '<g><line class="grid-line" x1="' + left + '" x2="' + (width - right) + '" y1="' + y(value).toFixed(1) + '" y2="' + y(value).toFixed(1) + '"/><text class="axis-text" x="' + (left - 8) + '" y="' + (y(value) + 4).toFixed(1) + '" text-anchor="end">' + esc(money(Math.round(value))) + '</text></g>').join('');
+    const zero = min < 0 && max > 0 ? '<line x1="' + left + '" x2="' + (width - right) + '" y1="' + y(0).toFixed(1) + '" y2="' + y(0).toFixed(1) + '" stroke="var(--danger)" stroke-width="1.5" stroke-dasharray="5 5"/>' : '';
+    const dots = rows.map((row, index) => '<g><circle cx="' + x(index).toFixed(1) + '" cy="' + y(row.accumulated).toFixed(1) + '" r="5" fill="var(--surface)" stroke="' + (row.accumulated < 0 ? 'var(--danger)' : 'var(--accent)') + '" stroke-width="3"><title>' + esc(monthName(row.monthKey) + ': ' + money(row.accumulated)) + '</title></circle><text class="axis-text" x="' + x(index).toFixed(1) + '" y="' + (height - 14) + '" text-anchor="middle">' + esc(shortMonth(row.monthKey)) + '</text></g>').join('');
+    return '<div class="savings-line-chart-scroll"><div class="savings-line-chart"><svg viewBox="0 0 ' + width + ' ' + height + '" role="img" aria-label="Evolución del dinero estimado, termina en ' + esc(money(values.at(-1))) + '">' + ticks + zero + '<polyline points="' + points + '" fill="none" stroke="var(--accent)" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/>' + dots + '</svg></div></div>';
   }
   function formSnapshot(form) { return JSON.stringify([...new FormData(form).entries()]); }
   function openDialog(id) { focusOrigins.set(id, document.activeElement); const dialog = $(id); dialog.showModal(); const form = dialog.querySelector('form'); if (form) snapshots.set(id, formSnapshot(form)); }
@@ -516,6 +559,23 @@ if (typeof document !== 'undefined') (() => {
     setOptions(form.elements.accountId, (data.accounts || []).map(account => [String(account.id), account.name + ' · ' + money(account.balanceCents)]), 'Sin cuenta');
     fillForm(form, { date: data.today, amount: '', description: '', category: data.categories[0], kind: 'expense', store: '', isFixed: 'false' });
     $('newTransactionError').hidden = true; openDialog('newTransactionModal');
+  }
+  function openWalletModal(wallet = null) {
+    if (!data.editable) return;
+    const form = $('walletForm');
+    fillForm(form, { id: wallet?.id || '', name: wallet?.name || '', balance: wallet ? (wallet.balanceCents / 100).toFixed(2).replace('.', ',') : '0', includeInProjection: wallet ? wallet.includeInProjection : true });
+    $('walletTitle').textContent = wallet ? 'Editar cartera' : 'Añadir cartera';
+    $('walletError').hidden = true; openDialog('walletModal');
+  }
+  async function submitWallet(event) {
+    event.preventDefault(); if (busy) return;
+    const form = event.target, payload = Object.fromEntries(new FormData(form));
+    payload.includeInProjection = form.elements.includeInProjection.checked;
+    const error = $('walletError'); error.hidden = true; busy = true;
+    const submit = form.querySelector('[type=submit]'), label = submit.textContent; submit.disabled = true; submit.textContent = 'Guardando…';
+    try { await mutate('/api/savings-wallets', payload); closeDialog('walletModal', true); await refreshData(); notify(payload.id ? 'Cartera actualizada.' : 'Cartera creada.'); }
+    catch (exception) { error.textContent = exception.message; error.hidden = false; }
+    finally { busy = false; submit.disabled = false; submit.textContent = label; }
   }
   function openTransferModal() {
     if (!data.editable) return;
@@ -603,28 +663,48 @@ if (typeof document !== 'undefined') (() => {
   function addReceiptReviewLine(values = {}) {
     const index = $('receiptReviewRows').children.length;
     const row = document.createElement('div'); row.className = 'form-grid receipt-review-line';
-    row.innerHTML = '<label class="full">Descripción<input name="description-' + index + '" required></label><label>Importe (€)<input name="amount-' + index + '" inputmode="decimal" required></label><label>Categoría<select name="category-' + index + '" required>' + data.categories.map(category => '<option>' + esc(category) + '</option>').join('') + '</select></label><label>Fecha<input name="date-' + index + '" type="date" required></label><button type="button" class="quiet" data-remove-line>Quitar línea</button>';
-    $('receiptReviewRows').appendChild(row); row.querySelector('[name^="description-"]').value = values.description || ''; row.querySelector('[name^="amount-"]').value = values.amount || (values.amountCents ? (values.amountCents / 100).toFixed(2).replace('.', ',') : ''); row.querySelector('[name^="category-"]').value = values.category || data.categories[0]; row.querySelector('[name^="date-"]').value = values.dateIso || values.date || data.today;
+    row.innerHTML = '<label class="full">Descripción<input name="description-' + index + '" required></label><label>Importe (€)<input name="amount-' + index + '" inputmode="decimal" required></label><label>Categoría<select name="category-' + index + '" required>' + data.categories.map(category => '<option>' + esc(category) + '</option>').join('') + '</select></label><label>Fecha<input name="date-' + index + '" type="date" required></label><label>Comercio<input name="store-' + index + '" list="storeNames"></label><button type="button" class="quiet" data-remove-line>Quitar línea</button>';
+    $('receiptReviewRows').appendChild(row); row.querySelector('[name^="description-"]').value = values.description || ''; row.querySelector('[name^="amount-"]').value = values.amount || (values.amountCents ? (values.amountCents / 100).toFixed(2).replace('.', ',') : ''); row.querySelector('[name^="category-"]').value = values.category || data.categories[0]; row.querySelector('[name^="date-"]').value = values.dateIso || values.date || $('receiptReviewForm').dataset.receiptDate || data.today; row.querySelector('[name^="store-"]').value = values.store || '';
+    updateReceiptReviewSum();
+  }
+  function receiptAmount(value) { const number = Number(String(value || '').trim().replace(/\s/g, '').replace(',', '.')); return Number.isFinite(number) ? Math.round(number * 100) : 0; }
+  function updateReceiptReviewSum() {
+    const form = $('receiptReviewForm');
+    const sumCents = [...$('receiptReviewRows').querySelectorAll('[name^="amount-"]')].reduce((total, input) => total + receiptAmount(input.value), 0);
+    const expectedRaw = form.elements.expectedTotal.value; const expected = receiptAmount(expectedRaw);
+    const node = $('receiptReviewSum'); node.className = 'receipt-review-sum';
+    if (!expectedRaw.trim()) node.textContent = 'Suma de las líneas: ' + money(sumCents) + ' · Escribe el total del justificante para comprobarla.';
+    else if (sumCents === expected) { node.classList.add('match'); node.textContent = 'Cuadra: las líneas suman ' + money(sumCents) + '.'; }
+    else { node.classList.add('mismatch'); node.textContent = 'Faltan ' + money(Math.abs(expected - sumCents)) + (sumCents > expected ? ' por quitar.' : ' por asignar.') + ' Líneas: ' + money(sumCents) + ' · ticket: ' + money(expected) + '.'; }
   }
   function openReceiptReview(id) {
     if (!data.editable) return;
     const file = data.receipts.find(row => row.id === Number(id)); if (!file) return;
     const linked = data.transactions.filter(row => row.receiptId === Number(id));
-    $('receiptReviewForm').elements.receiptId.value = id; $('receiptReviewRows').innerHTML = '';
+    const form = $('receiptReviewForm'); form.reset(); form.elements.receiptId.value = id; form.dataset.receiptDate = file.dateIso || data.today; $('receiptReviewRows').innerHTML = '';
+    $('receiptReviewTitle').textContent = 'Revisar ticket #' + id;
+    $('receiptReviewMeta').textContent = file.user + ' · recibido ' + file.date + (file.caption ? ' · ' + file.caption : '');
+    let preview = notice('Vista previa no disponible', 'Puedes abrir el archivo en otra pestaña para comprobarlo.', 'warn');
+    if (!file.fileAvailable) preview = notice('Archivo no disponible', 'Comprueba la carpeta del justificante y actualiza los datos.', 'warn');
+    else if (file.attachmentType === 'imagen') preview = '<img src="' + esc(file.url) + '" alt="Ticket #' + id + '">';
+    else if (file.attachmentType === 'audio') preview = '<audio controls src="' + esc(file.url) + '"></audio>';
+    else if ((file.path || '').toLowerCase().endsWith('.pdf')) preview = '<iframe title="Ticket #' + id + '" src="' + esc(file.url) + '"></iframe>';
+    $('receiptReviewPreview').innerHTML = preview;
     (linked.length ? linked : [{}]).forEach(row => addReceiptReviewLine(row));
-    $('receiptReviewError').hidden = true; openDialog('receiptReviewModal');
+    if (linked.length) form.elements.expectedTotal.value = (sum(linked) / 100).toFixed(2).replace('.', ',');
+    updateReceiptReviewSum(); $('receiptReviewError').hidden = true; openDialog('receiptReviewModal');
   }
   async function submitReceiptReview(event) {
     event.preventDefault(); if (busy) return;
-    const form = event.target, entries = [...$('receiptReviewRows').children].map(row => ({ description: row.querySelector('[name^="description-"]').value, amount: row.querySelector('[name^="amount-"]').value, category: row.querySelector('[name^="category-"]').value, date: row.querySelector('[name^="date-"]').value, kind: 'expense' }));
+    const form = event.target, entries = [...$('receiptReviewRows').children].map(row => ({ description: row.querySelector('[name^="description-"]').value, amount: row.querySelector('[name^="amount-"]').value, category: row.querySelector('[name^="category-"]').value, date: row.querySelector('[name^="date-"]').value, store: row.querySelector('[name^="store-"]').value, kind: 'expense' }));
     const error = $('receiptReviewError'); busy = true; error.hidden = true;
-    try { await mutate('/api/receipts/' + form.elements.receiptId.value + '/review', { entries }); closeDialog('receiptReviewModal', true); await refreshData(); notify('Ticket confirmado y movimientos registrados.'); }
+    try { await mutate('/api/receipts/' + form.elements.receiptId.value + '/review', { entries, expectedTotal: form.elements.expectedTotal.value }); closeDialog('receiptReviewModal', true); await refreshData(); notify('Ticket confirmado y movimientos registrados.'); }
     catch (exception) { error.textContent = exception.message; error.hidden = false; }
     finally { busy = false; }
   }
   async function refreshRuntimeStatus() {
     if (!$('runtimeStatus')) return;
-    try { const response = await fetch('/api/status', { cache: 'no-store' }); if (!response.ok) throw new Error(); const status = await response.json(); $('runtimeText').textContent = (status.bot.running === true ? 'Bot activo' : status.bot.running === false ? 'Bot detenido' : 'Bot: estado no confirmado') + ' · Panel conectado · ' + status.pendingCount + ' archivos pendientes en total'; }
+    try { const response = await fetch('/api/status', { cache: 'no-store' }); if (!response.ok) throw new Error(); const status = await response.json(); const backup = status.lastBackupAt ? ' · copia verificada ' + new Date(status.lastBackupAt).toLocaleDateString('es-ES') : ' · sin copia verificada'; $('runtimeText').textContent = (status.bot.running === true ? 'Bot activo' : status.bot.running === false ? 'Bot detenido' : 'Bot: estado no confirmado') + ' · Panel conectado · ' + status.pendingCount + ' archivos pendientes' + backup; }
     catch (_) { $('runtimeText').textContent = 'Sin conexión con el panel. Los datos visibles pueden estar desactualizados.'; }
   }
   Object.entries(filterIds).forEach(([key, id]) => $(id).addEventListener('input', () => { state[key] = $(id).value; state.page = 1; state.filesShown = 24; render(); saveState(); }));
@@ -643,8 +723,8 @@ if (typeof document !== 'undefined') (() => {
   document.addEventListener('change', event => { if (event.target.id === 'savingsStartMonth') { const min = data.today.slice(0, 7), max = addMonths(min, 35); state.savingsStartMonth = event.target.value || min; if (state.savingsStartMonth < min) state.savingsStartMonth = min; if (state.savingsStartMonth > max) state.savingsStartMonth = max; if (state.savingsEndMonth < state.savingsStartMonth) state.savingsEndMonth = state.savingsStartMonth; $('savingsStartMonth').value = state.savingsStartMonth; $('savingsEndMonth').value = state.savingsEndMonth; renderSavings(); saveState(); } });
   document.querySelectorAll('[data-savings-range]').forEach(button => button.addEventListener('click', () => { state.savingsEndMonth = addMonths(state.savingsStartMonth || data.today.slice(0, 7), Number(button.dataset.savingsRange) - 1); $('savingsEndMonth').value = state.savingsEndMonth; renderSavings(); saveState(); }));
   $('savingsSettingsForm').addEventListener('submit', async event => { event.preventDefault(); const payload = Object.fromEntries(new FormData(event.target)); payload.includeCurrentBalance = event.target.elements.includeCurrentBalance.checked; try { await mutate('/api/savings-settings', payload); await refreshData(); notify('Ajustes de ahorro guardados.'); } catch (error) { notify(error.message, true); } });
-  $('addWallet').addEventListener('click', async () => { const name = window.prompt('Nombre de la cartera, por ejemplo Emergencias'); if (!name) return; const balance = window.prompt('Saldo actual de esta cartera (€)', '0'); if (balance === null) return; try { await mutate('/api/savings-wallets', { name, balance, includeInProjection: true }); await refreshData(); notify('Cartera creada.'); } catch (error) { notify(error.message, true); } });
-  document.addEventListener('click', event => { const edit = event.target.closest('[data-edit-wallet]'); if (edit) { const wallet = (data.savings?.wallets || []).find(item => item.id === Number(edit.dataset.editWallet)); if (!wallet) return; const name = window.prompt('Nombre de la cartera', wallet.name); if (!name) return; const balance = window.prompt('Saldo actual (€)', (wallet.balanceCents / 100).toFixed(2).replace('.', ',')); if (balance === null) return; const include = window.confirm('¿Incluir esta cartera en el total estimado?'); mutate('/api/savings-wallets', { id: wallet.id, name, balance, includeInProjection: include }).then(refreshData).then(() => notify('Cartera actualizada.')).catch(error => notify(error.message, true)); return; } const archive = event.target.closest('[data-archive-wallet]'); if (archive && confirm('¿Archivar esta cartera? Se conservará su historial.')) mutate('/api/savings-wallets', { id: archive.dataset.archiveWallet, archive: true }).then(refreshData).then(() => notify('Cartera archivada.')).catch(error => notify(error.message, true)); });
+  $('addWallet').addEventListener('click', () => openWalletModal());
+  document.addEventListener('click', event => { const edit = event.target.closest('[data-edit-wallet]'); if (edit) { const wallet = (data.savings?.wallets || []).find(item => item.id === Number(edit.dataset.editWallet)); if (wallet) openWalletModal(wallet); return; } const archive = event.target.closest('[data-archive-wallet]'); if (archive && confirm('¿Archivar esta cartera? Se conservará su historial.')) mutate('/api/savings-wallets', { id: archive.dataset.archiveWallet, archive: true }).then(refreshData).then(() => notify('Cartera archivada.')).catch(error => notify(error.message, true)); });
   $('savingsSimulator').addEventListener('submit', event => { event.preventDefault(); const payload = Object.fromEntries(new FormData(event.target)); const months = Math.max(1, [...document.querySelectorAll('#savingsTable tbody tr')].length); const amount = Math.round(Number(String(payload.amount).replace(',', '.')) * 100); const delta = payload.kind === 'expense' ? -amount * (payload.frequency === 'monthly' ? months : 1) : amount * (payload.frequency === 'monthly' ? months : 1); const base = Number($('savingsPanel').dataset.savingsFinal || 0); $('simulatorResult').textContent = 'Escenario simulado: ' + money(delta) + '. El resultado final cambiaría de ' + money(base) + ' a aproximadamente ' + money(base + delta) + '. No se ha guardado ningún movimiento.'; });
   const transferButton = document.createElement('button'); transferButton.type = 'button'; transferButton.className = 'secondary'; transferButton.textContent = 'Transferir'; $('addAccount').after(transferButton);
   transferButton.addEventListener('click', openTransferModal);
@@ -652,8 +732,20 @@ if (typeof document !== 'undefined') (() => {
   setOptions($('budgetForm').elements.category, data.categories, null);
   $('budgetForm').addEventListener('submit', async event => { event.preventDefault(); const payload = Object.fromEntries(new FormData(event.target)); try { await mutate('/api/budgets', payload); event.target.reset(); await refreshData(); notify('Presupuesto guardado.'); } catch (error) { notify(error.message, true); } });
   $('goalForm').addEventListener('submit', async event => { event.preventDefault(); const payload = Object.fromEntries(new FormData(event.target)); try { await mutate('/api/savings-goals', payload); event.target.reset(); await refreshData(); notify('Objetivo creado.'); } catch (error) { notify(error.message, true); } });
-  $('editForm').addEventListener('submit', event => submitForm(event, false)); $('projectionForm').addEventListener('submit', event => submitForm(event, true)); $('newTransactionForm').addEventListener('submit', submitNewTransaction);
+  $('deleteTransaction').addEventListener('click', async () => {
+    const id = $('editForm').elements.id.value, row = data.transactions.find(item => String(item.id) === id);
+    if (!row || busy) return;
+    if (!confirm('¿Eliminar «' + row.description + '» (' + money(row.amountCents) + ')?\nPodrás deshacerlo justo después.')) return;
+    busy = true;
+    try {
+      await mutate('/api/transactions/' + id, {}, 'DELETE'); closeDialog('editModal', true); await refreshData();
+      notify('Movimiento eliminado.', false, { label: 'Deshacer', run: async () => { await mutate('/api/transactions/' + id + '/restore', {}); await refreshData(); notify('Movimiento restaurado.'); } });
+    } catch (failure) { notify(failure.message, true); }
+    finally { busy = false; }
+  });
+  $('editForm').addEventListener('submit', event => submitForm(event, false)); $('projectionForm').addEventListener('submit', event => submitForm(event, true)); $('newTransactionForm').addEventListener('submit', submitNewTransaction); $('walletForm').addEventListener('submit', submitWallet);
   $('receiptReviewForm').addEventListener('submit', submitReceiptReview); $('addReceiptLine').addEventListener('click', () => addReceiptReviewLine());
+  $('receiptReviewForm').addEventListener('input', updateReceiptReviewSum);
   $('projectionForm').elements.duration.addEventListener('change', updateDurationFields);
   for (const name of ['date', 'kind']) $('editForm').elements[name].addEventListener('change', () => projectionOptions($('editForm'), $('editForm').elements.projectionTemplateId.value));
   document.querySelectorAll('dialog').forEach(dialog => {
@@ -664,7 +756,7 @@ if (typeof document !== 'undefined') (() => {
     const monthStep = event.target.closest('[data-month-step]'); if (monthStep) { const [key, delta] = monthStep.dataset.monthStep.split(':'); stepMonth(key, Number(delta)); return; }
     const helpButton = event.target.closest('[data-help]'); if (helpButton) { const help = window.financeHelp?.[helpButton.dataset.help]; if (help) { $('helpTitle').textContent = help.title; $('helpWhat').textContent = help.what; $('helpSteps').innerHTML = help.steps.map(step => '<li>' + esc(step) + '</li>').join(''); $('helpExample').textContent = help.example; openDialog('helpModal'); } return; }
     const review = event.target.closest('[data-review]'); if (review) { openReceiptReview(review.dataset.review); return; }
-    const removeLine = event.target.closest('[data-remove-line]'); if (removeLine) { removeLine.closest('.receipt-review-line')?.remove(); return; }
+    const removeLine = event.target.closest('[data-remove-line]'); if (removeLine) { removeLine.closest('.receipt-review-line')?.remove(); updateReceiptReviewSum(); return; }
     const button = event.target.closest('button'); if (!button) return;
     if (button.dataset.tab) showTab(button.dataset.tab);
     if (button.dataset.go) { if (button.dataset.go === 'analytics' && state.month) { state.analyticsMonth = state.month; $('analyticsMonth').value = state.month; } showTab(button.dataset.go); }
@@ -678,6 +770,7 @@ if (typeof document !== 'undefined') (() => {
     if (button.dataset.attachment) openAttachment(button.dataset.attachment);
     if (button.dataset.undo) (async () => { try { await mutate('/api/transactions/' + button.dataset.undo + '/undo', {}); await refreshData(); notify('Último cambio deshecho.'); } catch (error) { notify(error.message, true); } })();
   });
+  $('quickAddTransaction').addEventListener('click', openNewTransactionModal);
   $('refreshData').addEventListener('click', async () => { $('refreshData').disabled = true; try { await refreshData(); notify('Datos actualizados.'); } catch (error) { notify(error.message, true); } finally { $('refreshData').disabled = false; } });
   $('themeToggle').addEventListener('click', () => {
     const theme = document.documentElement.dataset.theme === 'dark' ? 'light' : 'dark';

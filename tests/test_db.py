@@ -1,8 +1,10 @@
+import pytest
+
 from finance_bot.db import FinanceDatabase
 
 
 def test_projection_matching_requires_complete_meaningful_words(tmp_path):
-    db = FinanceDatabase(tmp_path / "finances.db", "Europe/Madrid")
+    db = FinanceDatabase(tmp_path / "finances.db", "Europe/Madrid", create=True)
     db.upsert_projection_template(kind="expense", name="Agua", default_amount_cents=2500, category="Suministros", start_month="2026-09")
     db.upsert_projection_template(kind="expense", name="Cu", default_amount_cents=1500, category="Deudas", start_month="2026-09")
     db.upsert_projection_template(kind="expense", name="Google", default_amount_cents=1200, category="Suscripciones", start_month="2026-09")
@@ -12,7 +14,7 @@ def test_projection_matching_requires_complete_meaningful_words(tmp_path):
 
 
 def test_pending_statuses_include_dudoso(tmp_path) -> None:
-    db = FinanceDatabase(tmp_path / "finances.db", "Europe/Madrid")
+    db = FinanceDatabase(tmp_path / "finances.db", "Europe/Madrid", create=True)
 
     receipt_id = db.add_receipt(
         local_path="ticket.pdf",
@@ -28,7 +30,7 @@ def test_pending_statuses_include_dudoso(tmp_path) -> None:
 
 
 def test_pending_statuses_include_missing(tmp_path) -> None:
-    db = FinanceDatabase(tmp_path / "finances.db", "Europe/Madrid")
+    db = FinanceDatabase(tmp_path / "finances.db", "Europe/Madrid", create=True)
 
     receipt_id = db.add_receipt(
         local_path="ticket.pdf",
@@ -44,7 +46,7 @@ def test_pending_statuses_include_missing(tmp_path) -> None:
 
 
 def test_find_possible_duplicate(tmp_path) -> None:
-    db = FinanceDatabase(tmp_path / "finances.db", "Europe/Madrid")
+    db = FinanceDatabase(tmp_path / "finances.db", "Europe/Madrid", create=True)
     created_at = "2026-06-01T12:00:00+02:00"
     transaction_id = db.add_manual_transaction(
         kind="expense",
@@ -69,7 +71,7 @@ def test_find_possible_duplicate(tmp_path) -> None:
 
 
 def test_update_transaction(tmp_path) -> None:
-    db = FinanceDatabase(tmp_path / "finances.db", "Europe/Madrid")
+    db = FinanceDatabase(tmp_path / "finances.db", "Europe/Madrid", create=True)
     transaction_id = db.add_manual_transaction(
         kind="expense",
         amount_cents=999,
@@ -102,7 +104,7 @@ def test_update_transaction(tmp_path) -> None:
 
 
 def test_projection_plan_roundtrip(tmp_path) -> None:
-    db = FinanceDatabase(tmp_path / "finances.db", "Europe/Madrid")
+    db = FinanceDatabase(tmp_path / "finances.db", "Europe/Madrid", create=True)
     template_id = db.upsert_projection_template(
         kind="expense",
         name="Alquiler",
@@ -132,7 +134,7 @@ def test_projection_plan_roundtrip(tmp_path) -> None:
 
 
 def test_update_projection_template_clears_installments(tmp_path) -> None:
-    db = FinanceDatabase(tmp_path / "finances.db", "Europe/Madrid")
+    db = FinanceDatabase(tmp_path / "finances.db", "Europe/Madrid", create=True)
     template_id = db.upsert_projection_template(
         kind="expense",
         name="Pago silla",
@@ -155,7 +157,7 @@ def test_update_projection_template_clears_installments(tmp_path) -> None:
 
 
 def test_expense_transaction_marks_matching_projection_completed(tmp_path) -> None:
-    db = FinanceDatabase(tmp_path / "finances.db", "Europe/Madrid")
+    db = FinanceDatabase(tmp_path / "finances.db", "Europe/Madrid", create=True)
     template_id = db.upsert_projection_template(
         kind="expense",
         name="hosting sered",
@@ -184,7 +186,7 @@ def test_expense_transaction_marks_matching_projection_completed(tmp_path) -> No
 
 
 def test_income_transaction_marks_matching_projection_completed(tmp_path) -> None:
-    db = FinanceDatabase(tmp_path / "finances.db", "Europe/Madrid")
+    db = FinanceDatabase(tmp_path / "finances.db", "Europe/Madrid", create=True)
     template_id = db.upsert_projection_template(
         kind="income",
         name="Sueldo cocina Ariel",
@@ -211,7 +213,7 @@ def test_income_transaction_marks_matching_projection_completed(tmp_path) -> Non
 
 
 def test_accounts_transfers_and_goals_are_separate_from_income_expense(tmp_path) -> None:
-    db = FinanceDatabase(tmp_path / "finances.db", "Europe/Madrid")
+    db = FinanceDatabase(tmp_path / "finances.db", "Europe/Madrid", create=True)
     bank = db.create_account("Banco", opening_balance_cents=10000)
     cash = db.create_account("Efectivo")
     db.add_transfer(from_account_id=bank, to_account_id=cash, amount_cents=2500)
@@ -224,9 +226,124 @@ def test_accounts_transfers_and_goals_are_separate_from_income_expense(tmp_path)
 
 
 def test_receipt_registration_is_atomic_and_marks_processed(tmp_path) -> None:
-    db = FinanceDatabase(tmp_path / "finances.db", "Europe/Madrid")
+    db = FinanceDatabase(tmp_path / "finances.db", "Europe/Madrid", create=True)
     receipt_id = db.add_receipt(local_path="ticket.jpg", drive_file_id=None, drive_url=None, telegram_message_id=None, caption="Ticket", status="pending")
     ids = db.register_receipt_entries(receipt_id, [{"kind": "expense", "amount_cents": 1200, "category": "Ocio", "note": "Cafe"}])
     assert len(ids) == 1
     assert db.get_receipt(receipt_id)["status"] == "processed"
     assert db.get_transaction(ids[0])["receipt_id"] == receipt_id
+
+
+def test_delayed_telegram_messages_keep_their_send_date(tmp_path) -> None:
+    db = FinanceDatabase(tmp_path / "finances.db", "Europe/Madrid", create=True)
+
+    receipt_id = db.add_receipt(
+        local_path="ticket.jpg",
+        drive_file_id=None,
+        drive_url=None,
+        telegram_message_id=10,
+        caption=None,
+        telegram_user_id=1,
+        created_at="2026-08-31T23:50:00+02:00",
+    )
+
+    assert db.get_receipt(receipt_id)["created_at"] == "2026-08-31T23:50:00+02:00"
+
+
+def test_telegram_message_already_stored_detects_redelivered_messages(tmp_path) -> None:
+    from finance_bot.parser import parse_transactions
+
+    db = FinanceDatabase(tmp_path / "finances.db", "Europe/Madrid", create=True)
+    db.add_receipt(
+        local_path="ticket.jpg",
+        drive_file_id=None,
+        drive_url=None,
+        telegram_message_id=10,
+        caption=None,
+        telegram_user_id=1,
+    )
+    db.add_transaction(
+        parse_transactions("gasto 5 cafe")[0], telegram_message_id=11, telegram_user_id=1
+    )
+
+    assert db.telegram_message_already_stored(1, 10)
+    assert db.telegram_message_already_stored(1, 11)
+    assert not db.telegram_message_already_stored(1, 12)
+    assert not db.telegram_message_already_stored(2, 10)
+    assert not db.telegram_message_already_stored(None, 10)
+
+
+def test_multiline_telegram_message_is_saved_atomically(tmp_path, monkeypatch) -> None:
+    from finance_bot.parser import parse_transactions
+
+    db = FinanceDatabase(tmp_path / "finances.db", "Europe/Madrid", create=True)
+    parsed = parse_transactions("gasto 10 cafe\ngasto 20 cena")
+    original = db.add_transaction
+    calls = {"count": 0}
+
+    def fail_second(item, **metadata):
+        calls["count"] += 1
+        if calls["count"] == 2:
+            raise RuntimeError("fallo simulado")
+        return original(item, **metadata)
+
+    monkeypatch.setattr(db, "add_transaction", fail_second)
+    with pytest.raises(RuntimeError, match="fallo simulado"):
+        db.add_telegram_transactions(parsed, telegram_user_id=1, telegram_message_id=99)
+
+    assert db.list_transactions() == []
+    assert not db.telegram_message_already_stored(1, 99)
+
+    monkeypatch.setattr(db, "add_transaction", original)
+    assert len(db.add_telegram_transactions(parsed, telegram_user_id=1, telegram_message_id=99)) == 2
+    assert db.telegram_message_already_stored(1, 99)
+    assert db.add_telegram_transactions(parsed, telegram_user_id=1, telegram_message_id=99) == []
+
+
+def test_delete_transaction_can_be_restored_with_its_projection(tmp_path) -> None:
+    db = FinanceDatabase(tmp_path / "finances.db", "Europe/Madrid", create=True)
+    template = db.upsert_projection_template(
+        kind="expense", name="Internet", default_amount_cents=3000,
+        category="Suministros", start_month="2026-09",
+    )
+    transaction_id = db.add_manual_transaction(
+        kind="expense", amount_cents=3000, category="Suministros", note="Internet",
+        is_fixed=True, created_at="2026-09-05T12:00:00+02:00",
+    )
+    db.update_transaction(transaction_id, projection_template_id=template)
+    db.set_projection_occurrence(
+        template_id=template, month="2026-09", amount_cents=3000, status="completed", note="",
+    )
+    before = dict(db.get_transaction(transaction_id))
+
+    db.delete_transaction(transaction_id)
+
+    assert db.get_transaction(transaction_id) is None
+    assert db.get_projection_occurrence(template, "2026-09")["status"] == "pending"
+
+    restored = db.restore_deleted_transaction(transaction_id)
+
+    assert dict(restored) == before
+    assert db.get_projection_occurrence(template, "2026-09")["status"] == "completed"
+
+
+def test_delete_transaction_errors_are_explicit(tmp_path) -> None:
+    import pytest
+
+    db = FinanceDatabase(tmp_path / "finances.db", "Europe/Madrid", create=True)
+    transaction_id = db.add_manual_transaction(
+        kind="expense", amount_cents=500, category="Ocio", note="cine",
+        created_at="2026-09-05T12:00:00+02:00",
+    )
+
+    with pytest.raises(KeyError):
+        db.delete_transaction(999)
+    with pytest.raises(KeyError):
+        db.restore_deleted_transaction(999)  # nunca se borro
+    with pytest.raises(ValueError):
+        db.restore_deleted_transaction(transaction_id)  # sigue existiendo
+
+    db.delete_transaction(transaction_id)
+    db.restore_deleted_transaction(transaction_id)
+    with pytest.raises(ValueError):
+        db.restore_deleted_transaction(transaction_id)

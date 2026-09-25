@@ -16,7 +16,7 @@ def test_recover_missing_receipts_relinks_from_recovery_folder(tmp_path: Path) -
     recovery_dir = data_dir / "receipts-recovery"
     voice_dir = data_dir / "voices"
 
-    db = FinanceDatabase(db_path, "Europe/Madrid")
+    db = FinanceDatabase(db_path, "Europe/Madrid", create=True)
     missing_name = "ticket-20260713-132500-AQADHA5rG_qVqVJ-.jpg"
     receipt_id = db.add_receipt(
         local_path=str(Path(r"G:\Mi unidad\Finanzas - Tickets\2026-07 Julio") / missing_name),
@@ -40,6 +40,8 @@ def test_recover_missing_receipts_relinks_from_recovery_folder(tmp_path: Path) -
             "RECEIPTS_SYNC_DIR": str(receipt_dir),
             "VOICES_SYNC_DIR": str(voice_dir),
             "TIMEZONE": "Europe/Madrid",
+            # Fija la salida del script para no depender de la consola que lance pytest.
+            "PYTHONIOENCODING": "utf-8",
         }
     )
 
@@ -47,7 +49,10 @@ def test_recover_missing_receipts_relinks_from_recovery_folder(tmp_path: Path) -
         sys.executable,
         str(Path(__file__).resolve().parents[1] / "scripts" / "recover_missing_receipts.py"),
     ]
-    result = subprocess.run(command, capture_output=True, text=True, env=env, check=False)
+    # encoding explicito: los scripts escriben en UTF-8 aunque la consola sea cp1252.
+    result = subprocess.run(
+        command, capture_output=True, text=True, encoding="utf-8", env=env, check=False
+    )
 
     assert result.returncode == 0
     assert f"#{receipt_id} recuperado" in result.stdout

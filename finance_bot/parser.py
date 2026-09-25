@@ -661,6 +661,14 @@ def parse_transaction(text: str) -> ParsedTransaction | None:
         inference_notes.append(
             f"Categoria asumida como {category} por falta de palabras clave claras."
         )
+    elif kind == "income" and category not in INCOME_CATEGORIES:
+        # Una palabra clave de gasto ("ropa", "izhan"...) no convierte un cobro en
+        # gasto de esa categoria: el ingreso pasa a la categoria de ingresos por defecto.
+        inference_notes.append(
+            f"La palabra clave apuntaba a {category}, que es de gastos; "
+            f"el ingreso se asigno a {DEFAULT_INCOME_CATEGORY}."
+        )
+        category = DEFAULT_INCOME_CATEGORY
     if kind == "income" and normalized_note in {"sueldo", "nomina", "cobro", "ingreso"}:
         inference_notes.append(
             "No se pudo deducir a que ingreso concreto del mes corresponde este cobro."

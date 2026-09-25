@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import unicodedata
 from datetime import datetime
@@ -36,11 +37,10 @@ def _user_label(row, aliases: dict[int, str] | None = None) -> str:
 def _file_url(path_value: str | None) -> str:
     if not path_value:
         return ""
-    path = Path(path_value)
-    if not path.is_absolute():
-        path = Path.cwd() / path
     try:
-        return path.resolve().as_uri()
+        # abspath normaliza sin tocar el disco. resolve() consultaba cada archivo
+        # (lento en la unidad de Google Drive) y se llevaba ~70% del tiempo del panel.
+        return Path(os.path.abspath(path_value)).as_uri()
     except ValueError:
         return ""
 
@@ -155,6 +155,7 @@ def _receipt_payload(rows, aliases: dict[int, str]) -> list[dict[str, object]]:
                 "monthKey": created_at.strftime("%Y-%m"),
                 "date": format_date(created_at),
                 "status": row["status"],
+                "dateIso": created_at.strftime("%Y-%m-%d"),
                 "path": path,
                 "url": _file_url(path),
                 "caption": row["caption"] or "",
@@ -291,10 +292,19 @@ def _projection_payload(
             name_tokens = {token for token in re.findall(r"\w+", template_name_key) if len(token) >= 3}
             link_warnings = []
             for transaction in linked:
-                tokens = set(re.findall(r"\w+", _normalize_text(str(transaction["description"]) + " " + str(transaction["store"]))))
-                if transaction.get("reviewStatus") != "reviewed" and (transaction["kind"] != kind or transaction["category"] != category or not name_tokens.intersection(tokens)):
+                if transaction.get("reviewStatus") == "reviewed":
+                    continue
+                mismatched = transaction["kind"] != kind or transaction["category"] != category
+                # Un sobre por categoria (p. ej. Hogar y Alimentacion) recoge cualquier
+                # compra de esa categoria: "Fresa platano" no tiene por que nombrarlo.
+                if not tracks_actual_category and not mismatched:
+                    tokens = set(re.findall(r"\w+", _normalize_text(str(transaction["description"]) + " " + str(transaction["store"]))))
+                    mismatched = not name_tokens.intersection(tokens)
+                if mismatched:
                     link_warnings.append("Revisar vínculo con movimiento #" + str(transaction["id"]))
-            if linked and actual_linked != amount_cents:
+            # En un sobre, gastar distinto de lo presupuestado es lo normal (ya se
+            # muestra como "Gastado real / falta"), no una discrepancia a conciliar.
+            if linked and actual_linked != amount_cents and not tracks_actual_category:
                 link_warnings.append("El importe registrado difiere del previsto")
             if status == "completed" and not linked and not tracks_actual_category:
                 link_warnings.append("Marcado manualmente; sin movimiento vinculado")
@@ -380,6 +390,8 @@ def _projection_payload(
 
 
 def report_data(settings: Settings, *, editable: bool = False) -> dict:
+    from finance_bot.storage import inspect_database, read_backup_status
+    health = inspect_database(settings.sqlite_db_path)
     settings.ensure_core_dirs()
     db = FinanceDatabase(settings.sqlite_db_path, settings.timezone)
     transactions = _transaction_payload(db.list_transactions(), settings.telegram_user_aliases)
@@ -414,6 +426,7 @@ def report_data(settings: Settings, *, editable: bool = False) -> dict:
         "wallets": savings_wallets,
     }
     return {"transactions": transactions, "receipts": receipts, "projections": projections,
+            "dataHealth": {"lastRecordAt": health["lastRecordAt"], "lastBackupAt": read_backup_status(settings.data_dir).get("verifiedAt")},
             "accounts": accounts, "budgets": budgets, "savingsGoals": goals, "savings": savings,
             "generatedAt": now.strftime("%d/%m/%Y %H:%M"), "today": now.strftime("%Y-%m-%d"),
             "editable": editable, "categories": list(VALID_CATEGORIES)}

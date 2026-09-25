@@ -5,6 +5,8 @@ import json
 import re
 import sqlite3
 import unicodedata
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -24,6 +26,7 @@ from finance_bot.parser import (
     ParsedTransaction,
     VALID_CATEGORIES,
 )
+from finance_bot.storage import inspect_database
 
 
 REVIEW_QUEUE_STATUSES = ("nuevo", "pending", "voice_pending", "dudoso", "missing")
@@ -44,20 +47,59 @@ class StoredTransaction:
 
 
 class FinanceDatabase:
-    def __init__(self, db_path: Path, timezone: str) -> None:
+    def __init__(self, db_path: Path, timezone: str, *, create: bool = False) -> None:
         self.db_path = db_path
         self.timezone = ZoneInfo(timezone)
+        self._active_connection = ContextVar(f"finance_connection_{id(self)}", default=None)
+        if not create:
+            inspect_database(db_path)
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        self._allow_create = create
         self._init_schema()
 
-    def _connect(self) -> sqlite3.Connection:
-        connection = sqlite3.connect(self.db_path, timeout=10)
+    @contextmanager
+    def _connect(self):
+        active = self._active_connection.get()
+        if active is not None:
+            yield active
+            return
+        mode = "rwc" if self._allow_create else "rw"
+        connection = sqlite3.connect(self.db_path.resolve().as_uri() + "?mode=" + mode, uri=True, timeout=10)
         connection.row_factory = sqlite3.Row
-        connection.execute("PRAGMA journal_mode = WAL")
-        connection.execute("PRAGMA synchronous = NORMAL")
-        connection.execute("PRAGMA busy_timeout = 10000")
-        connection.execute("PRAGMA foreign_keys = ON")
-        return connection
+        try:
+            connection.execute("PRAGMA journal_mode = WAL")
+            connection.execute("PRAGMA synchronous = NORMAL")
+            connection.execute("PRAGMA busy_timeout = 10000")
+            connection.execute("PRAGMA foreign_keys = ON")
+            with connection:
+                yield connection
+        finally:
+            connection.close()
+
+    @contextmanager
+    def atomic(self):
+        if self._active_connection.get() is not None:
+            yield
+            return
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            token = self._active_connection.set(connection)
+            try:
+                yield
+            finally:
+                self._active_connection.reset(token)
+
+    def add_telegram_transactions(self, parsed_transactions, **metadata) -> list[int]:
+        """Acknowledge a message only when every line and projection was saved."""
+        with self.atomic():
+            if self.telegram_message_already_stored(metadata.get("telegram_user_id"), metadata.get("telegram_message_id")):
+                return []
+            ids = [self.add_transaction(parsed, **metadata) for parsed in parsed_transactions]
+            if ids and metadata.get("telegram_user_id") is not None and metadata.get("telegram_message_id") is not None:
+                with self._connect() as connection:
+                    connection.execute("INSERT INTO telegram_messages(user_id, message_id, processed_at) VALUES (?, ?, ?)",
+                                       (metadata["telegram_user_id"], metadata["telegram_message_id"], self._now()))
+            return ids
 
     def _now(self) -> str:
         return datetime.now(self.timezone).isoformat(timespec="seconds")
@@ -70,22 +112,116 @@ class FinanceDatabase:
             )
 
     def undo_last_transaction_change(self, transaction_id: int) -> sqlite3.Row:
-        with self._connect() as connection:
-            row = connection.execute(
-                "SELECT id, details FROM audit_log WHERE entity_type = 'transaction' AND entity_id = ? AND action = 'update' ORDER BY id DESC LIMIT 1",
+        with self.atomic(), self._connect() as connection:
+            history = connection.execute(
+                "SELECT id, action, details FROM audit_log WHERE entity_type='transaction' AND entity_id=? ORDER BY id DESC",
                 (transaction_id,),
-            ).fetchone()
+            ).fetchall()
+            undone = {json.loads(item["details"]).get("undid") for item in history if item["action"] == "undo"}
+            row = next((item for item in history if item["action"] == "update" and item["id"] not in undone), None)
             if row is None:
                 raise KeyError(f"No hay cambios que deshacer para el movimiento {transaction_id}")
+            current = self.get_transaction(transaction_id)
+            if current is None:
+                raise KeyError(f"No existe el movimiento {transaction_id}")
             payload = json.loads(row["details"])
             before = payload.get("before") or {}
-            columns = ["created_at", "kind", "amount_cents", "category", "note", "store", "is_fixed", "review_status", "inference_notes", "projection_template_id", "account_id", "due_date", "paid_amount_cents"]
+            if any(current[key] != value for key, value in payload.get("after", {}).items() if key in current.keys()):
+                raise ValueError("El movimiento cambió después de esta edición. Revisa sus datos antes de deshacer.")
+            columns = ["created_at", "kind", "amount_cents", "category", "note", "store", "is_fixed", "review_status",
+                       "inference_notes", "projection_template_id", "account_id", "due_date", "paid_amount_cents",
+                       "telegram_user_id", "telegram_username", "telegram_full_name", "receipt_id", "receipt_local_path",
+                       "receipt_drive_file_id", "receipt_drive_url"]
             available = [column for column in columns if column in before]
-            connection.execute("UPDATE transactions SET " + ", ".join(f"{column} = ?" for column in available) + " WHERE id = ?", tuple(before[column] for column in available) + (transaction_id,))
-            connection.execute("INSERT INTO audit_log(created_at, action, entity_type, entity_id, details) VALUES (?, 'undo', 'transaction', ?, ?)", (self._now(), transaction_id, json.dumps({"undid": row["id"]})))
-            restored = connection.execute("SELECT * FROM transactions WHERE id = ?", (transaction_id,)).fetchone()
-        if restored is None:
-            raise KeyError(f"No existe el movimiento {transaction_id}")
+            if not available:
+                raise ValueError("Esta edición antigua no conserva datos suficientes para deshacerla.")
+            for snapshot in payload.get("projections", []):
+                existing = self.get_projection_occurrence(snapshot["templateId"], snapshot["month"])
+                comparable = lambda item: {k: v for k, v in item.items() if k not in {"id", "updated_at"}} if item else None
+                if comparable(dict(existing) if existing else None) != comparable(snapshot["after"]):
+                    raise ValueError("Una proyección vinculada cambió después. Revísala antes de deshacer.")
+            connection.execute("UPDATE transactions SET " + ", ".join(f"{column} = ?" for column in available) + " WHERE id = ?",
+                               tuple(before[column] for column in available) + (transaction_id,))
+            if "projections" in payload:
+                for snapshot in payload["projections"]:
+                    saved = snapshot["before"]
+                    if saved is None:
+                        connection.execute("DELETE FROM projection_occurrences WHERE template_id=? AND month=?", (snapshot["templateId"], snapshot["month"]))
+                    else:
+                        self.set_projection_occurrence(template_id=saved["template_id"], month=saved["month"],
+                                                       amount_cents=saved["amount_cents"], status=saved["status"], note=saved["note"])
+            else:
+                # Old audit entries did not include projection snapshots.
+                for link, month in {(current["projection_template_id"], current["created_at"][:7]),
+                                    (before.get("projection_template_id"), str(before.get("created_at", ""))[:7])}:
+                    if link:
+                        count = connection.execute("SELECT COUNT(*) FROM transactions WHERE projection_template_id=? AND substr(created_at,1,7)=?", (link, month)).fetchone()[0]
+                        connection.execute("UPDATE projection_occurrences SET status=?, updated_at=? WHERE template_id=? AND month=?",
+                                           ("completed" if count else "pending", self._now(), link, month))
+            self.log_audit("undo", "transaction", transaction_id, json.dumps({"undid": row["id"]}))
+            return self.get_transaction(transaction_id)
+
+    def delete_transaction(self, transaction_id: int) -> None:
+        """Borra un movimiento guardando la fila completa en audit_log para poder restaurarlo."""
+        with self.atomic(), self._connect() as connection:
+            row = connection.execute("SELECT * FROM transactions WHERE id = ?", (transaction_id,)).fetchone()
+            if row is None:
+                raise KeyError(f"No existe el movimiento {transaction_id}")
+            link, month = row["projection_template_id"], str(row["created_at"])[:7]
+            occurrence = self.get_projection_occurrence(link, month) if link else None
+            connection.execute("DELETE FROM transactions WHERE id = ?", (transaction_id,))
+            if link:
+                # Igual que al cambiar el vinculo desde el panel: si el concepto se
+                # habia completado solo por este movimiento, vuelve a pendiente.
+                remaining = connection.execute(
+                    "SELECT COUNT(*) FROM transactions WHERE projection_template_id = ? AND substr(created_at,1,7) = ?",
+                    (link, month),
+                ).fetchone()[0]
+                if not remaining:
+                    connection.execute(
+                        "UPDATE projection_occurrences SET status = 'pending', note = '', updated_at = ? "
+                        "WHERE template_id = ? AND month = ? AND status = 'completed'",
+                        (self._now(), link, month),
+                    )
+            self.log_audit(
+                "delete",
+                "transaction",
+                transaction_id,
+                json.dumps(
+                    {"row": dict(row), "projection": dict(occurrence) if occurrence else None},
+                    ensure_ascii=False,
+                    default=str,
+                ),
+            )
+
+    def restore_deleted_transaction(self, transaction_id: int) -> sqlite3.Row:
+        with self.atomic(), self._connect() as connection:
+            if connection.execute("SELECT 1 FROM transactions WHERE id = ?", (transaction_id,)).fetchone():
+                raise ValueError("El movimiento ya existe; no hay nada que restaurar.")
+            entry = connection.execute(
+                "SELECT details FROM audit_log WHERE entity_type = 'transaction' AND entity_id = ? "
+                "AND action = 'delete' ORDER BY id DESC LIMIT 1",
+                (transaction_id,),
+            ).fetchone()
+            if entry is None:
+                raise KeyError(f"No hay un borrado del movimiento {transaction_id} que restaurar")
+            payload = json.loads(entry["details"])
+            columns = {info["name"] for info in connection.execute("PRAGMA table_info(transactions)")}
+            saved = {key: value for key, value in payload["row"].items() if key in columns}
+            connection.execute(
+                f"INSERT INTO transactions ({', '.join(saved)}) VALUES ({', '.join('?' for _ in saved)})",
+                tuple(saved.values()),
+            )
+            occurrence = payload.get("projection")
+            if occurrence:
+                connection.execute(
+                    "UPDATE projection_occurrences SET status = ?, note = ?, updated_at = ? "
+                    "WHERE template_id = ? AND month = ?",
+                    (occurrence["status"], occurrence["note"], self._now(), occurrence["template_id"], occurrence["month"]),
+                )
+            self.log_audit("restore", "transaction", transaction_id, "Restaurado tras un borrado")
+        restored = self.get_transaction(transaction_id)
+        assert restored is not None
         return restored
 
     def set_transaction_payment(self, transaction_id: int, paid_amount_cents: int, due_date: str | None = None) -> sqlite3.Row:
@@ -103,6 +239,12 @@ class FinanceDatabase:
         with self._connect() as connection:
             connection.executescript(
                 """
+                CREATE TABLE IF NOT EXISTS finance_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+                INSERT OR IGNORE INTO finance_meta(key,value) VALUES ('initialized','1');
+                CREATE TABLE IF NOT EXISTS telegram_messages (
+                    user_id INTEGER NOT NULL, message_id INTEGER NOT NULL, processed_at TEXT NOT NULL,
+                    PRIMARY KEY(user_id,message_id)
+                );
                 CREATE TABLE IF NOT EXISTS transactions (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     created_at TEXT NOT NULL,
@@ -393,6 +535,7 @@ class FinanceDatabase:
         transfer_id: int | None = None,
         due_date: str | None = None,
         paid_amount_cents: int | None = None,
+        created_at: str | None = None,
     ) -> int:
         with self._connect() as connection:
             cursor = connection.execute(
@@ -407,7 +550,7 @@ class FinanceDatabase:
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
-                    self._now(),
+                    created_at or self._now(),
                     parsed.kind,
                     parsed.amount_cents,
                     parsed.currency,
@@ -634,6 +777,7 @@ class FinanceDatabase:
         telegram_user_id: int | None = None,
         telegram_username: str | None = None,
         telegram_full_name: str | None = None,
+        created_at: str | None = None,
     ) -> int:
         with self._connect() as connection:
             cursor = connection.execute(
@@ -646,7 +790,7 @@ class FinanceDatabase:
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
-                    self._now(),
+                    created_at or self._now(),
                     local_path,
                     drive_file_id,
                     drive_url,
@@ -659,6 +803,33 @@ class FinanceDatabase:
                 ),
             )
             return int(cursor.lastrowid)
+
+    def telegram_message_already_stored(
+        self, telegram_user_id: int | None, telegram_message_id: int | None
+    ) -> bool:
+        """Indica si un mensaje de Telegram ya genero un ticket o un movimiento.
+
+        Telegram vuelve a entregar los mensajes que el bot recibio pero no llego a
+        confirmar (por ejemplo, si se cerro de golpe), asi que sin esta comprobacion
+        se registrarian dos veces.
+        """
+        if telegram_user_id is None or telegram_message_id is None:
+            return False
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT 1 FROM receipts
+                WHERE telegram_user_id = ? AND telegram_message_id = ?
+                UNION ALL
+                SELECT 1 FROM transactions
+                WHERE telegram_user_id = ? AND telegram_message_id = ? AND receipt_id IS NULL
+                UNION ALL
+                SELECT 1 FROM telegram_messages WHERE user_id = ? AND message_id = ?
+                LIMIT 1
+                """,
+                (telegram_user_id, telegram_message_id, telegram_user_id, telegram_message_id, telegram_user_id, telegram_message_id),
+            ).fetchone()
+        return row is not None
 
     def get_receipt(self, receipt_id: int) -> sqlite3.Row | None:
         with self._connect() as connection:
@@ -683,6 +854,10 @@ class FinanceDatabase:
             )
 
     def register_receipt_entries(self, receipt_id: int, entries: list[dict[str, object]], *, allow_existing: bool = False) -> list[int]:
+        with self.atomic():
+            return self._register_receipt_entries(receipt_id, entries, allow_existing=allow_existing)
+
+    def _register_receipt_entries(self, receipt_id: int, entries: list[dict[str, object]], *, allow_existing: bool = False) -> list[int]:
         receipt = self.get_receipt(receipt_id)
         if receipt is None:
             raise KeyError(f"No existe el ticket {receipt_id}")
@@ -691,7 +866,7 @@ class FinanceDatabase:
         if not allow_existing:
             with self._connect() as connection:
                 if connection.execute("SELECT 1 FROM transactions WHERE receipt_id = ? LIMIT 1", (receipt_id,)).fetchone():
-                    raise ValueError("El ticket ya tiene movimientos; activa allow_existing para reemplazarlos")
+                    raise ValueError("El ticket ya está registrado. Edita sus movimientos vinculados para corregirlo.")
         prepared: list[tuple[object, ...]] = []
         for entry in entries:
             kind = str(entry.get("kind") or "expense")
