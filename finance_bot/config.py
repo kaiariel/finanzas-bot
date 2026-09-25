@@ -77,9 +77,13 @@ class Settings:
 
     @classmethod
     def from_env(cls, env_file: str | Path = ".env") -> "Settings":
-        load_dotenv(env_file, encoding="utf-8-sig")
+        env_path = Path(__file__).resolve().parents[1] / ".env" if str(env_file) == ".env" else Path(env_file).resolve()
+        load_dotenv(env_path, encoding="utf-8-sig")
+        def configured_path(value) -> Path:
+            path = Path(os.path.expandvars(str(value))).expanduser()
+            return path if path.is_absolute() else env_path.parent / path
 
-        data_dir = Path(os.getenv("DATA_DIR", "data"))
+        data_dir = configured_path(os.getenv("DATA_DIR", "data"))
         return cls(
             telegram_bot_token=os.getenv("TELEGRAM_BOT_TOKEN", "").strip(),
             allowed_telegram_user_ids=_parse_allowed_user_ids(
@@ -87,11 +91,11 @@ class Settings:
             ),
             telegram_user_aliases=_parse_user_aliases(os.getenv("TELEGRAM_USER_NAMES")),
             data_dir=data_dir,
-            sqlite_db_path=Path(os.getenv("SQLITE_DB_PATH", data_dir / "finances.db")),
-            export_csv_path=Path(os.getenv("EXPORT_CSV_PATH", data_dir / "movimientos.csv")),
-            report_html_path=Path(os.getenv("REPORT_HTML_PATH", "reports/finanzas.html")),
-            receipts_sync_dir=Path(os.getenv("RECEIPTS_SYNC_DIR", data_dir / "receipts")),
-            voices_sync_dir=Path(os.getenv("VOICES_SYNC_DIR", data_dir / "voices")),
+            sqlite_db_path=configured_path(os.getenv("SQLITE_DB_PATH", "~/FinanzasLocal/finances.db")),
+            export_csv_path=configured_path(os.getenv("EXPORT_CSV_PATH", data_dir / "movimientos.csv")),
+            report_html_path=configured_path(os.getenv("REPORT_HTML_PATH", "reports/finanzas.html")),
+            receipts_sync_dir=configured_path(os.getenv("RECEIPTS_SYNC_DIR", data_dir / "receipts")),
+            voices_sync_dir=configured_path(os.getenv("VOICES_SYNC_DIR", data_dir / "voices")),
             timezone=os.getenv("TIMEZONE", "Europe/Madrid").strip(),
             prefer_codex_media_review=_parse_bool(
                 os.getenv("PREFER_CODEX_MEDIA_REVIEW"), default=True

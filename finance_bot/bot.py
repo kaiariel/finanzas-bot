@@ -1,12 +1,14 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import asyncio
+import json
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
 from telegram import Update
+from telegram.error import NetworkError, RetryAfter
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -27,6 +29,15 @@ from finance_bot.report import generate_report
 
 
 logger = logging.getLogger(__name__)
+
+# Telegram solo guarda 24 h los mensajes que el bot no ha recogido: si el bot
+# pasa mas tiempo apagado, los mas antiguos se pierden sin remedio.
+TELEGRAM_UPDATE_RETENTION = timedelta(hours=24)
+HEARTBEAT_INTERVAL_SECONDS = 60
+# Al arrancar llegan de golpe todos los mensajes acumulados; el reporte HTML se
+# regenera una sola vez al terminar la rafaga en lugar de una vez por mensaje.
+REPORT_REFRESH_DELAY_SECONDS = 3
+DOWNLOAD_ATTEMPTS = 4
 
 
 def _format_money(cents: int, currency: str = "EUR") -> str:
@@ -54,15 +65,63 @@ def _safe_suffix(name: str | None, fallback: str) -> str:
     return suffix if suffix else fallback
 
 
-def _timestamp(settings: Settings) -> str:
-    return datetime.now(ZoneInfo(settings.timezone)).strftime("%Y%m%d-%H%M%S")
+def _message_datetime(update: Update, settings: Settings) -> datetime:
+    """Momento en que se envio el mensaje, no en el que el bot lo procesa.
+
+    Tras tener la compu apagada, los mensajes acumulados se procesan horas o dias
+    despues; usar la hora actual los fecharia (y archivaria) en el dia equivocado.
+    """
+    tz = ZoneInfo(settings.timezone)
+    message = update.effective_message
+    sent_at = message.date if message else None
+    if sent_at is None:
+        return datetime.now(tz)
+    if sent_at.tzinfo is None:
+        sent_at = sent_at.replace(tzinfo=timezone.utc)
+    return sent_at.astimezone(tz)
 
 
-def _month_dir(base_dir: Path, settings: Settings) -> Path:
-    now = datetime.now(ZoneInfo(settings.timezone))
-    folder = base_dir / f"{now:%Y-%m} {format_month(now)}"
+def _created_at(moment: datetime) -> str:
+    return moment.isoformat(timespec="seconds")
+
+
+def _timestamp(moment: datetime) -> str:
+    return moment.strftime("%Y%m%d-%H%M%S")
+
+
+def _month_dir(base_dir: Path, moment: datetime) -> Path:
+    folder = base_dir / f"{moment:%Y-%m} {format_month(moment)}"
     folder.mkdir(parents=True, exist_ok=True)
     return folder
+
+
+def _retry_delay(exc: Exception, attempt: int) -> float:
+    if isinstance(exc, RetryAfter):
+        delay = exc.retry_after
+        return delay.total_seconds() if isinstance(delay, timedelta) else float(delay)
+    return float(2**attempt)
+
+
+async def _download_file(context: ContextTypes.DEFAULT_TYPE, file_id: str, path: Path) -> None:
+    """Descarga reintentando: un corte de red no debe perder el ticket."""
+    for attempt in range(1, DOWNLOAD_ATTEMPTS + 1):
+        try:
+            telegram_file = await context.bot.get_file(file_id)
+            await telegram_file.download_to_drive(custom_path=path)
+            return
+        except (NetworkError, RetryAfter) as exc:
+            if attempt == DOWNLOAD_ATTEMPTS:
+                raise
+            delay = _retry_delay(exc, attempt)
+            logger.warning(
+                "Fallo la descarga de %s (intento %s/%s): %s. Reintento en %.0fs",
+                path.name,
+                attempt,
+                DOWNLOAD_ATTEMPTS,
+                exc,
+                delay,
+            )
+            await asyncio.sleep(delay)
 
 
 def _user_metadata(update: Update, settings: Settings) -> dict[str, object | None]:
@@ -79,6 +138,29 @@ def _user_metadata(update: Update, settings: Settings) -> dict[str, object | Non
         "telegram_username": user.username,
         "telegram_full_name": alias or user.full_name,
     }
+
+
+def _already_stored(update: Update, db: FinanceDatabase) -> bool:
+    user = update.effective_user
+    message = update.effective_message
+    if not user or not message:
+        return False
+    if db.telegram_message_already_stored(user.id, message.message_id):
+        logger.info(
+            "Mensaje %s de %s ya registrado; se ignora la entrega repetida",
+            message.message_id,
+            user.id,
+        )
+        return True
+    return False
+
+
+def _request_report_refresh(context: ContextTypes.DEFAULT_TYPE) -> None:
+    event = context.application.bot_data.get("report_refresh")
+    if event is None:
+        _refresh_report(context.application.bot_data["settings"])
+        return
+    event.set()
 
 
 async def _is_allowed(update: Update, settings: Settings) -> bool:
@@ -153,18 +235,21 @@ async def record_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
     if any(transaction.needs_clarification for transaction in parsed_transactions):
         await update.effective_message.reply_text(
-            "Â¿La transferencia/Bizum corresponde a ingreso, deuda, ayuda familiar, ahorro u otra categorÃ­a?"
+            "¿La transferencia/Bizum corresponde a ingreso, deuda, ayuda familiar, ahorro u otra categoría?"
         )
         return
 
+    if _already_stored(update, db):
+        return
+
     user_metadata = _user_metadata(update, settings)
-    for parsed in parsed_transactions:
-        db.add_transaction(
-            parsed,
-            telegram_message_id=update.effective_message.message_id,
-            **user_metadata,
-        )
-    _refresh_report(settings)
+    created_at = _created_at(_message_datetime(update, settings))
+    ids = db.add_telegram_transactions(parsed_transactions,
+        telegram_message_id=update.effective_message.message_id,
+        created_at=created_at, **user_metadata)
+    if not ids:
+        return
+    _request_report_refresh(context)
     await update.effective_message.reply_text(_confirmation_text(len(parsed_transactions)))
 
 
@@ -174,14 +259,15 @@ async def record_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         return
 
     voice = update.effective_message.voice
-    if not voice:
+    if not voice or _already_stored(update, db):
         return
 
+    sent_at = _message_datetime(update, settings)
+    created_at = _created_at(sent_at)
     local_path = settings.resolved_voices_dir() / (
-        f"voice-{_timestamp(settings)}-{voice.file_unique_id}.ogg"
+        f"voice-{_timestamp(sent_at)}-{voice.file_unique_id}.ogg"
     )
-    telegram_file = await context.bot.get_file(voice.file_id)
-    await telegram_file.download_to_drive(custom_path=local_path)
+    await _download_file(context, voice.file_id, local_path)
 
     if settings.voice_transcription_enabled:
         try:
@@ -196,14 +282,13 @@ async def record_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
                 transaction.needs_clarification for transaction in parsed_transactions
             ):
                 user_metadata = _user_metadata(update, settings)
-                for parsed in parsed_transactions:
-                    db.add_transaction(
-                        parsed,
-                        receipt_local_path=str(local_path),
-                        telegram_message_id=update.effective_message.message_id,
-                        **user_metadata,
-                    )
-                _refresh_report(settings)
+                ids = db.add_telegram_transactions(parsed_transactions,
+                    receipt_local_path=str(local_path),
+                    telegram_message_id=update.effective_message.message_id,
+                    created_at=created_at, **user_metadata)
+                if not ids:
+                    return
+                _request_report_refresh(context)
                 await update.effective_message.reply_text(
                     _confirmation_text(len(parsed_transactions))
                 )
@@ -216,11 +301,12 @@ async def record_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
                 telegram_message_id=update.effective_message.message_id,
                 caption=f"transcripcion sin registrar: {transcription or 'sin texto'}",
                 status="voice_pending",
+                created_at=created_at,
                 **_user_metadata(update, settings),
             )
-            _refresh_report(settings)
+            _request_report_refresh(context)
             await update.effective_message.reply_text(
-                f"Voz recibida para revisiÃ³n #{pending_id}."
+                f"Voz recibida para revisión #{pending_id}."
             )
             return
 
@@ -231,11 +317,12 @@ async def record_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         telegram_message_id=update.effective_message.message_id,
         caption="nota de voz pendiente",
         status="voice_pending",
+        created_at=created_at,
         **_user_metadata(update, settings),
     )
-    _refresh_report(settings)
+    _request_report_refresh(context)
     await update.effective_message.reply_text(
-        f"Voz recibida para revisiÃ³n #{pending_id}."
+        f"Voz recibida para revisión #{pending_id}."
     )
 
 
@@ -259,11 +346,14 @@ async def record_receipt(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     else:
         return
 
-    local_path = _month_dir(settings.resolved_receipts_dir(), settings) / (
-        f"ticket-{_timestamp(settings)}-{unique_id}{suffix}"
+    if _already_stored(update, db):
+        return
+
+    sent_at = _message_datetime(update, settings)
+    local_path = _month_dir(settings.resolved_receipts_dir(), sent_at) / (
+        f"ticket-{_timestamp(sent_at)}-{unique_id}{suffix}"
     )
-    telegram_file = await context.bot.get_file(telegram_file_id)
-    await telegram_file.download_to_drive(custom_path=local_path)
+    await _download_file(context, telegram_file_id, local_path)
 
     caption = message.caption or ""
     receipt_id = db.add_receipt(
@@ -272,9 +362,10 @@ async def record_receipt(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         drive_url=None,
         telegram_message_id=message.message_id,
         caption=caption or None,
+        created_at=_created_at(sent_at),
         **_user_metadata(update, settings),
     )
-    _refresh_report(settings)
+    _request_report_refresh(context)
     await message.reply_text(
         f"Documento recibido para análisis #{receipt_id}."
     )
@@ -342,11 +433,12 @@ async def export_csv(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         return
 
     csv_path = db.export_csv(settings.export_csv_path)
-    await update.effective_message.reply_document(
-        document=csv_path.open("rb"),
-        filename=csv_path.name,
-        caption="Export CSV de movimientos.",
-    )
+    with csv_path.open("rb") as handle:
+        await update.effective_message.reply_document(
+            document=handle,
+            filename=csv_path.name,
+            caption="Export CSV de movimientos.",
+        )
 
 
 async def report(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -354,16 +446,119 @@ async def report(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not await _is_allowed(update, settings):
         return
 
-    report_path = generate_report(settings)
-    await update.effective_message.reply_document(
-        document=report_path.open("rb"),
-        filename=report_path.name,
-        caption="Reporte HTML interactivo.",
-    )
+    report_path = await asyncio.to_thread(generate_report, settings)
+    with report_path.open("rb") as handle:
+        await update.effective_message.reply_document(
+            document=handle,
+            filename=report_path.name,
+            caption="Reporte HTML interactivo.",
+        )
 
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if update is None and isinstance(context.error, NetworkError):
+        # Cortes de red mientras escucha: la libreria reintenta sola.
+        logger.warning("Sin conexion con Telegram: %s", context.error)
+        return
     logger.exception("Error manejando update", exc_info=context.error)
+    message = update.effective_message if isinstance(update, Update) else None
+    if message is not None:
+        try:
+            await message.reply_text(
+                "No pude guardar este mensaje por un error. Reenvialo en un rato."
+            )
+        except Exception:
+            logger.warning("No se pudo avisar del error al usuario")
+
+
+def _heartbeat_path(settings: Settings) -> Path:
+    return settings.data_dir / "bot_heartbeat.json"
+
+
+def _read_heartbeat(path: Path) -> datetime | None:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        last_seen = datetime.fromisoformat(payload["last_seen"])
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+    if last_seen.tzinfo is None:
+        last_seen = last_seen.replace(tzinfo=timezone.utc)
+    return last_seen
+
+
+def _write_heartbeat(path: Path, moment: datetime) -> None:
+    path.write_text(json.dumps({"last_seen": moment.isoformat()}), encoding="utf-8")
+
+
+def _lost_messages_warning(last_seen: datetime, now: datetime, settings: Settings) -> str:
+    tz = ZoneInfo(settings.timezone)
+    offline_since = last_seen.astimezone(tz)
+    kept_since = (now - TELEGRAM_UPDATE_RETENTION).astimezone(tz)
+    return (
+        f"Aviso: el bot estuvo apagado desde el {offline_since:%d/%m %H:%M}. "
+        "Telegram solo guarda 24 h los mensajes pendientes, asi que lo enviado entre el "
+        f"{offline_since:%d/%m %H:%M} y el {kept_since:%d/%m %H:%M} no llego. "
+        "Si mandaste tickets o gastos en ese rango, reenvialos."
+    )
+
+
+async def _warn_lost_messages(
+    application: Application, last_seen: datetime, now: datetime
+) -> None:
+    settings: Settings = application.bot_data["settings"]
+    text = _lost_messages_warning(last_seen, now, settings)
+    logger.warning(text)
+    for user_id in sorted(settings.allowed_telegram_user_ids or ()):
+        try:
+            await application.bot.send_message(chat_id=user_id, text=text)
+        except Exception:
+            logger.warning("No se pudo enviar el aviso de mensajes perdidos a %s", user_id)
+
+
+async def _heartbeat_loop(application: Application) -> None:
+    """Registra que el bot esta vivo y avisa si estuvo caido mas de 24 h.
+
+    Cubre tanto la compu apagada como la suspension: al despertar, el hueco
+    entre latidos delata el tiempo sin recoger mensajes.
+    """
+    path = _heartbeat_path(application.bot_data["settings"])
+    last_seen = _read_heartbeat(path)
+    while True:
+        now = datetime.now(timezone.utc)
+        if last_seen is not None and now - last_seen > TELEGRAM_UPDATE_RETENTION:
+            await _warn_lost_messages(application, last_seen, now)
+        try:
+            _write_heartbeat(path, now)
+        except OSError as exc:
+            logger.warning("No se pudo actualizar %s: %s", path, exc)
+        last_seen = now
+        await asyncio.sleep(HEARTBEAT_INTERVAL_SECONDS)
+
+
+async def _report_refresh_loop(application: Application) -> None:
+    settings: Settings = application.bot_data["settings"]
+    event: asyncio.Event = application.bot_data["report_refresh"]
+    while True:
+        await event.wait()
+        await asyncio.sleep(REPORT_REFRESH_DELAY_SECONDS)
+        event.clear()
+        await asyncio.to_thread(_refresh_report, settings)
+
+
+async def _post_init(application: Application) -> None:
+    application.bot_data["report_refresh"] = asyncio.Event()
+    application.bot_data["background_tasks"] = [
+        asyncio.create_task(_heartbeat_loop(application)),
+        asyncio.create_task(_report_refresh_loop(application)),
+    ]
+
+
+async def _post_stop(application: Application) -> None:
+    for task in application.bot_data.pop("background_tasks", []):
+        task.cancel()
+    event = application.bot_data.get("report_refresh")
+    if event is not None and event.is_set():
+        _refresh_report(application.bot_data["settings"])
 
 
 def build_application(settings: Settings) -> Application:
@@ -372,7 +567,13 @@ def build_application(settings: Settings) -> Application:
 
     db = FinanceDatabase(settings.sqlite_db_path, settings.timezone)
 
-    application = Application.builder().token(settings.telegram_bot_token).build()
+    application = (
+        Application.builder()
+        .token(settings.telegram_bot_token)
+        .post_init(_post_init)
+        .post_stop(_post_stop)
+        .build()
+    )
     application.bot_data["settings"] = settings
     application.bot_data["db"] = db
 
@@ -384,9 +585,15 @@ def build_application(settings: Settings) -> Application:
     application.add_handler(CommandHandler("exportar", export_csv))
     application.add_handler(CommandHandler("reporte", report))
     application.add_handler(CommandHandler("pendientes", pending))
-    application.add_handler(MessageHandler(filters.VOICE, record_voice))
-    application.add_handler(MessageHandler(filters.PHOTO | filters.Document.ALL, record_receipt))
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, record_text))
+    # Solo mensajes nuevos: editar un mensaje ya enviado no debe registrarlo otra vez.
+    new_messages = filters.UpdateType.MESSAGE
+    application.add_handler(MessageHandler(new_messages & filters.VOICE, record_voice))
+    application.add_handler(
+        MessageHandler(new_messages & (filters.PHOTO | filters.Document.ALL), record_receipt)
+    )
+    application.add_handler(
+        MessageHandler(new_messages & filters.TEXT & ~filters.COMMAND, record_text)
+    )
     application.add_error_handler(error_handler)
     return application
 
@@ -396,7 +603,15 @@ def main() -> None:
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
         level=logging.INFO,
     )
+    # httpx registra cada peticion con la URL completa, que incluye el token del
+    # bot: llenaba bot.log (sincronizado por OneDrive) con el token en claro.
+    logging.getLogger("httpx").setLevel(logging.WARNING)
     settings = Settings.from_env()
     application = build_application(settings)
-    application.run_polling(allowed_updates=Update.ALL_TYPES)
-
+    # bootstrap_retries=-1: si al encender la compu aun no hay red, el bot espera
+    # y reintenta en lugar de cerrarse ("Failed run number 0 of 0. Aborting").
+    application.run_polling(
+        allowed_updates=Update.ALL_TYPES,
+        bootstrap_retries=-1,
+        drop_pending_updates=False,
+    )

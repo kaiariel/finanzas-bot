@@ -40,6 +40,7 @@ VALID_CATEGORIES = (
     "Transporte",
     "Ocio",
     "Ahorro",
+    "Sin clasificar",
     "Ingresos laborales",
     "Ingresos clientes",
     "Trabajos extra",
@@ -94,7 +95,9 @@ TENS_NUMBER_WORDS = {
 
 FIXED_CATEGORIES = {"Alquiler", "Deudas", "Ayuda familiar", "Suscripciones"}
 INCOME_CATEGORIES = {"Ingresos laborales", "Ingresos clientes", "Trabajos extra"}
-DEFAULT_EXPENSE_CATEGORY = "Ocio"
+# Sin pistas no se adivina: "Ocio" como comodin inflaba esa categoria con
+# envios familiares, coworking o publicidad. Lo dudoso queda a la vista.
+DEFAULT_EXPENSE_CATEGORY = "Sin clasificar"
 DEFAULT_INCOME_CATEGORY = "Trabajos extra"
 CLIENT_REIMBURSABLE_EXPENSE_PHRASES = (
     "facebook ads",
@@ -422,6 +425,27 @@ def normalize_text(text: str) -> str:
     return "".join(ch for ch in normalized if not unicodedata.combining(ch))
 
 
+def note_key(note: str) -> str:
+    """Clave estable de un concepto: sin tildes, mayusculas ni signos."""
+    return " ".join(re.findall(r"\w+", normalize_text(note or "")))
+
+
+def with_learned_category(parsed: "ParsedTransaction", category: str) -> "ParsedTransaction":
+    """Aplica una categoria que el usuario ya corrigio para este mismo concepto."""
+    if category == parsed.category or category not in VALID_CATEGORIES:
+        return parsed
+    notes = tuple(
+        note for note in parsed.inference_notes
+        if not note.startswith("Categoria asumida") and "es de gastos" not in note
+    )
+    return replace(
+        parsed,
+        category=category,
+        is_fixed=infer_is_fixed(parsed.source_text, category),
+        inference_notes=notes,
+    )
+
+
 def _contains_keyword(normalized_text: str, keyword: str) -> bool:
     normalized_keyword = normalize_text(keyword)
     if " " in normalized_keyword or "&" in normalized_keyword:
@@ -661,6 +685,14 @@ def parse_transaction(text: str) -> ParsedTransaction | None:
         inference_notes.append(
             f"Categoria asumida como {category} por falta de palabras clave claras."
         )
+    elif kind == "income" and category not in INCOME_CATEGORIES:
+        # Una palabra clave de gasto ("ropa", "izhan"...) no convierte un cobro en
+        # gasto de esa categoria: el ingreso pasa a la categoria de ingresos por defecto.
+        inference_notes.append(
+            f"La palabra clave apuntaba a {category}, que es de gastos; "
+            f"el ingreso se asigno a {DEFAULT_INCOME_CATEGORY}."
+        )
+        category = DEFAULT_INCOME_CATEGORY
     if kind == "income" and normalized_note in {"sueldo", "nomina", "cobro", "ingreso"}:
         inference_notes.append(
             "No se pudo deducir a que ingreso concreto del mes corresponde este cobro."

@@ -5,8 +5,10 @@ import json
 import re
 import sqlite3
 import unicodedata
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -19,11 +21,19 @@ from finance_bot.formatting import (
     tipo_label,
 )
 from finance_bot.parser import (
+    DEFAULT_EXPENSE_CATEGORY,
     HOUSEHOLD_FOOD_CATEGORY,
     LEGACY_HOUSEHOLD_FOOD_CATEGORIES,
     ParsedTransaction,
+    VALID_CATEGORIES,
+    note_key,
+    with_learned_category,
 )
+from finance_bot.storage import inspect_database
 
+
+# Marca de los movimientos creados al marcar como pagado un concepto domiciliado.
+AUTO_REGISTER_SOURCE = "Registrado automaticamente al marcar el concepto como pagado"
 
 REVIEW_QUEUE_STATUSES = ("nuevo", "pending", "voice_pending", "dudoso", "missing")
 
@@ -43,24 +53,205 @@ class StoredTransaction:
 
 
 class FinanceDatabase:
-    def __init__(self, db_path: Path, timezone: str) -> None:
+    def __init__(self, db_path: Path, timezone: str, *, create: bool = False) -> None:
         self.db_path = db_path
         self.timezone = ZoneInfo(timezone)
+        self._active_connection = ContextVar(f"finance_connection_{id(self)}", default=None)
+        if not create:
+            inspect_database(db_path)
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        self._allow_create = create
         self._init_schema()
 
-    def _connect(self) -> sqlite3.Connection:
-        connection = sqlite3.connect(self.db_path)
+    @contextmanager
+    def _connect(self):
+        active = self._active_connection.get()
+        if active is not None:
+            yield active
+            return
+        mode = "rwc" if self._allow_create else "rw"
+        connection = sqlite3.connect(self.db_path.resolve().as_uri() + "?mode=" + mode, uri=True, timeout=10)
         connection.row_factory = sqlite3.Row
-        return connection
+        try:
+            connection.execute("PRAGMA journal_mode = WAL")
+            connection.execute("PRAGMA synchronous = NORMAL")
+            connection.execute("PRAGMA busy_timeout = 10000")
+            connection.execute("PRAGMA foreign_keys = ON")
+            with connection:
+                yield connection
+        finally:
+            connection.close()
+
+    @contextmanager
+    def atomic(self):
+        if self._active_connection.get() is not None:
+            yield
+            return
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            token = self._active_connection.set(connection)
+            try:
+                yield
+            finally:
+                self._active_connection.reset(token)
+
+    def add_telegram_transactions(self, parsed_transactions, **metadata) -> list[int]:
+        """Acknowledge a message only when every line and projection was saved."""
+        with self.atomic():
+            if self.telegram_message_already_stored(metadata.get("telegram_user_id"), metadata.get("telegram_message_id")):
+                return []
+            parsed_transactions = [self.apply_learned_category(parsed) for parsed in parsed_transactions]
+            ids = [self.add_transaction(parsed, **metadata) for parsed in parsed_transactions]
+            if ids and metadata.get("telegram_user_id") is not None and metadata.get("telegram_message_id") is not None:
+                with self._connect() as connection:
+                    connection.execute("INSERT INTO telegram_messages(user_id, message_id, processed_at) VALUES (?, ?, ?)",
+                                       (metadata["telegram_user_id"], metadata["telegram_message_id"], self._now()))
+            return ids
 
     def _now(self) -> str:
         return datetime.now(self.timezone).isoformat(timespec="seconds")
+
+    def log_audit(self, action: str, entity_type: str, entity_id: int | None, details: str = "") -> None:
+        with self._connect() as connection:
+            connection.execute(
+                "INSERT INTO audit_log(created_at, action, entity_type, entity_id, details) VALUES (?, ?, ?, ?, ?)",
+                (self._now(), action, entity_type, entity_id, details),
+            )
+
+    def undo_last_transaction_change(self, transaction_id: int) -> sqlite3.Row:
+        with self.atomic(), self._connect() as connection:
+            history = connection.execute(
+                "SELECT id, action, details FROM audit_log WHERE entity_type='transaction' AND entity_id=? ORDER BY id DESC",
+                (transaction_id,),
+            ).fetchall()
+            undone = {json.loads(item["details"]).get("undid") for item in history if item["action"] == "undo"}
+            row = next((item for item in history if item["action"] == "update" and item["id"] not in undone), None)
+            if row is None:
+                raise KeyError(f"No hay cambios que deshacer para el movimiento {transaction_id}")
+            current = self.get_transaction(transaction_id)
+            if current is None:
+                raise KeyError(f"No existe el movimiento {transaction_id}")
+            payload = json.loads(row["details"])
+            before = payload.get("before") or {}
+            if any(current[key] != value for key, value in payload.get("after", {}).items() if key in current.keys()):
+                raise ValueError("El movimiento cambió después de esta edición. Revisa sus datos antes de deshacer.")
+            columns = ["created_at", "kind", "amount_cents", "category", "note", "store", "is_fixed", "review_status",
+                       "inference_notes", "projection_template_id", "account_id", "due_date", "paid_amount_cents",
+                       "telegram_user_id", "telegram_username", "telegram_full_name", "receipt_id", "receipt_local_path",
+                       "receipt_drive_file_id", "receipt_drive_url"]
+            available = [column for column in columns if column in before]
+            if not available:
+                raise ValueError("Esta edición antigua no conserva datos suficientes para deshacerla.")
+            for snapshot in payload.get("projections", []):
+                existing = self.get_projection_occurrence(snapshot["templateId"], snapshot["month"])
+                comparable = lambda item: {k: v for k, v in item.items() if k not in {"id", "updated_at"}} if item else None
+                if comparable(dict(existing) if existing else None) != comparable(snapshot["after"]):
+                    raise ValueError("Una proyección vinculada cambió después. Revísala antes de deshacer.")
+            connection.execute("UPDATE transactions SET " + ", ".join(f"{column} = ?" for column in available) + " WHERE id = ?",
+                               tuple(before[column] for column in available) + (transaction_id,))
+            if "projections" in payload:
+                for snapshot in payload["projections"]:
+                    saved = snapshot["before"]
+                    if saved is None:
+                        connection.execute("DELETE FROM projection_occurrences WHERE template_id=? AND month=?", (snapshot["templateId"], snapshot["month"]))
+                    else:
+                        self.set_projection_occurrence(template_id=saved["template_id"], month=saved["month"],
+                                                       amount_cents=saved["amount_cents"], status=saved["status"], note=saved["note"])
+            else:
+                # Old audit entries did not include projection snapshots.
+                for link, month in {(current["projection_template_id"], current["created_at"][:7]),
+                                    (before.get("projection_template_id"), str(before.get("created_at", ""))[:7])}:
+                    if link:
+                        count = connection.execute("SELECT COUNT(*) FROM transactions WHERE projection_template_id=? AND substr(created_at,1,7)=?", (link, month)).fetchone()[0]
+                        connection.execute("UPDATE projection_occurrences SET status=?, updated_at=? WHERE template_id=? AND month=?",
+                                           ("completed" if count else "pending", self._now(), link, month))
+            self.log_audit("undo", "transaction", transaction_id, json.dumps({"undid": row["id"]}))
+            return self.get_transaction(transaction_id)
+
+    def delete_transaction(self, transaction_id: int) -> None:
+        """Borra un movimiento guardando la fila completa en audit_log para poder restaurarlo."""
+        with self.atomic(), self._connect() as connection:
+            row = connection.execute("SELECT * FROM transactions WHERE id = ?", (transaction_id,)).fetchone()
+            if row is None:
+                raise KeyError(f"No existe el movimiento {transaction_id}")
+            link, month = row["projection_template_id"], str(row["created_at"])[:7]
+            occurrence = self.get_projection_occurrence(link, month) if link else None
+            connection.execute("DELETE FROM transactions WHERE id = ?", (transaction_id,))
+            if link:
+                # Igual que al cambiar el vinculo desde el panel: si el concepto se
+                # habia completado solo por este movimiento, vuelve a pendiente.
+                remaining = connection.execute(
+                    "SELECT COUNT(*) FROM transactions WHERE projection_template_id = ? AND substr(created_at,1,7) = ?",
+                    (link, month),
+                ).fetchone()[0]
+                if not remaining:
+                    connection.execute(
+                        "UPDATE projection_occurrences SET status = 'pending', note = '', updated_at = ? "
+                        "WHERE template_id = ? AND month = ? AND status = 'completed'",
+                        (self._now(), link, month),
+                    )
+            self.log_audit(
+                "delete",
+                "transaction",
+                transaction_id,
+                json.dumps(
+                    {"row": dict(row), "projection": dict(occurrence) if occurrence else None},
+                    ensure_ascii=False,
+                    default=str,
+                ),
+            )
+
+    def restore_deleted_transaction(self, transaction_id: int) -> sqlite3.Row:
+        with self.atomic(), self._connect() as connection:
+            if connection.execute("SELECT 1 FROM transactions WHERE id = ?", (transaction_id,)).fetchone():
+                raise ValueError("El movimiento ya existe; no hay nada que restaurar.")
+            entry = connection.execute(
+                "SELECT details FROM audit_log WHERE entity_type = 'transaction' AND entity_id = ? "
+                "AND action = 'delete' ORDER BY id DESC LIMIT 1",
+                (transaction_id,),
+            ).fetchone()
+            if entry is None:
+                raise KeyError(f"No hay un borrado del movimiento {transaction_id} que restaurar")
+            payload = json.loads(entry["details"])
+            columns = {info["name"] for info in connection.execute("PRAGMA table_info(transactions)")}
+            saved = {key: value for key, value in payload["row"].items() if key in columns}
+            connection.execute(
+                f"INSERT INTO transactions ({', '.join(saved)}) VALUES ({', '.join('?' for _ in saved)})",
+                tuple(saved.values()),
+            )
+            occurrence = payload.get("projection")
+            if occurrence:
+                connection.execute(
+                    "UPDATE projection_occurrences SET status = ?, note = ?, updated_at = ? "
+                    "WHERE template_id = ? AND month = ?",
+                    (occurrence["status"], occurrence["note"], self._now(), occurrence["template_id"], occurrence["month"]),
+                )
+            self.log_audit("restore", "transaction", transaction_id, "Restaurado tras un borrado")
+        restored = self.get_transaction(transaction_id)
+        assert restored is not None
+        return restored
+
+    def set_transaction_payment(self, transaction_id: int, paid_amount_cents: int, due_date: str | None = None) -> sqlite3.Row:
+        if paid_amount_cents < 0:
+            raise ValueError("El importe pagado no puede ser negativo")
+        with self._connect() as connection:
+            connection.execute("UPDATE transactions SET paid_amount_cents = ?, due_date = ? WHERE id = ?", (paid_amount_cents, due_date, transaction_id))
+            row = connection.execute("SELECT * FROM transactions WHERE id = ?", (transaction_id,)).fetchone()
+        if row is None:
+            raise KeyError(f"No existe el movimiento {transaction_id}")
+        self.log_audit("payment", "transaction", transaction_id, f"Pagado {paid_amount_cents}")
+        return row
 
     def _init_schema(self) -> None:
         with self._connect() as connection:
             connection.executescript(
                 """
+                CREATE TABLE IF NOT EXISTS finance_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+                INSERT OR IGNORE INTO finance_meta(key,value) VALUES ('initialized','1');
+                CREATE TABLE IF NOT EXISTS telegram_messages (
+                    user_id INTEGER NOT NULL, message_id INTEGER NOT NULL, processed_at TEXT NOT NULL,
+                    PRIMARY KEY(user_id,message_id)
+                );
                 CREATE TABLE IF NOT EXISTS transactions (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     created_at TEXT NOT NULL,
@@ -105,6 +296,7 @@ class FinanceDatabase:
                     group_name TEXT NOT NULL DEFAULT '',
                     recurrence TEXT NOT NULL DEFAULT 'monthly',
                     start_month TEXT NOT NULL DEFAULT '',
+                    end_month TEXT NOT NULL DEFAULT '',
                     installment_current INTEGER,
                     installment_total INTEGER,
                     active INTEGER NOT NULL DEFAULT 1,
@@ -125,6 +317,80 @@ class FinanceDatabase:
 
                 CREATE UNIQUE INDEX IF NOT EXISTS idx_projection_templates_kind_name
                     ON projection_templates(kind, name);
+
+                CREATE TABLE IF NOT EXISTS audit_log (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    created_at TEXT NOT NULL,
+                    action TEXT NOT NULL,
+                    entity_type TEXT NOT NULL,
+                    entity_id INTEGER,
+                    details TEXT NOT NULL DEFAULT ''
+                );
+
+                CREATE TABLE IF NOT EXISTS accounts (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    created_at TEXT NOT NULL,
+                    name TEXT NOT NULL UNIQUE,
+                    account_type TEXT NOT NULL DEFAULT 'bank',
+                    opening_balance_cents INTEGER NOT NULL DEFAULT 0,
+                    currency TEXT NOT NULL DEFAULT 'EUR',
+                    active INTEGER NOT NULL DEFAULT 1
+                );
+
+                CREATE TABLE IF NOT EXISTS transfers (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    created_at TEXT NOT NULL,
+                    from_account_id INTEGER NOT NULL,
+                    to_account_id INTEGER NOT NULL,
+                    amount_cents INTEGER NOT NULL,
+                    note TEXT NOT NULL DEFAULT '',
+                    FOREIGN KEY(from_account_id) REFERENCES accounts(id),
+                    FOREIGN KEY(to_account_id) REFERENCES accounts(id)
+                );
+
+                CREATE TABLE IF NOT EXISTS budgets (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    month TEXT NOT NULL,
+                    category TEXT NOT NULL,
+                    amount_cents INTEGER NOT NULL,
+                    UNIQUE(month, category)
+                );
+
+                CREATE TABLE IF NOT EXISTS savings_goals (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    created_at TEXT NOT NULL,
+                    name TEXT NOT NULL,
+                    target_cents INTEGER NOT NULL,
+                    current_cents INTEGER NOT NULL DEFAULT 0,
+                    target_date TEXT,
+                    wallet_id INTEGER,
+                    active INTEGER NOT NULL DEFAULT 1
+                );
+
+                CREATE TABLE IF NOT EXISTS savings_settings (
+                    id INTEGER PRIMARY KEY CHECK (id = 1),
+                    current_balance_cents INTEGER NOT NULL DEFAULT 0,
+                    current_balance_date TEXT NOT NULL DEFAULT '',
+                    include_current_balance INTEGER NOT NULL DEFAULT 0,
+                    emergency_monthly_cents INTEGER NOT NULL DEFAULT 0
+                );
+
+                CREATE TABLE IF NOT EXISTS savings_wallets (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    created_at TEXT NOT NULL,
+                    name TEXT NOT NULL UNIQUE,
+                    balance_cents INTEGER NOT NULL DEFAULT 0,
+                    include_in_projection INTEGER NOT NULL DEFAULT 1,
+                    active INTEGER NOT NULL DEFAULT 1
+                );
+
+                CREATE TABLE IF NOT EXISTS import_batches (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    created_at TEXT NOT NULL,
+                    filename TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'preview',
+                    row_count INTEGER NOT NULL DEFAULT 0
+                );
                 """
             )
             self._ensure_column(connection, "transactions", "store", "TEXT NOT NULL DEFAULT ''")
@@ -143,10 +409,15 @@ class FinanceDatabase:
                 connection, "transactions", "inference_notes", "TEXT NOT NULL DEFAULT '[]'"
             )
             self._ensure_column(connection, "transactions", "projection_template_id", "INTEGER")
+            self._ensure_column(connection, "transactions", "account_id", "INTEGER")
+            self._ensure_column(connection, "transactions", "transfer_id", "INTEGER")
+            self._ensure_column(connection, "transactions", "due_date", "TEXT")
+            self._ensure_column(connection, "transactions", "paid_amount_cents", "INTEGER")
             self._ensure_column(connection, "receipts", "telegram_user_id", "INTEGER")
             self._ensure_column(connection, "receipts", "telegram_username", "TEXT")
             self._ensure_column(connection, "receipts", "telegram_full_name", "TEXT")
             self._ensure_column(connection, "receipts", "review_notes", "TEXT")
+            self._ensure_column(connection, "savings_goals", "wallet_id", "INTEGER")
             self._ensure_column(
                 connection,
                 "projection_templates",
@@ -165,6 +436,12 @@ class FinanceDatabase:
                 "start_month",
                 "TEXT NOT NULL DEFAULT ''",
             )
+            self._ensure_column(
+                connection,
+                "projection_templates",
+                "end_month",
+                "TEXT NOT NULL DEFAULT ''",
+            )
             self._ensure_column(connection, "projection_templates", "installment_current", "INTEGER")
             self._ensure_column(connection, "projection_templates", "installment_total", "INTEGER")
             self._ensure_column(
@@ -173,7 +450,76 @@ class FinanceDatabase:
             self._ensure_column(
                 connection, "projection_templates", "sort_order", "INTEGER NOT NULL DEFAULT 0"
             )
-            self._apply_household_food_projection_migration(connection)
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS category_rules (
+                    note_key TEXT NOT NULL,
+                    kind TEXT NOT NULL,
+                    category TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    PRIMARY KEY (note_key, kind)
+                )
+                """
+            )
+            self._ensure_column(
+                connection, "projection_templates", "auto_register", "INTEGER NOT NULL DEFAULT 0"
+            )
+            # Migraciones de datos pesadas (recorren tablas completas) se ejecutan una
+            # sola vez: _init_schema corre en cada apertura de FinanceDatabase (una por
+            # request en el panel), asi que guardarlas detras de user_version evita un
+            # UPDATE de barrido completo en cada peticion.
+            schema_version = connection.execute("PRAGMA user_version").fetchone()[0]
+            if schema_version < 1:
+                self._apply_household_food_projection_migration(connection)
+                connection.execute("PRAGMA user_version = 1")
+            if schema_version < 2:
+                self._seed_category_rules_from_history(connection)
+                connection.execute("PRAGMA user_version = 2")
+
+    def _seed_category_rules_from_history(self, connection: sqlite3.Connection) -> None:
+        """Convierte en reglas las correcciones de categoria ya hechas en el panel."""
+        history = connection.execute(
+            "SELECT details FROM audit_log WHERE entity_type = 'transaction' AND action = 'update' ORDER BY id"
+        ).fetchall()
+        for (details,) in history:
+            try:
+                payload = json.loads(details)
+                before, after = payload["before"], payload["after"]
+            except (ValueError, KeyError, TypeError):
+                continue
+            if isinstance(before, dict) and isinstance(after, dict) and before.get("category") != after.get("category"):
+                self._store_category_rule(connection, after.get("note"), after.get("kind"), after.get("category"))
+
+    def _store_category_rule(self, connection: sqlite3.Connection, note: object, kind: object, category: object) -> None:
+        key = note_key(str(note or ""))
+        if not key or kind not in {"expense", "income"} or category not in VALID_CATEGORIES:
+            return
+        if category == DEFAULT_EXPENSE_CATEGORY:
+            connection.execute("DELETE FROM category_rules WHERE note_key = ? AND kind = ?", (key, kind))
+            return
+        connection.execute(
+            "INSERT INTO category_rules(note_key, kind, category, updated_at) VALUES (?, ?, ?, ?) "
+            "ON CONFLICT(note_key, kind) DO UPDATE SET category = excluded.category, updated_at = excluded.updated_at",
+            (key, kind, category, self._now()),
+        )
+
+    def learn_category(self, note: str, kind: str, category: str) -> None:
+        with self._connect() as connection:
+            self._store_category_rule(connection, note, kind, category)
+
+    def learned_category(self, note: str, kind: str) -> str | None:
+        key = note_key(note)
+        if not key:
+            return None
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT category FROM category_rules WHERE note_key = ? AND kind = ?", (key, kind)
+            ).fetchone()
+        return row["category"] if row else None
+
+    def apply_learned_category(self, parsed: ParsedTransaction) -> ParsedTransaction:
+        learned = self.learned_category(parsed.note, parsed.kind)
+        return with_learned_category(parsed, learned) if learned else parsed
 
     def _ensure_column(
         self, connection: sqlite3.Connection, table: str, column: str, definition: str
@@ -213,21 +559,10 @@ class FinanceDatabase:
         connection.execute(
             f"""
             UPDATE projection_templates
-            SET name = ?, default_amount_cents = ?, category = ?, active = 1
+            SET name = ?, category = ?
             WHERE kind = 'expense' AND name IN ({household_placeholders})
             """,
-            (HOUSEHOLD_FOOD_CATEGORY, 60000, HOUSEHOLD_FOOD_CATEGORY, *household_names),
-        )
-        connection.execute(
-            f"""
-            UPDATE projection_occurrences
-            SET amount_cents = ?
-            WHERE template_id IN (
-                SELECT id FROM projection_templates
-                WHERE kind = 'expense' AND name = ?
-            )
-            """,
-            (60000, HOUSEHOLD_FOOD_CATEGORY),
+            (HOUSEHOLD_FOOD_CATEGORY, HOUSEHOLD_FOOD_CATEGORY, *household_names),
         )
 
         izhan_projection_names = ("Musica Izhan", "Música Izhan", "Izhan hijo")
@@ -265,6 +600,11 @@ class FinanceDatabase:
         receipt_id: int | None = None,
         review_status: str = "registered",
         duplicate_of_id: int | None = None,
+        account_id: int | None = None,
+        transfer_id: int | None = None,
+        due_date: str | None = None,
+        paid_amount_cents: int | None = None,
+        created_at: str | None = None,
     ) -> int:
         with self._connect() as connection:
             cursor = connection.execute(
@@ -274,12 +614,12 @@ class FinanceDatabase:
                     store, is_fixed, source_text, receipt_local_path, receipt_drive_file_id,
                     receipt_drive_url, telegram_message_id, telegram_user_id,
                     telegram_username, telegram_full_name, receipt_id, review_status,
-                    duplicate_of_id, inference_notes
+                    duplicate_of_id, inference_notes, account_id, transfer_id, due_date, paid_amount_cents
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
-                    self._now(),
+                    created_at or self._now(),
                     parsed.kind,
                     parsed.amount_cents,
                     parsed.currency,
@@ -299,6 +639,10 @@ class FinanceDatabase:
                     review_status,
                     duplicate_of_id,
                     json.dumps(list(parsed.inference_notes), ensure_ascii=False),
+                    account_id,
+                    transfer_id,
+                    due_date,
+                    paid_amount_cents if paid_amount_cents is not None else parsed.amount_cents,
                 ),
             )
             transaction_id = int(cursor.lastrowid)
@@ -327,6 +671,11 @@ class FinanceDatabase:
         receipt_id: int | None = None,
         review_status: str = "registered",
         duplicate_of_id: int | None = None,
+        account_id: int | None = None,
+        transfer_id: int | None = None,
+        due_date: str | None = None,
+        paid_amount_cents: int | None = None,
+        auto_link: bool = True,
     ) -> int:
         if kind not in {"expense", "income"}:
             raise ValueError("kind debe ser 'expense' o 'income'")
@@ -339,9 +688,9 @@ class FinanceDatabase:
                     store, is_fixed, source_text, receipt_local_path, receipt_drive_file_id,
                     receipt_drive_url, telegram_message_id, telegram_user_id,
                     telegram_username, telegram_full_name, receipt_id, review_status,
-                    duplicate_of_id, inference_notes
+                    duplicate_of_id, inference_notes, account_id, transfer_id, due_date, paid_amount_cents
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     created_at or self._now(),
@@ -364,11 +713,194 @@ class FinanceDatabase:
                     review_status,
                     duplicate_of_id,
                     "[]",
+                    account_id,
+                    transfer_id,
+                    due_date,
+                    paid_amount_cents if paid_amount_cents is not None else amount_cents,
                 ),
             )
             transaction_id = int(cursor.lastrowid)
-        self.auto_apply_projection_for_transaction(transaction_id)
+        if auto_link:
+            self.auto_apply_projection_for_transaction(transaction_id)
         return transaction_id
+
+    def set_projection_auto_register(self, template_id: int, enabled: bool) -> None:
+        with self._connect() as connection:
+            cursor = connection.execute(
+                "UPDATE projection_templates SET auto_register = ? WHERE id = ?", (1 if enabled else 0, template_id)
+            )
+            if cursor.rowcount == 0:
+                raise KeyError(f"No existe la proyeccion {template_id}")
+
+    def _payment_date(self, month: str) -> str:
+        """Fecha dentro del mes indicado: hoy si es el mes en curso; si no, su ultimo o primer dia."""
+        now = datetime.now(self.timezone)
+        current = now.strftime("%Y-%m")
+        if month == current:
+            return now.isoformat(timespec="seconds")
+        first = datetime.fromisoformat(month + "-01T12:00:00").replace(tzinfo=self.timezone)
+        if month > current:
+            return first.isoformat(timespec="seconds")
+        following = (first.replace(day=28) + timedelta(days=4)).replace(day=1)
+        return (following - timedelta(days=1)).isoformat(timespec="seconds")
+
+    def register_projection_payment(self, template_id: int, month: str) -> int | None:
+        """Crea el movimiento de un concepto domiciliado si ese mes aun no tiene ninguno."""
+        template = self.get_projection_template(template_id)
+        if template is None or not template["auto_register"]:
+            return None
+        with self.atomic(), self._connect() as connection:
+            linked = connection.execute(
+                "SELECT COUNT(*) FROM transactions WHERE projection_template_id = ? AND substr(created_at,1,7) = ?",
+                (template_id, month),
+            ).fetchone()[0]
+            if linked:
+                return None
+            occurrence = self.get_projection_occurrence(template_id, month)
+            amount_cents = int(occurrence["amount_cents"]) if occurrence else int(template["default_amount_cents"])
+            transaction_id = self.add_manual_transaction(
+                kind=template["kind"],
+                amount_cents=amount_cents,
+                category=template["category"],
+                note=template["name"],
+                is_fixed=True,
+                source_text=AUTO_REGISTER_SOURCE,
+                created_at=self._payment_date(month),
+                review_status="reviewed",
+                auto_link=False,
+            )
+            connection.execute(
+                "UPDATE transactions SET projection_template_id = ? WHERE id = ?", (template_id, transaction_id)
+            )
+            self.log_audit("create", "transaction", transaction_id, f"Cargo automatico del concepto {template_id} ({month})")
+        return transaction_id
+
+    def drop_auto_payments(self, template_id: int, month: str, keep: int | None = None) -> list[int]:
+        """Borra los cargos automaticos de un concepto y mes (restaurables desde audit_log)."""
+        with self._connect() as connection:
+            ids = [
+                row[0]
+                for row in connection.execute(
+                    "SELECT id FROM transactions WHERE projection_template_id = ? AND substr(created_at,1,7) = ? "
+                    "AND source_text = ? AND id IS NOT ?",
+                    (template_id, month, AUTO_REGISTER_SOURCE, keep),
+                )
+            ]
+        for transaction_id in ids:
+            self.delete_transaction(transaction_id)
+        return ids
+
+    def create_account(self, name: str, account_type: str = "bank", opening_balance_cents: int = 0) -> int:
+        name = name.strip()
+        if not name:
+            raise ValueError("El nombre de la cuenta es obligatorio")
+        with self._connect() as connection:
+            cursor = connection.execute(
+                "INSERT INTO accounts(created_at, name, account_type, opening_balance_cents) VALUES (?, ?, ?, ?)",
+                (self._now(), name, account_type, int(opening_balance_cents)),
+            )
+            return int(cursor.lastrowid)
+
+    def list_accounts(self, active_only: bool = True) -> list[sqlite3.Row]:
+        query = "SELECT * FROM accounts"
+        if active_only:
+            query += " WHERE active = 1"
+        query += " ORDER BY name"
+        with self._connect() as connection:
+            return connection.execute(query).fetchall()
+
+    def add_transfer(self, *, from_account_id: int, to_account_id: int, amount_cents: int, note: str = "", created_at: str | None = None) -> int:
+        if from_account_id == to_account_id or amount_cents <= 0:
+            raise ValueError("La transferencia debe unir dos cuentas distintas y tener importe positivo")
+        with self._connect() as connection:
+            account_ids = {row[0] for row in connection.execute("SELECT id FROM accounts WHERE active = 1 AND id IN (?, ?)", (from_account_id, to_account_id)).fetchall()}
+            if account_ids != {from_account_id, to_account_id}:
+                raise ValueError("La cuenta de origen o destino no existe")
+            cursor = connection.execute(
+                "INSERT INTO transfers(created_at, from_account_id, to_account_id, amount_cents, note) VALUES (?, ?, ?, ?, ?)",
+                (created_at or self._now(), from_account_id, to_account_id, amount_cents, note),
+            )
+            return int(cursor.lastrowid)
+
+    def account_balances(self) -> list[sqlite3.Row]:
+        with self._connect() as connection:
+            return connection.execute(
+                """
+                SELECT a.*, a.opening_balance_cents
+                    + COALESCE((SELECT SUM(t.amount_cents) FROM transfers t WHERE t.to_account_id = a.id), 0)
+                    - COALESCE((SELECT SUM(t.amount_cents) FROM transfers t WHERE t.from_account_id = a.id), 0)
+                    + COALESCE((SELECT SUM(CASE WHEN x.kind = 'income' THEN x.amount_cents ELSE -x.amount_cents END) FROM transactions x WHERE x.account_id = a.id), 0)
+                    AS balance_cents
+                FROM accounts a WHERE a.active = 1 ORDER BY a.name
+                """
+            ).fetchall()
+
+    def upsert_budget(self, month: str, category: str, amount_cents: int) -> None:
+        if amount_cents < 0:
+            raise ValueError("El presupuesto no puede ser negativo")
+        with self._connect() as connection:
+            connection.execute(
+                "INSERT INTO budgets(month, category, amount_cents) VALUES (?, ?, ?) ON CONFLICT(month, category) DO UPDATE SET amount_cents = excluded.amount_cents",
+                (month, category, amount_cents),
+            )
+
+    def list_budgets(self, month: str | None = None) -> list[sqlite3.Row]:
+        with self._connect() as connection:
+            if month:
+                return connection.execute("SELECT * FROM budgets WHERE month = ? ORDER BY category", (month,)).fetchall()
+            return connection.execute("SELECT * FROM budgets ORDER BY month, category").fetchall()
+
+    def create_savings_goal(self, name: str, target_cents: int, target_date: str | None = None, wallet_id: int | None = None) -> int:
+        if target_cents <= 0:
+            raise ValueError("El objetivo debe ser positivo")
+        with self._connect() as connection:
+            cursor = connection.execute(
+                "INSERT INTO savings_goals(created_at, name, target_cents, target_date, wallet_id) VALUES (?, ?, ?, ?, ?)",
+                (self._now(), name.strip(), target_cents, target_date, wallet_id),
+            )
+            return int(cursor.lastrowid)
+
+    def list_savings_goals(self, active_only: bool = True) -> list[sqlite3.Row]:
+        query = "SELECT * FROM savings_goals" + (" WHERE active = 1" if active_only else "") + " ORDER BY target_date, name"
+        with self._connect() as connection:
+            return connection.execute(query).fetchall()
+
+    def get_savings_settings(self) -> sqlite3.Row:
+        with self._connect() as connection:
+            connection.execute("INSERT OR IGNORE INTO savings_settings(id) VALUES (1)")
+            return connection.execute("SELECT * FROM savings_settings WHERE id = 1").fetchone()
+
+    def update_savings_settings(self, *, current_balance_cents: int, current_balance_date: str, include_current_balance: bool, emergency_monthly_cents: int) -> None:
+        if current_balance_cents < 0 or emergency_monthly_cents < 0:
+            raise ValueError("Los importes de ahorro no pueden ser negativos")
+        with self._connect() as connection:
+            connection.execute(
+                "INSERT INTO savings_settings(id, current_balance_cents, current_balance_date, include_current_balance, emergency_monthly_cents) VALUES (1, ?, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET current_balance_cents=excluded.current_balance_cents, current_balance_date=excluded.current_balance_date, include_current_balance=excluded.include_current_balance, emergency_monthly_cents=excluded.emergency_monthly_cents",
+                (current_balance_cents, current_balance_date, 1 if include_current_balance else 0, emergency_monthly_cents),
+            )
+        self.log_audit("update", "savings_settings", 1, "Saldo y reserva actualizados")
+
+    def create_savings_wallet(self, name: str, balance_cents: int, include_in_projection: bool = True) -> int:
+        if not name.strip() or balance_cents < 0:
+            raise ValueError("La cartera necesita nombre e importe válido")
+        with self._connect() as connection:
+            cursor = connection.execute("INSERT INTO savings_wallets(created_at, name, balance_cents, include_in_projection) VALUES (?, ?, ?, ?)", (self._now(), name.strip(), balance_cents, 1 if include_in_projection else 0))
+            wallet_id = int(cursor.lastrowid)
+        self.log_audit("create", "savings_wallet", wallet_id, "Cartera creada")
+        return wallet_id
+
+    def update_savings_wallet(self, wallet_id: int, *, name: str, balance_cents: int, include_in_projection: bool, active: bool = True) -> None:
+        if not name.strip() or balance_cents < 0:
+            raise ValueError("La cartera necesita nombre e importe válido")
+        with self._connect() as connection:
+            cursor = connection.execute("UPDATE savings_wallets SET name = ?, balance_cents = ?, include_in_projection = ?, active = ? WHERE id = ?", (name.strip(), balance_cents, 1 if include_in_projection else 0, 1 if active else 0, wallet_id))
+            if cursor.rowcount == 0:
+                raise KeyError(f"No existe la cartera {wallet_id}")
+        self.log_audit("update", "savings_wallet", wallet_id, "Cartera actualizada")
+
+    def list_savings_wallets(self, active_only: bool = True) -> list[sqlite3.Row]:
+        with self._connect() as connection:
+            return connection.execute("SELECT * FROM savings_wallets " + ("WHERE active = 1 " if active_only else "") + "ORDER BY name").fetchall()
 
     def add_receipt(
         self,
@@ -382,6 +914,7 @@ class FinanceDatabase:
         telegram_user_id: int | None = None,
         telegram_username: str | None = None,
         telegram_full_name: str | None = None,
+        created_at: str | None = None,
     ) -> int:
         with self._connect() as connection:
             cursor = connection.execute(
@@ -394,7 +927,7 @@ class FinanceDatabase:
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
-                    self._now(),
+                    created_at or self._now(),
                     local_path,
                     drive_file_id,
                     drive_url,
@@ -407,6 +940,33 @@ class FinanceDatabase:
                 ),
             )
             return int(cursor.lastrowid)
+
+    def telegram_message_already_stored(
+        self, telegram_user_id: int | None, telegram_message_id: int | None
+    ) -> bool:
+        """Indica si un mensaje de Telegram ya genero un ticket o un movimiento.
+
+        Telegram vuelve a entregar los mensajes que el bot recibio pero no llego a
+        confirmar (por ejemplo, si se cerro de golpe), asi que sin esta comprobacion
+        se registrarian dos veces.
+        """
+        if telegram_user_id is None or telegram_message_id is None:
+            return False
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT 1 FROM receipts
+                WHERE telegram_user_id = ? AND telegram_message_id = ?
+                UNION ALL
+                SELECT 1 FROM transactions
+                WHERE telegram_user_id = ? AND telegram_message_id = ? AND receipt_id IS NULL
+                UNION ALL
+                SELECT 1 FROM telegram_messages WHERE user_id = ? AND message_id = ?
+                LIMIT 1
+                """,
+                (telegram_user_id, telegram_message_id, telegram_user_id, telegram_message_id, telegram_user_id, telegram_message_id),
+            ).fetchone()
+        return row is not None
 
     def get_receipt(self, receipt_id: int) -> sqlite3.Row | None:
         with self._connect() as connection:
@@ -430,15 +990,48 @@ class FinanceDatabase:
                 (status, review_notes, receipt_id),
             )
 
+    def register_receipt_entries(self, receipt_id: int, entries: list[dict[str, object]], *, allow_existing: bool = False) -> list[int]:
+        with self.atomic():
+            return self._register_receipt_entries(receipt_id, entries, allow_existing=allow_existing)
+
+    def _register_receipt_entries(self, receipt_id: int, entries: list[dict[str, object]], *, allow_existing: bool = False) -> list[int]:
+        receipt = self.get_receipt(receipt_id)
+        if receipt is None:
+            raise KeyError(f"No existe el ticket {receipt_id}")
+        if not entries:
+            raise ValueError("El ticket necesita al menos una línea")
+        if not allow_existing:
+            with self._connect() as connection:
+                if connection.execute("SELECT 1 FROM transactions WHERE receipt_id = ? LIMIT 1", (receipt_id,)).fetchone():
+                    raise ValueError("El ticket ya está registrado. Edita sus movimientos vinculados para corregirlo.")
+        prepared: list[tuple[object, ...]] = []
+        for entry in entries:
+            kind = str(entry.get("kind") or "expense")
+            amount = int(entry.get("amount_cents") or 0)
+            category = str(entry.get("category") or "")
+            note = str(entry.get("note") or "").strip()
+            if kind not in {"expense", "income"} or amount <= 0 or category not in VALID_CATEGORIES or not note:
+                raise ValueError("Cada línea necesita tipo, importe, categoría y descripción")
+            prepared.append((kind, amount, category, note, str(entry.get("store") or ""), bool(entry.get("is_fixed")), entry.get("created_at")))
+        created_ids: list[int] = []
+        with self._connect() as connection:
+            for kind, amount, category, note, store, is_fixed, created_at in prepared:
+                cursor = connection.execute(
+                    """INSERT INTO transactions(created_at, kind, amount_cents, currency, category, note, store, is_fixed, source_text, receipt_local_path, telegram_message_id, telegram_user_id, telegram_username, telegram_full_name, receipt_id, review_status, inference_notes, paid_amount_cents)
+                       VALUES (?, ?, ?, 'EUR', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'registered', '[]', ?)""",
+                    (created_at or self._now(), kind, amount, category, note, store, int(is_fixed), receipt["caption"] or "", receipt["local_path"], receipt["telegram_message_id"], receipt["telegram_user_id"], receipt["telegram_username"], receipt["telegram_full_name"], receipt_id, amount),
+                )
+                created_ids.append(int(cursor.lastrowid))
+            connection.execute("UPDATE receipts SET status = 'processed', review_notes = COALESCE(review_notes, '') WHERE id = ?", (receipt_id,))
+        for transaction_id in created_ids:
+            self.auto_apply_projection_for_transaction(transaction_id)
+        return created_ids
+
     def get_transaction(self, transaction_id: int) -> sqlite3.Row | None:
         with self._connect() as connection:
             return connection.execute(
                 """
-                SELECT id, created_at, kind, amount_cents, currency, category, note,
-                       store, is_fixed, source_text, receipt_local_path,
-                       telegram_user_id, telegram_username, telegram_full_name,
-                       receipt_id, review_status, duplicate_of_id,
-                       inference_notes, projection_template_id
+                SELECT *
                 FROM transactions
                 WHERE id = ?
                 """,
@@ -504,11 +1097,7 @@ class FinanceDatabase:
                 raise KeyError(f"No existe el movimiento {transaction_id}")
             row = connection.execute(
                 """
-                SELECT id, created_at, kind, amount_cents, currency, category, note,
-                       store, is_fixed, source_text, receipt_local_path,
-                       telegram_user_id, telegram_username, telegram_full_name,
-                       receipt_id, review_status, duplicate_of_id,
-                       inference_notes, projection_template_id
+                SELECT *
                 FROM transactions
                 WHERE id = ?
                 """,
@@ -528,6 +1117,7 @@ class FinanceDatabase:
         group_name: str = "",
         recurrence: str = "monthly",
         start_month: str = "",
+        end_month: str = "",
         installment_current: int | None = None,
         installment_total: int | None = None,
         active: bool = True,
@@ -543,16 +1133,17 @@ class FinanceDatabase:
                 """
                 INSERT INTO projection_templates (
                     created_at, kind, name, default_amount_cents, category,
-                    group_name, recurrence, start_month, installment_current, installment_total,
+                    group_name, recurrence, start_month, end_month, installment_current, installment_total,
                     active, sort_order
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(kind, name) DO UPDATE SET
                     default_amount_cents = excluded.default_amount_cents,
                     category = excluded.category,
                     group_name = excluded.group_name,
                     recurrence = excluded.recurrence,
                     start_month = excluded.start_month,
+                    end_month = excluded.end_month,
                     installment_current = excluded.installment_current,
                     installment_total = excluded.installment_total,
                     active = excluded.active,
@@ -567,6 +1158,7 @@ class FinanceDatabase:
                     group_name,
                     recurrence,
                     start_month,
+                    end_month,
                     installment_current,
                     installment_total,
                     1 if active else 0,
@@ -590,6 +1182,7 @@ class FinanceDatabase:
         default_amount_cents: int | None = None,
         category: str | None = None,
         start_month: str | None = None,
+        end_month: str | None = None,
         installment_current: int | None = None,
         installment_total: int | None = None,
         clear_installments: bool = False,
@@ -606,6 +1199,7 @@ class FinanceDatabase:
             "default_amount_cents": default_amount_cents,
             "category": category,
             "start_month": start_month,
+            "end_month": end_month,
         }
         for column, value in values.items():
             if value is not None:
@@ -644,8 +1238,8 @@ class FinanceDatabase:
             row = connection.execute(
                 """
                 SELECT id, created_at, kind, name, default_amount_cents, category,
-                       group_name, recurrence, start_month, installment_current, installment_total,
-                       active, sort_order
+                       group_name, recurrence, start_month, end_month, installment_current, installment_total,
+                       active, sort_order, auto_register
                 FROM projection_templates
                 WHERE id = ?
                 """,
@@ -660,8 +1254,8 @@ class FinanceDatabase:
             return connection.execute(
                 """
                 SELECT id, created_at, kind, name, default_amount_cents, category,
-                       group_name, recurrence, start_month, installment_current, installment_total,
-                       active, sort_order
+                       group_name, recurrence, start_month, end_month, installment_current, installment_total,
+                       active, sort_order, auto_register
                 FROM projection_templates
                 WHERE id = ?
                 """,
@@ -708,6 +1302,37 @@ class FinanceDatabase:
             raise RuntimeError("No se pudo guardar el mes proyectado")
         return int(row["id"])
 
+    def end_projection_from(self, template_id: int, month: str) -> sqlite3.Row:
+        """Finish a recurring projection from ``month`` while preserving prior months."""
+        template = self.get_projection_template(template_id)
+        if template is None:
+            raise KeyError(f"No existe la proyeccion {template_id}")
+        start_month = str(template["start_month"] or month)
+        if month < start_month:
+            raise ValueError("El mes final no puede ser anterior al inicio")
+
+        if month == start_month:
+            with self._connect() as connection:
+                connection.execute("UPDATE projection_templates SET active = 0, end_month = ? WHERE id = ?", (month, template_id))
+                connection.execute(
+                    "UPDATE projection_occurrences SET status = 'skipped', note = ?, updated_at = ? WHERE template_id = ? AND month >= ?",
+                    ("Finalizado desde este mes", self._now(), template_id, month),
+                )
+        else:
+            current = datetime.strptime(month, "%Y-%m")
+            previous = (current.replace(day=1) - timedelta(days=1)).strftime("%Y-%m")
+            with self._connect() as connection:
+                connection.execute("UPDATE projection_templates SET active = 1, end_month = ? WHERE id = ?", (previous, template_id))
+                connection.execute(
+                    "UPDATE projection_occurrences SET status = 'skipped', note = ?, updated_at = ? WHERE template_id = ? AND month >= ?",
+                    ("Finalizado desde este mes", self._now(), template_id, month),
+                )
+        self.log_audit("end", "projection", template_id, f"Finalizada desde {month}")
+        updated = self.get_projection_template(template_id)
+        if updated is None:
+            raise KeyError(f"No existe la proyeccion {template_id}")
+        return updated
+
     def get_projection_occurrence(self, template_id: int, month: str) -> sqlite3.Row | None:
         with self._connect() as connection:
             return connection.execute(
@@ -725,8 +1350,8 @@ class FinanceDatabase:
             return connection.execute(
                 f"""
                 SELECT id, created_at, kind, name, default_amount_cents, category,
-                       group_name, recurrence, start_month, installment_current, installment_total,
-                       active, sort_order
+                       group_name, recurrence, start_month, end_month, installment_current, installment_total,
+                       active, sort_order, auto_register
                 FROM projection_templates
                 {where}
                 ORDER BY kind DESC, sort_order ASC, name ASC
@@ -865,11 +1490,7 @@ class FinanceDatabase:
         with self._connect() as connection:
             return connection.execute(
                 """
-                SELECT id, created_at, kind, amount_cents, currency, category, note,
-                       store, is_fixed, source_text, receipt_local_path,
-                       telegram_user_id, telegram_username, telegram_full_name,
-                       receipt_id, review_status, duplicate_of_id,
-                       inference_notes, projection_template_id
+                SELECT *
                 FROM transactions
                 ORDER BY created_at ASC, id ASC
                 """
@@ -924,6 +1545,7 @@ class FinanceDatabase:
         note = str(occurrence["note"]) if occurrence is not None else ""
         if not note.strip():
             note = f"Marcado automaticamente por movimiento #{transaction_id}: {row['note']}"
+        self.drop_auto_payments(template_id, month, keep=transaction_id)
         self.set_projection_occurrence(
             template_id=template_id,
             month=month,
@@ -938,6 +1560,9 @@ class FinanceDatabase:
         start_month = str(template["start_month"] or month)
         month_offset = self._month_distance(start_month, month)
         if month_offset < 0:
+            return False
+        end_month = str(template["end_month"] or "")
+        if end_month and month > end_month:
             return False
         installment_current = template["installment_current"]
         installment_total = template["installment_total"]
@@ -958,10 +1583,17 @@ class FinanceDatabase:
 
         template_tokens = set(re.findall(r"\w+", template_name))
         text_tokens = set(re.findall(r"\w+", normalized_text))
+        # A substring is not a concept: agua must not match Paraguay and
+        # a short label such as Cu must not match cuota/cuidado.
+        meaningful = {token for token in template_tokens if len(token) >= 3}
+        if not meaningful or not meaningful.intersection(text_tokens):
+            return 0
+        if len(meaningful) == 1 and self._normalize_text(str(transaction["category"] or "")) != self._normalize_text(str(template["category"] or "")):
+            return 0
         overlap = len(template_tokens & text_tokens)
         score = overlap * 18
 
-        if template_name in normalized_text:
+        if re.search(r"(?<!\w)" + re.escape(template_name) + r"(?!\w)", normalized_text):
             score += 80
         if normalized_text and normalized_text in template_name:
             score += 35
