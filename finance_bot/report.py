@@ -11,6 +11,7 @@ from string import Template
 
 from finance_bot.config import Settings
 from finance_bot.db import FinanceDatabase
+from finance_bot.calendar import CalendarStore, month_bounds
 from finance_bot.formatting import (
     fixed_label,
     format_date,
@@ -473,6 +474,17 @@ def report_data(settings: Settings, *, editable: bool = False) -> dict:
                 f"/api/attachments/{'transactions' if 'receipt' in row else 'receipts'}/{row['id']}" if path else ""
             )
     now = datetime.now(db.timezone)
+    calendar_start, _ = month_bounds(now.strftime("%Y-%m"))
+    next_month = (calendar_start.replace(day=28) + timedelta(days=4)).replace(day=1)
+    _, calendar_end = month_bounds(next_month.strftime("%Y-%m"))
+    calendar_data = CalendarStore(db).payload(calendar_start, calendar_end, today=now.date())
+    source_urls = {}
+    for event in calendar_data["events"]:
+        if event["hasSource"]:
+            source_urls[event["id"]] = f"/api/calendar/events/{event['id']}/source" if editable else _file_url(CalendarStore(db).get_event(event["id"])["source_path"])
+    for event in calendar_data["events"] + calendar_data["occurrences"] + calendar_data["today"]:
+        if event["hasSource"]:
+            event["sourceUrl"] = source_urls[event["id"]]
     accounts = [{"id": row["id"], "name": row["name"], "type": row["account_type"], "balanceCents": row["balance_cents"]} for row in db.account_balances()]
     budgets = [{"id": row["id"], "month": row["month"], "category": row["category"], "amountCents": row["amount_cents"]} for row in db.list_budgets()]
     goals = [{"id": row["id"], "name": row["name"], "targetCents": row["target_cents"], "currentCents": row["current_cents"], "targetDate": row["target_date"], "walletId": row["wallet_id"]} for row in db.list_savings_goals()]
@@ -485,10 +497,10 @@ def report_data(settings: Settings, *, editable: bool = False) -> dict:
         "emergencyMonthlyCents": savings_settings["emergency_monthly_cents"],
         "wallets": savings_wallets,
     }
-    return {"transactions": transactions, "receipts": receipts, "projections": projections,
+    return {"transactions": transactions, "receipts": receipts, "projections": projections, "calendar": calendar_data,
             "dataHealth": {"lastRecordAt": health["lastRecordAt"], "lastBackupAt": read_backup_status(settings.data_dir).get("verifiedAt")},
             "accounts": accounts, "budgets": budgets, "savingsGoals": goals, "savings": savings,
-            "generatedAt": now.strftime("%d/%m/%Y %H:%M"), "today": now.strftime("%Y-%m-%d"),
+            "generatedAt": now.strftime("%d/%m/%Y %H:%M"), "today": now.strftime("%Y-%m-%d"), "timezone": settings.timezone,
             "editable": editable, "categories": list(VALID_CATEGORIES)}
 
 
@@ -496,13 +508,17 @@ def render_report_html(settings: Settings, *, editable: bool = False) -> str:
     data = report_data(settings, editable=editable)
     assets = Path(__file__).with_name("ui")
     return Template((assets / "dashboard.html").read_text(encoding="utf-8")).substitute(
-        css=(assets / "dashboard.css").read_text(encoding="utf-8"),
+        css=(assets / "dashboard.css").read_text(encoding="utf-8") + "\n" + (assets / "family.css").read_text(encoding="utf-8"),
         js=(assets / "icons.js").read_text(encoding="utf-8")
+        + "\n"
+        + (assets / "calendar-ui.js").read_text(encoding="utf-8")
         + "\n"
         + (assets / "dashboard.js").read_text(encoding="utf-8"),
         data=json.dumps(data, ensure_ascii=False).replace("<", "\\u003c"),
-        runtime=('<div id="runtimeStatus" class="runtime" role="status"><span id="runtimeText">Comprobando conexión…</span>'
-                 '<button id="runtimeRefresh" class="quiet">Actualizar estado</button></div>') if editable else '',
+        runtime=('<div id="runtimeStatus" class="runtime" role="status"><details><summary>'
+                 '<span aria-hidden="true">🔌 </span><span id="runtimeSummary">Comprobando conexión…</span>'
+                 '</summary><div class="runtime-detail"><span id="runtimeText"></span>'
+                 '<button id="runtimeRefresh" class="secondary">Comprobar conexión</button></div></details></div>') if editable else '',
     )
 
 

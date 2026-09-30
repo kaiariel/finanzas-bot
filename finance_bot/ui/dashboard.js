@@ -37,7 +37,11 @@ if (typeof document !== 'undefined') (() => {
   'use strict';
   const $ = id => document.getElementById(id);
   let data = JSON.parse($('initialData').textContent);
-  document.querySelectorAll('.nav-icon[data-icon]').forEach(node => { node.innerHTML = iconSvg(node.dataset.icon); });
+  document.querySelectorAll('[data-icon]').forEach(node => {
+    node.setAttribute('aria-hidden', 'true');
+    if (node.dataset.emoji) node.textContent = node.dataset.emoji;
+    else node.innerHTML = iconSvg(node.dataset.icon);
+  });
   const money = cents => new Intl.NumberFormat('es-ES', { style: 'currency', currency: 'EUR' }).format(cents / 100);
   const esc = value => String(value ?? '').replace(/[&<>"']/g, char => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#039;' }[char]));
   const monthName = key => key ? new Intl.DateTimeFormat('es-ES', { month: 'long', year: 'numeric', timeZone: 'UTC' }).format(new Date(key + '-15T12:00:00Z')) : 'Todo el historial';
@@ -74,6 +78,19 @@ if (typeof document !== 'undefined') (() => {
     } catch (_) { /* The static report may not allow persistent storage. */ }
     return window.matchMedia?.('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
   }
+  function applyTextSize(size) {
+    const large = size === 'large';
+    document.documentElement.dataset.textSize = large ? 'large' : 'normal';
+    $('textSizeToggle').setAttribute('aria-pressed', String(large));
+    $('textSizeToggle').textContent = large ? 'Aa · Texto normal' : 'Aa · Texto grande';
+    $('textSizeToggle').setAttribute('aria-label', large ? 'Volver al tamaño de texto normal' : 'Aumentar el tamaño del texto');
+  }
+  $('textSizeToggle').addEventListener('click', () => {
+    const size = document.documentElement.dataset.textSize === 'large' ? 'normal' : 'large';
+    applyTextSize(size);
+    try { localStorage.setItem('finance-text-size', size); } catch (_) {}
+  });
+  try { applyTextSize(localStorage.getItem('finance-text-size')); } catch (_) { applyTextSize('normal'); }
   function saveState() { try { sessionStorage.setItem('finance-ui-v2', JSON.stringify(state)); } catch (_) {} }
   function notify(message, error = false, action = null) {
     clearTimeout(toastTimer); $('toast').textContent = message; $('toast').className = 'toast' + (error ? ' error' : ''); $('toast').hidden = false;
@@ -124,6 +141,7 @@ if (typeof document !== 'undefined') (() => {
     $('storeNames').innerHTML = unique(data.transactions.map(row => row.store)).map(store => '<option value="' + esc(store) + '"></option>').join('');
     const goalForm = $('goalForm'); if (goalForm && !goalForm.elements.walletId) goalForm.querySelector('button[type=submit]').insertAdjacentHTML('beforebegin', '<select name="walletId" aria-label="Cartera vinculada"><option value="">Sin cartera</option></select>'); if (goalForm?.elements.walletId) setOptions(goalForm.elements.walletId, (data.savings?.wallets || []).filter(wallet => wallet.active).map(wallet => [String(wallet.id), wallet.name]), 'Sin cartera');
     if (!$('budgetForm').elements.month.value) $('budgetForm').elements.month.value = data.today.slice(0, 7);
+    calendarUI.update();
     addPanelHelpButtons();
     showTab(state.tab, false);
   }
@@ -170,13 +188,17 @@ if (typeof document !== 'undefined') (() => {
     state.page = 1; render(); saveState();
   }
   function showTab(tab, scroll = true) {
-    if (!['dashboard', 'transactions', 'projection', 'savings', 'files', 'analytics'].includes(tab)) tab = 'dashboard';
+    if (!['dashboard', 'transactions', 'projection', 'savings', 'files', 'analytics', 'calendar'].includes(tab)) tab = 'dashboard';
+    if ($('mobileMoreModal')?.open) closeDialog('mobileMoreModal', true);
     state.tab = tab;
     document.querySelectorAll('[data-panel]').forEach(panel => { panel.hidden = panel.dataset.panel !== tab; });
     document.querySelectorAll('[data-tab]').forEach(button => { if (button.dataset.tab === tab) button.setAttribute('aria-current', 'page'); else button.removeAttribute('aria-current'); });
-    const [eyebrow, title] = { dashboard: ['Panel', 'Resumen'], transactions: ['El detalle', 'Movimientos'], projection: ['Plan del hogar', 'Proyección mensual'], savings: ['Dinero para tus objetivos', 'Ahorro'], files: ['Justificantes y audios', 'Archivos'], analytics: ['Calidad y previsión', 'Diagnóstico'] }[tab];
+    const [eyebrow, title] = { dashboard: ['Panel', 'Resumen'], transactions: ['El detalle', 'Movimientos'], projection: ['Plan del hogar', 'Proyección mensual'], savings: ['Dinero para tus objetivos', 'Ahorro'], files: ['Justificantes y audios', 'Archivos'], analytics: ['Calidad y previsión', 'Diagnóstico'], calendar: ['Agenda del hogar', 'Calendario'] }[tab];
     $('viewEyebrow').textContent = eyebrow; $('viewTitle').textContent = title;
-    $('globalFilters').hidden = ['projection', 'savings', 'analytics'].includes(tab);
+    $('viewEmoji').textContent = {dashboard:'🏡', transactions:'💸', projection:'🔭', savings:'🐷', files:'📁', analytics:'🔎', calendar:'📅'}[tab];
+    if (tab === 'dashboard') $('dashboardFiltersSlot').appendChild($('globalFilters'));
+    else document.querySelector('[data-panel="' + tab + '"]').before($('globalFilters'));
+    $('globalFilters').hidden = ['projection', 'savings', 'analytics', 'calendar'].includes(tab);
     $('moreFilters').hidden = !state.more; $('toggleFilters').setAttribute('aria-expanded', String(state.more)); $('toggleFilters').textContent = state.more ? 'Menos filtros' : 'Más filtros';
     render(); saveState(); if (scroll) window.scrollTo({ top: 0 });
   }
@@ -208,8 +230,10 @@ if (typeof document !== 'undefined') (() => {
     if (state.tab === 'analytics') renderAnalytics();
     if (state.tab === 'files') renderReceipts();
     if (state.tab === 'savings') renderSavings();
+    if (state.tab === 'calendar') calendarUI.render();
   }
   function renderSummary(rows) {
+    calendarUI.renderToday();
     const total = totals(rows), balance = total.income - total.expense;
     $('periodLabel').textContent = monthName(state.month);
     $('incomeTotal').textContent = money(total.income); $('expenseTotal').textContent = money(total.expense); $('balanceTotal').textContent = money(balance);
@@ -716,8 +740,14 @@ if (typeof document !== 'undefined') (() => {
   }
   async function refreshRuntimeStatus() {
     if (!$('runtimeStatus')) return;
-    try { const response = await fetch('/api/status', { cache: 'no-store' }); if (!response.ok) throw new Error(); const status = await response.json(); const backup = status.lastBackupAt ? ' · copia verificada ' + new Date(status.lastBackupAt).toLocaleDateString('es-ES') : ' · sin copia verificada'; $('runtimeText').textContent = (status.bot.running === true ? 'Bot activo' : status.bot.running === false ? 'Bot detenido' : 'Bot: estado no confirmado') + ' · Panel conectado · ' + status.pendingCount + ' archivos pendientes' + backup; }
-    catch (_) { $('runtimeText').textContent = 'Sin conexión con el panel. Los datos visibles pueden estar desactualizados.'; }
+    try {
+      const response = await fetch('/api/status', { cache: 'no-store' }); if (!response.ok) throw new Error();
+      const status = await response.json();
+      $('runtimeSummary').textContent = status.bot.running === false ? 'La app está conectada · revisar Telegram' : 'La app está conectada';
+      const backup = status.lastBackupAt ? ' · copia verificada ' + new Date(status.lastBackupAt).toLocaleDateString('es-ES') : ' · sin copia verificada';
+      $('runtimeText').textContent = (status.bot.running === true ? 'Telegram activo' : status.bot.running === false ? 'Telegram detenido' : 'Estado de Telegram sin confirmar') + ' · ' + status.pendingCount + ' archivos pendientes' + backup;
+    }
+    catch (_) { $('runtimeSummary').textContent = 'La app ha perdido la conexión'; $('runtimeText').textContent = 'Los datos visibles pueden estar desactualizados. Vuelve a abrir Iniciar Finanzas.'; }
   }
   Object.entries(filterIds).forEach(([key, id]) => $(id).addEventListener('input', () => { state[key] = $(id).value; state.page = 1; state.filesShown = 24; render(); saveState(); }));
   $('toggleFilters').addEventListener('click', () => { state.more = !state.more; showTab(state.tab, false); });
@@ -791,5 +821,9 @@ if (typeof document !== 'undefined') (() => {
   });
   $('runtimeRefresh')?.addEventListener('click', refreshRuntimeStatus);
   window.addEventListener('beforeunload', event => { for (const dialog of document.querySelectorAll('dialog[open]')) { const form = dialog.querySelector('form'); if (form && formSnapshot(form) !== snapshots.get(dialog.id)) { event.preventDefault(); event.returnValue = ''; return; } } });
+  const calendarUI = window.createFinanceCalendar({ getData: () => data, refreshData, mutate, notify, openDialog, closeDialog });
+  $('mobileMore').addEventListener('click', () => openDialog('mobileMoreModal'));
+  $('mobileThemeToggle').addEventListener('click', () => $('themeToggle').click());
+  setInterval(() => { if (!data.editable || document.hidden) return; const today = new Intl.DateTimeFormat('sv-SE', { timeZone: data.timezone || 'Europe/Madrid' }).format(new Date()); if (today !== data.today) refreshData().catch(error => notify(error.message, true)); }, 60000);
   applyTheme(preferredTheme()); setup(); refreshRuntimeStatus(); if (data.editable) setInterval(refreshRuntimeStatus, 30000);
 })();

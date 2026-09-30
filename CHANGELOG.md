@@ -3,6 +3,40 @@
 Registro de cambios funcionales, del más reciente al más antiguo. El detalle de uso
 de cada función está en el [README](README.md).
 
+## 2026-09-30 · Agenda familiar, accesibilidad e inicio de Windows
+
+- Rediseño azul claro, tarjetas con bordes visibles y emojis acompañados de texto.
+  Se conservan Resumen, Movimientos, Proyección, Ahorro, Archivos y Diagnóstico;
+  Calendario es una sección adicional. Modo oscuro y navegación móvil conservados.
+- `Hoy` y los accesos familiares aparecen antes de los filtros financieros y de
+  `Así va el mes`. Las comidas muestran todos los platos, con texto de 18 px y
+  opción de texto grande persistente. Los botones principales tienen 44 px de alto,
+  foco visible y el calendario admite navegación con las flechas del teclado.
+- Calendario mensual y agenda: eventos puntuales, repetición diaria, semanal con
+  días elegibles, mensual y anual, hora y fecha final opcionales. Edición del día
+  seleccionado o de toda la serie, completado, omisión y archivo de series.
+  Los meses sin el día indicado se omiten; los borradores de cada ámbito se conservan.
+- `/hoy` y el texto `hoy` consultan la misma agenda en Europe/Madrid, respetan los
+  usuarios autorizados y dividen respuestas largas sin perder los detalles.
+  La consulta incluye lo añadido en la app y no activa avisos automáticos.
+- Nuevas tablas `calendar_events` y `calendar_occurrences`, con cambios auditados.
+  La agenda no altera importes ni estados de las proyecciones financieras.
+- Importador JSON revisado con claves de origen únicas, copia de SQLite verificada
+  previa y conservación de correcciones. Los documentos originales se enlazan
+  desde el panel y permanecen bajo `data/calendar/`, excluida de Git.
+- `Iniciar Finanzas.vbs` abre sin consola. Los accesos `.cmd` delegan en él y la
+  reapertura reutiliza la sesión existente, incluido el proceso hijo de Python en
+  Windows. Un bloqueo coordina aperturas simultáneas sin duplicar bot ni panel.
+- Inicio automático mediante `Finanzas.vbs` en la carpeta Inicio del usuario,
+  sin consola ni navegador. Instalación repetible y desactivación; migración del
+  antiguo acceso propio `.cmd` conservando scripts ajenos. La configuración del
+  escritorio y de Inicio se aplica localmente y se puede reinstalar en otro equipo.
+- Maqueta inicial en `prototypes/inicio-familiar/`, con datos ficticios y capturas;
+  documentada como referencia histórica, independiente de la aplicación real.
+- Validación del conjunto: 127 pruebas automatizadas; siete secciones comprobadas
+  en 360, 390, 768 y 1280 px, texto normal/grande y modo oscuro. Verificados edición
+  puntual, repeticiones semanales/mensuales, inicio/cierre y reaperturas simultáneas.
+
 ## 2026-09-25 · Presupuesto semanal para Hogar y Alimentación
 
 - El sobre de `Hogar y Alimentación` admite un **presupuesto semanal** (columna

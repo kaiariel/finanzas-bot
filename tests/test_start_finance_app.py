@@ -5,6 +5,7 @@ import json
 import os
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -192,11 +193,123 @@ def test_rotate_log_keeps_the_previous_file(tmp_path) -> None:
     assert (tmp_path / "bot.log.1").read_text(encoding="utf-8") == "x" * 20
 
 
-def test_autostart_script_starts_detached_without_browser(tmp_path) -> None:
+def test_autostart_uses_the_windowless_launcher_without_browser() -> None:
     start_app = _load_start_finance_app()
 
-    script = start_app._autostart_script(tmp_path / "pythonw.exe")
+    script = start_app._autostart_script()
 
-    assert f'cd /d "{start_app.ROOT}"' in script
-    assert "--detached --no-browser" in script
+    assert str(start_app.ROOT / "Iniciar Finanzas.vbs") in script
+    assert "--no-browser" in script
+    assert "wscript.exe" in script
+    assert 'shell.Run command, 0, False' in script
     assert start_app.build_parser().parse_args(["--install-autostart"]).install_autostart
+
+
+def test_autostart_install_migrates_and_can_be_removed(tmp_path, monkeypatch):
+    start_app = _load_start_finance_app()
+    monkeypatch.setattr(start_app, "_startup_dir", lambda: tmp_path)
+    legacy = tmp_path / "Finanzas.cmd"
+    legacy.write_text(f'cd /d "{start_app.ROOT}"\npython scripts/start_finance_app.py --no-browser', encoding="utf-8")
+    assert start_app._install_autostart() == 0
+    target = tmp_path / "Finanzas.vbs"
+    assert "--no-browser" in target.read_text(encoding="utf-16")
+    assert not legacy.exists()
+    assert start_app._install_autostart() == 0
+    assert len(list(tmp_path.iterdir())) == 1
+    assert start_app._remove_autostart() == 0
+    assert not target.exists()
+    assert start_app._remove_autostart() == 0
+
+
+def test_autostart_preserves_an_unrelated_legacy_script(tmp_path, monkeypatch):
+    start_app = _load_start_finance_app()
+    monkeypatch.setattr(start_app, "_startup_dir", lambda: tmp_path)
+    legacy = tmp_path / "Finanzas.cmd"
+    legacy.write_text('echo Other application', encoding="utf-8")
+    assert start_app._install_autostart() == 0
+    assert legacy.read_text(encoding="utf-8") == 'echo Other application'
+
+
+@pytest.mark.parametrize("matching", [True, False])
+def test_reuse_requires_the_registered_supervisor_and_dashboard(tmp_path, monkeypatch, matching):
+    start_app = _load_start_finance_app()
+    runtime = tmp_path / "runtime_status.json"
+    runtime.write_text(json.dumps({"supervisor_pid": 4242, "dashboard_pid": 4343}), encoding="utf-8")
+    monkeypatch.setattr(start_app, "_process_is_running", lambda pid: pid in {4242, 4343})
+    payload = {"ok": True, "supervisor": {"running": True, "pid": 4242},
+               "dashboard": {"running": True, "pid": 4343 if matching else 9999}}
+
+    class Response:
+        status = 200
+        def __enter__(self): return self
+        def __exit__(self, *args): pass
+        def read(self, size): return json.dumps(payload).encode()
+
+    monkeypatch.setattr(start_app, "urlopen", lambda *args, **kwargs: Response())
+    assert start_app._running_dashboard_matches("http://127.0.0.1:8765", runtime) is matching
+
+
+def test_reuse_ignores_dead_sessions_and_invalid_responses(tmp_path, monkeypatch):
+    start_app = _load_start_finance_app()
+    path = tmp_path / "runtime_status.json"
+    path.write_text(json.dumps({"supervisor_pid": 4242, "dashboard_pid": 4343}), encoding="utf-8")
+    monkeypatch.setattr(start_app, "_process_is_running", lambda pid: False)
+    monkeypatch.setattr(start_app, "urlopen", lambda *a, **k: pytest.fail("No HTTP request for dead sessions"))
+    assert not start_app._running_dashboard_matches("http://127.0.0.1:8765", path)
+    monkeypatch.setattr(start_app, "_process_is_running", lambda pid: True)
+    class Response:
+        status = 200
+        def __enter__(self): return self
+        def __exit__(self, *args): pass
+        def read(self, size): return b'{"ok":true,"supervisor":null}'
+    monkeypatch.setattr(start_app, "urlopen", lambda *a, **k: Response())
+    assert not start_app._running_dashboard_matches("http://127.0.0.1:8765", path)
+
+
+def test_second_launch_opens_existing_app_without_spawning(tmp_path, monkeypatch):
+    start_app = _load_start_finance_app()
+    args = start_app.build_parser().parse_args(["--detached"])
+    settings = SimpleNamespace(data_dir=tmp_path)
+    opened = []
+    monkeypatch.setattr(start_app, "_running_dashboard_matches", lambda *a: True)
+    monkeypatch.setattr(start_app.webbrowser, "open", opened.append)
+    monkeypatch.setattr(start_app, "_run_detached", lambda *a: pytest.fail("Already running; do not spawn"))
+    assert start_app._start_detached_once(args, settings) == start_app.EXIT_OK
+    assert opened == ["http://127.0.0.1:8765"]
+    assert not (tmp_path / "launch_result.json").exists()
+    args.no_browser = True
+    assert start_app._start_detached_once(args, settings) == start_app.EXIT_OK
+    assert len(opened) == 1
+
+
+def test_detached_launch_waits_for_the_other_launcher(tmp_path, monkeypatch):
+    start_app = _load_start_finance_app()
+    attempts = []
+    class LaunchLock:
+        def __init__(self, path): pass
+        def __enter__(self):
+            attempts.append(True)
+            if len(attempts) == 1: raise start_app.AlreadyRunningError()
+        def __exit__(self, *args): pass
+    monkeypatch.setattr(start_app, "SingleInstance", LaunchLock)
+    monkeypatch.setattr(start_app.time, "sleep", lambda seconds: None)
+    monkeypatch.setattr(start_app, "_reuse_running_app", lambda *a: True)
+    monkeypatch.setattr(start_app, "_run_detached", lambda *a: pytest.fail("The first launcher already started it"))
+    assert start_app._start_detached_once(start_app.build_parser().parse_args([]), SimpleNamespace(data_dir=tmp_path)) == 0
+    assert len(attempts) == 2
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows venv redirector")
+def test_dashboard_recognizes_the_venv_child_but_not_unrelated_processes(monkeypatch):
+    start_app = _load_start_finance_app()
+    monkeypatch.setattr(start_app, "_windows_parent_pid", lambda pid: {4344: 4343, 9999: 8888}.get(pid))
+    assert start_app._dashboard_pid_matches(4343, 4343)
+    assert start_app._dashboard_pid_matches(4343, 4344)
+    assert not start_app._dashboard_pid_matches(4343, 9999)
+    assert not start_app._dashboard_pid_matches(4343, None)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows process inventory")
+def test_windows_process_parent_matches_os_getppid():
+    start_app = _load_start_finance_app()
+    assert start_app._windows_parent_pid(os.getpid()) == os.getppid()

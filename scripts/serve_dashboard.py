@@ -9,12 +9,13 @@ import sys
 from datetime import date, datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from finance_bot.config import Settings
 from finance_bot.db import FinanceDatabase
+from finance_bot.calendar import CalendarStore, month_bounds
 from finance_bot.formatting import parse_created_at
 from finance_bot.parser import VALID_CATEGORIES, amount_to_cents
 from finance_bot.report import generate_report, render_report_html, report_data
@@ -274,6 +275,24 @@ class DashboardHandler(BaseHTTPRequestHandler):
         if path == "/api/data":
             self._send_json(200, report_data(self.settings, editable=True))
             return
+        if path == "/api/calendar":
+            db = FinanceDatabase(self.settings.sqlite_db_path, self.settings.timezone)
+            month = parse_qs(urlparse(self.path).query).get("month", [datetime.now(db.timezone).strftime("%Y-%m")])[0]
+            try:
+                start, end = month_bounds(_parse_month(month))
+            except ValueError as exc:
+                self._send_json(400, {"ok": False, "error": str(exc)})
+                return
+            calendar = CalendarStore(db).payload(start, end)
+            for event in calendar["events"] + calendar["occurrences"] + calendar["today"]:
+                if event["hasSource"]:
+                    event["sourceUrl"] = f"/api/calendar/events/{event['id']}/source"
+            self._send_json(200, calendar)
+            return
+        calendar_source = re.fullmatch(r"/api/calendar/events/(\d+)/source", path)
+        if calendar_source:
+            self._attachment("calendar", int(calendar_source.group(1)))
+            return
         attachment = re.fullmatch(r"/api/attachments/(transactions|receipts)/(\d+)", path)
         if attachment:
             self._attachment(attachment.group(1), int(attachment.group(2)))
@@ -285,8 +304,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
 
     def _attachment(self, kind: str, item_id: int) -> None:
         db = FinanceDatabase(self.settings.sqlite_db_path, self.settings.timezone)
-        row = db.get_transaction(item_id) if kind == "transactions" else db.get_receipt(item_id)
-        value = row["receipt_local_path" if kind == "transactions" else "local_path"] if row else None
+        row = CalendarStore(db).get_event(item_id) if kind == "calendar" else db.get_transaction(item_id) if kind == "transactions" else db.get_receipt(item_id)
+        value = row["source_path" if kind == "calendar" else "receipt_local_path" if kind == "transactions" else "local_path"] if row else None
         path = Path(value) if value else None
         allowed = {".jpg", ".jpeg", ".png", ".webp", ".gif", ".pdf", ".ogg", ".mp3", ".wav", ".m4a", ".opus"}
         if not path or path.suffix.lower() not in allowed:
@@ -307,6 +326,9 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self._send_json(403, {"ok": False, "error": "Origen de edición no permitido."})
             return
         path = urlparse(self.path).path
+        calendar_create = path == "/api/calendar/events"
+        calendar_event = re.fullmatch(r"/api/calendar/events/(\d+)", path)
+        calendar_occurrence = re.fullmatch(r"/api/calendar/events/(\d+)/(\d{4}-\d{2}-\d{2})", path)
         match = re.fullmatch(r"/api/transactions/(\d+)", path)
         undo_match = re.fullmatch(r"/api/transactions/(\d+)/undo", path)
         restore_match = re.fullmatch(r"/api/transactions/(\d+)/restore", path)
@@ -323,13 +345,23 @@ class DashboardHandler(BaseHTTPRequestHandler):
         projection_end_match = re.fullmatch(r"/api/projections/(\d+)/(\d{4}-\d{2})/from", path)
         projection_match = re.fullmatch(r"/api/projections/(\d+)/(\d{4}-\d{2})", path)
         projection_create = path == "/api/projections"
-        if not match and not undo_match and not restore_match and not payment_match and not create_transaction and not create_account and not create_transfer and not create_budget and not create_goal and not savings_settings and not savings_wallet and not receipt_review and not status_match and not projection_end_match and not projection_match and not projection_create:
+        if not calendar_create and not calendar_event and not calendar_occurrence and not match and not undo_match and not restore_match and not payment_match and not create_transaction and not create_account and not create_transfer and not create_budget and not create_goal and not savings_settings and not savings_wallet and not receipt_review and not status_match and not projection_end_match and not projection_match and not projection_create:
             self._send_json(404, {"ok": False, "error": "Ruta no encontrada."})
             return
 
         try:
             payload = self._read_json()
-            if create_transaction:
+            if calendar_create or calendar_event or calendar_occurrence:
+                db = FinanceDatabase(self.settings.sqlite_db_path, self.settings.timezone)
+                store = CalendarStore(db)
+                if calendar_occurrence:
+                    if not {"status", "overrides"}.intersection(payload):
+                        raise ValueError("Falta el cambio para este día.")
+                    store.set_occurrence(int(calendar_occurrence.group(1)), calendar_occurrence.group(2), status=payload.get("status"), overrides=payload.get("overrides"))
+                else:
+                    store.save_event(payload, int(calendar_event.group(1)) if calendar_event else None)
+                generate_report(self.settings)
+            elif create_transaction:
                 self._create_transaction(payload)
             elif create_account:
                 db = FinanceDatabase(self.settings.sqlite_db_path, self.settings.timezone)
@@ -475,13 +507,20 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self._send_json(403, {"ok": False, "error": "Origen de edición no permitido."})
             return
         path = urlparse(self.path).path
+        calendar_event = re.fullmatch(r"/api/calendar/events/(\d+)", path)
         projection_end_match = re.fullmatch(r"/api/projections/(\d+)/(\d{4}-\d{2})/from", path)
         projection_match = re.fullmatch(r"/api/projections/(\d+)/(\d{4}-\d{2})", path)
         transaction_match = re.fullmatch(r"/api/transactions/(\d+)", path)
-        if not projection_match and not projection_end_match and not transaction_match:
+        if not calendar_event and not projection_match and not projection_end_match and not transaction_match:
             self._send_json(404, {"ok": False, "error": "Ruta no encontrada."})
             return
         try:
+            if calendar_event:
+                db = FinanceDatabase(self.settings.sqlite_db_path, self.settings.timezone)
+                CalendarStore(db).archive_event(int(calendar_event.group(1)))
+                generate_report(self.settings)
+                self._send_json(200, {"ok": True})
+                return
             if transaction_match:
                 db = FinanceDatabase(self.settings.sqlite_db_path, self.settings.timezone)
                 db.delete_transaction(int(transaction_match.group(1)))

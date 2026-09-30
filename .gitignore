@@ -16,3 +16,4 @@ reports/
 *.csv
 .codex_tmp_tests_ui/
 .codex_tmp_plan_render/
+tmp/

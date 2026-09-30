@@ -38,6 +38,13 @@ lista de movimientos hasta que se revisan y se convierten en entradas contables.
 
 El historial fechado y completo está en [CHANGELOG.md](CHANGELOG.md). Resumen:
 
+- El panel adopta una paleta azul clara con tarjetas suaves y conserva Resumen,
+  Movimientos, Proyección, Ahorro, Archivos y Diagnóstico. En móvil, `Más` da acceso
+  a Proyección y al resto de los módulos; el modo oscuro sigue disponible.
+- Nuevo Calendario familiar con eventos puntuales o diarios, semanales, mensuales
+  y anuales. El panel `Hoy`, encima del resumen mensual, muestra desayunos, comidas
+  y recordatorios. Telegram consulta la misma agenda con `/hoy` o el texto `hoy`.
+
 - `Resumen` y `Proyección` muestran una sola cifra principal, el **cierre estimado del
   mes**, con su cuenta a la vista: registrado hasta hoy + por cobrar − por pagar. El
   plan completo del mes aparece como dato secundario.
@@ -192,20 +199,21 @@ G:\Mi unidad\Finanzas - Tickets\2026-06 Junio
 
 ### Inicio recomendado en Windows
 
-Haz doble clic en `Iniciar Finanzas.cmd`. El lanzador inicia el bot y el panel
-en segundo plano, abre el navegador, evita instancias duplicadas y guarda los
-errores en `data/logs`.
+Haz doble clic en `Iniciar Finanzas.vbs` o en el acceso de Finanzas del escritorio.
+El lanzador inicia el bot y el panel sin consola, abre el navegador y reutiliza
+la sesión activa si ya está funcionando. `Iniciar Finanzas.cmd` sigue siendo
+compatible y delega en el mismo acceso. Los registros están en `data/logs`.
 
 El lanzador **espera a que el arranque se confirme** antes de dar por buena la
-puesta en marcha. Si algo falla, la ventana no se cierra: muestra el motivo, el
-codigo de salida y la ruta del registro. Ademas, si una sesion anterior quedo a
+puesta en marcha. Si algo falla, aparece un aviso con el código de salida y la
+ruta del registro. Si una sesión anterior quedó a
 medias (por ejemplo, cerrada desde el Administrador de tareas), cierra los
 procesos huerfanos que ocupaban el puerto y continua.
 
 | Codigo | Significado |
 | --- | --- |
-| 0 | Finanzas se inicio correctamente. |
-| 2 | Ya estaba iniciada o el puerto `8765` esta ocupado por otro programa. |
+| 0 | Finanzas se inició correctamente o se abrió la sesión que ya estaba activa. |
+| 2 | El puerto `8765` está ocupado y no se ha podido verificar una sesión reutilizable. |
 | 3 | El panel no llego a responder; revisa `data/logs/dashboard.log`. |
 | 4 | El arranque no se confirmo en 60 segundos. |
 | 5 | Error inesperado; el registro incluye el detalle completo. |
@@ -226,7 +234,17 @@ navegador):
 .venv-working\Scripts\python.exe scripts\start_finance_app.py --install-autostart
 ```
 
-Se desactiva con `--remove-autostart`.
+Se instala `Finanzas.vbs` en la carpeta Inicio del usuario. Arranca el bot y el
+panel al iniciar sesión; no es un servicio que funcione antes de entrar en Windows.
+Puedes ejecutar la instalación de nuevo sin duplicar el acceso. Migra el antiguo
+`Finanzas.cmd` creado por este proyecto. Si cambias la carpeta del proyecto, vuelve
+a instalarlo para actualizar la ruta.
+
+Se desactiva con:
+
+```powershell
+.venv-working\Scripts\python.exe scripts\start_finance_app.py --remove-autostart
+```
 
 Al arrancar, el bot:
 
@@ -250,6 +268,7 @@ Si uno de los procesos se cae, el supervisor mantiene el otro activo y lo
 relanza con una espera creciente (5 s, 10 s, 20 s... hasta 5 min). Los logs se
 rotan al superar 5 MB (se conserva el anterior como `.log.1`). Los bloqueos `data/finance_app.lock` y
 `data/telegram_bot.lock` evitan iniciar dos supervisores o dos bots simultaneamente.
+`data/finance_launch.lock` coordina los clics simultáneos durante el arranque.
 
 Archivos de diagnostico:
 
@@ -528,7 +547,7 @@ plegable `Mis cuentas y transferencias`, pero no se suman automáticamente al ah
 Las transferencias internas se guardan separadas y no cuentan como ingresos o gastos.
 Los presupuestos por categoría también se mantienen en un apartado plegable.
 
-Cuando el panel se inicia mediante `Iniciar Finanzas.cmd`, muestra el estado del bot,
+Cuando el panel se inicia mediante el lanzador, muestra el estado del bot,
 el servidor local, la ultima actividad registrada y la cantidad de tickets pendientes.
 El estado se actualiza cada cinco segundos y tambien puede refrescarse con el boton
 `Actualizar estado`.
@@ -574,6 +593,97 @@ un `Origin` o `Host` ajenos al propio panel. Casi todos los cambios quedan en
 | DELETE | `/api/projections/<id>/<AAAA-MM>` | Omitir el concepto ese mes. |
 | POST | `/api/accounts`, `/api/transfers`, `/api/budgets` | Cuentas, transferencias y presupuestos. |
 | POST | `/api/savings-goals`, `/api/savings-settings`, `/api/savings-wallets` | Ahorro. |
+
+## Inicio cómodo y lectura accesible
+
+Abre `Iniciar Finanzas.vbs` o el acceso de Finanzas del escritorio para iniciar sin
+consola. Los accesos `Iniciar Finanzas.cmd` y `Cerrar Finanzas.cmd` también delegan
+en ese mismo inicio. Si la app ya funciona, vuelve a abrir su panel sin arrancar
+otro bot o servidor. Ante un fallo real aparece un aviso con la ruta del registro.
+
+Para iniciar automáticamente al entrar en Windows, ejecuta
+`.venv-working\Scripts\python.exe -B scripts\start_finance_app.py --install-autostart`.
+Se instala `Finanzas.vbs` en la carpeta Inicio del usuario: arranca sin consola ni
+navegador y reutiliza la sesión existente. Usa `--remove-autostart` para desactivarlo.
+
+En la cabecera, `Aa · Texto grande` amplía la lectura y recuerda la preferencia.
+Los emojis acompañan a nombres de secciones y acciones; puedes recorrer los días
+del calendario con las flechas del teclado. Hoy y los accesos familiares están
+antes de los filtros del mes en el inicio.
+
+## Calendario familiar y Hoy
+
+El calendario muestra los platos concretos del menú, con letra más grande. Al tocar
+un día, sus detalles aparecen encima del mes: usa `Editar detalles` o `Añadir a este
+día`. El formulario incluye `Platos y detalles` y `Repetición` (cada semana con días
+elegibles o cada mes). En eventos recurrentes, `Cambiar repetición de la serie`
+permite modificar la regla; la edición de un día conserva su propio borrador.
+
+El calendario comparte la base local con las finanzas, en tablas independientes.
+Sus eventos no crean gastos ni ingresos, y los filtros del resumen financiero no
+afectan a `Hoy` ni al calendario.
+
+- Usa `Añadir evento` para indicar título, tipo, persona, fecha, hora opcional y
+  detalles. Elige una sola fecha o una repetición diaria, semanal (días elegibles),
+  mensual o anual, con fecha final opcional.
+- En una repetición mensual o anual se mantiene el día exacto: una fecha inexistente,
+  como el 31 de febrero, se omite.
+- Al editar, elige `Solo este día` o `Toda la serie`. `Completar` y `Omitir este día`
+  cambian solo esa fecha; `Mostrar omitidos` permite restaurarla. Retirar toda la
+  serie la archiva, conservando su registro en la base.
+- `Hoy` usa la fecha de la zona horaria configurada (Europe/Madrid). El bot responde
+  a `/hoy` y a `hoy`, respetando los usuarios autorizados y mostrando también los
+  eventos que añadas en el panel. La hora organiza la agenda; la consulta no implica
+  avisos automáticos por Telegram.
+- Las comidas y desayunos importados enlazan al documento original. El HTML
+  exportado es una copia de consulta con el mes actual y el siguiente; el panel
+  local permite navegar por otros meses y editar.
+
+Los documentos de guardería se guardan en `data/calendar/sources/`, que está
+excluida de Git. La importación revisada se encuentra en `data/calendar/`.
+Para importar otros eventos desde un JSON revisado:
+
+```powershell
+.venv-working\Scripts\python.exe scripts\import_calendar.py archivo-eventos.json
+```
+
+El archivo debe contener una lista de objetos con `title`, `kind`, `startDate`,
+`recurrence` y una `sourceKey` única. Puede añadir `details`, `person`, `time`,
+`endDate`, `weekdays` (0=lunes a 6=domingo), `sourceLabel` y `sourcePath`.
+La importación crea una copia verificada antes de actualizar el esquema y guardar
+eventos. Reimportar la misma clave no duplica ni reemplaza correcciones familiares.
+
+Ejemplo mínimo de importación (sin documentos personales):
+
+```json
+[
+  {
+    "sourceKey": "recordatorio-ejemplo-semanal",
+    "title": "Preparar mochila",
+    "details": "Ropa de recambio y botella de agua",
+    "kind": "reminder",
+    "startDate": "2026-10-01",
+    "recurrence": "weekly",
+    "weekdays": [0, 2]
+  }
+]
+```
+
+Los documentos originales, menús importados, copias de SQLite, accesos del
+escritorio y configuración instalada en Windows son datos o ajustes locales; no
+se publican con el código. El importador conserva las correcciones hechas en la app.
+La maqueta inicial se conserva en `prototypes/inicio-familiar/` con datos ficticios.
+
+API de la agenda:
+
+| Método | Ruta | Uso |
+| --- | --- | --- |
+| GET | `/api/calendar?month=AAAA-MM` | Series y ocurrencias del mes, incluyendo omitidas. |
+| POST | `/api/calendar/events` | Crear un evento o serie. |
+| POST | `/api/calendar/events/<id>` | Editar la serie. |
+| POST | `/api/calendar/events/<id>/<AAAA-MM-DD>` | Estado o campos `overrides` de un solo día. |
+| DELETE | `/api/calendar/events/<id>` | Archivar la serie. |
+| GET | `/api/calendar/events/<id>/source` | Abrir el documento registrado de origen. |
 
 ## Proyecciones
 
@@ -839,7 +949,9 @@ El repositorio deberia contener:
 finance_bot/
 scripts/
 tests/
+Iniciar Finanzas.vbs
 Iniciar Finanzas.cmd
+Cerrar Finanzas.cmd
 run_bot.py
 requirements.txt
 requirements-voice.txt
@@ -875,7 +987,7 @@ git status --short
 git diff --check
 .venv\Scripts\python.exe -B -m pytest -q
 git switch -c mejora-inicio-finanzas
-git add README.md .gitignore run_bot.py "Iniciar Finanzas.cmd" finance_bot scripts tests
+git add README.md CHANGELOG.md .gitignore run_bot.py "Iniciar Finanzas.vbs" "Iniciar Finanzas.cmd" "Cerrar Finanzas.cmd" finance_bot scripts tests prototypes
 git status --short
 git diff --cached --stat
 git diff --cached
@@ -890,7 +1002,7 @@ Si trabajas solo y prefieres subir directamente a `main`, usa:
 
 ```powershell
 git switch main
-git add README.md .gitignore run_bot.py "Iniciar Finanzas.cmd" finance_bot scripts tests
+git add README.md CHANGELOG.md .gitignore run_bot.py "Iniciar Finanzas.vbs" "Iniciar Finanzas.cmd" "Cerrar Finanzas.cmd" finance_bot scripts tests prototypes
 git commit -m "Add one-click finance app launcher"
 git push origin main
 ```
@@ -982,7 +1094,7 @@ El bot no arranca:
 El lanzador indica que el puerto `8765` esta ocupado:
 
 - Si el panel quedo huerfano de una sesion anterior, el lanzador lo cierra solo:
-  vuelve a hacer doble clic en `Iniciar Finanzas.cmd`.
+  vuelve a hacer doble clic en `Iniciar Finanzas.vbs`.
 - Si el aviso persiste, ejecuta `Cerrar Finanzas.cmd` y reintenta.
 - Si sigue ocupado, el puerto lo esta usando otro programa ajeno a Finanzas.
 - No finalices procesos al azar: `Cerrar Finanzas.cmd` solo detiene los que
@@ -992,10 +1104,11 @@ El lanzador indica que el bot ya esta iniciado:
 
 - Ya existe otra ejecucion de `run_bot.py`.
 - Cierra la terminal anterior con `Ctrl+C`.
-- Vuelve a iniciar mediante `Iniciar Finanzas.cmd` para que bot y panel queden supervisados.
+- Vuelve a iniciar mediante `Iniciar Finanzas.vbs` para que bot y panel queden supervisados.
 
 El navegador no se abre automaticamente:
 
-- Comprueba que la terminal muestre `Finanzas iniciadas`.
+- El inicio automático usa `--no-browser`: abre el acceso del escritorio para ver el panel.
+- Si el inicio manual no lo abre, comprueba `data/logs/launcher.log`.
 - Abre manualmente `http://127.0.0.1:8765`.
 - Si el panel no responde, revisa `data/logs/dashboard.log`.

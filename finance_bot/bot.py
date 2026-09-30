@@ -19,6 +19,7 @@ from telegram.ext import (
 
 from finance_bot.config import Settings
 from finance_bot.db import FinanceDatabase
+from finance_bot.calendar import CalendarStore
 from finance_bot.formatting import format_month
 from finance_bot.local_transcription import (
     LocalTranscriptionUnavailable,
@@ -207,6 +208,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "Comandos:\n"
         "/estado - estado global de las finanzas\n"
         "/resumen - resumen del mes actual\n"
+        "/hoy - desayunos, menú y recordatorios de hoy\n"
         "/exportar - genera y envia CSV\n"
         "/reporte - genera y envia HTML interactivo\n"
         "/pendientes - lista tickets y voces pendientes\n\n"
@@ -220,12 +222,33 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     )
 
 
+async def today_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    settings, db = _get_services(context)
+    if not await _is_allowed(update, settings):
+        return
+    # La agenda consulta el día actual en Madrid, incluso si el mensaje llegó tarde.
+    day = datetime.now(db.timezone).date()
+    text = CalendarStore(db).today_text(day)
+    # Telegram limita cada mensaje a 4096 caracteres. Dividir conserva todos los datos.
+    while text:
+        cut = min(len(text), 3800)
+        if len(text) > cut:
+            newline = text.rfind("\n", 0, cut)
+            if newline > 0:
+                cut = newline
+        await update.effective_message.reply_text(text[:cut])
+        text = text[cut:].lstrip("\n")
+
+
 async def record_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     settings, db = _get_services(context)
     if not await _is_allowed(update, settings):
         return
 
     text = update.effective_message.text or ""
+    if text.strip().casefold() == "hoy":
+        await today_command(update, context)
+        return
     parsed_transactions = parse_transactions(text)
     if not parsed_transactions:
         await update.effective_message.reply_text(
@@ -585,6 +608,7 @@ def build_application(settings: Settings) -> Application:
     application.add_handler(CommandHandler("exportar", export_csv))
     application.add_handler(CommandHandler("reporte", report))
     application.add_handler(CommandHandler("pendientes", pending))
+    application.add_handler(CommandHandler("hoy", today_command))
     # Solo mensajes nuevos: editar un mensaje ya enviado no debe registrarlo otra vez.
     new_messages = filters.UpdateType.MESSAGE
     application.add_handler(MessageHandler(new_messages & filters.VOICE, record_voice))

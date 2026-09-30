@@ -10,6 +10,7 @@ import sys
 import time
 import traceback
 import webbrowser
+from ctypes import wintypes
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -46,7 +47,7 @@ RESTART_MIN_DELAY_SECONDS = 5.0
 RESTART_MAX_DELAY_SECONDS = 300.0
 STABLE_RUN_SECONDS = 300.0
 LOG_ROTATE_BYTES = 5 * 1024 * 1024
-AUTOSTART_FILENAME = "Finanzas.cmd"
+AUTOSTART_FILENAME = "Finanzas.vbs"
 
 
 @dataclass
@@ -234,6 +235,7 @@ def _start_process(name: str, command: list[str], log_path: Path) -> ManagedProc
         env=env,
         stdout=log_handle,
         stderr=subprocess.STDOUT,
+        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0,
     )
     return ManagedProcess(name=name, process=process, log_handle=log_handle)
 
@@ -376,6 +378,101 @@ def _cleanup_orphans(status_path: Path) -> list[str]:
         _kill_pid(pid)
         cleaned.append(f"{label} (PID {pid})")
     return cleaned
+
+
+def _running_dashboard_matches(url: str, status_path: Path) -> bool:
+    """Reutiliza solo el panel del supervisor registrado, no cualquier servidor."""
+    runtime = _read_json_file(status_path)
+    supervisor_pid = runtime.get("supervisor_pid")
+    dashboard_pid = runtime.get("dashboard_pid")
+    if not _process_is_running(supervisor_pid) or not _process_is_running(dashboard_pid):
+        return False
+    try:
+        with urlopen(url + "/api/status", timeout=2.0) as response:
+            if response.status != 200:
+                return False
+            status = json.loads(response.read(65536))
+        return (
+            isinstance(status, dict)
+            and status.get("ok") is True
+            and status.get("supervisor", {}).get("running") is True
+            and status["supervisor"].get("pid") == supervisor_pid
+            and status.get("dashboard", {}).get("running") is True
+            and _dashboard_pid_matches(dashboard_pid, status["dashboard"].get("pid"))
+        )
+    except (OSError, ValueError, TypeError, AttributeError):
+        return False
+
+
+def _windows_parent_pid(pid: int) -> int | None:
+    # En Windows python.exe del venv puede redirigir al interprete real: Popen
+    # conserva el PID del padre, pero /api/status devuelve el del hijo.
+    class ProcessEntry(ctypes.Structure):
+        _fields_ = [
+            ("dwSize", wintypes.DWORD), ("cntUsage", wintypes.DWORD),
+            ("th32ProcessID", wintypes.DWORD), ("th32DefaultHeapID", ctypes.c_size_t),
+            ("th32ModuleID", wintypes.DWORD), ("cntThreads", wintypes.DWORD),
+            ("th32ParentProcessID", wintypes.DWORD), ("pcPriClassBase", wintypes.LONG),
+            ("dwFlags", wintypes.DWORD), ("szExeFile", wintypes.WCHAR * 260),
+        ]
+    kernel = ctypes.windll.kernel32
+    kernel.CreateToolhelp32Snapshot.argtypes = [wintypes.DWORD, wintypes.DWORD]
+    kernel.CreateToolhelp32Snapshot.restype = wintypes.HANDLE
+    kernel.Process32FirstW.argtypes = [wintypes.HANDLE, ctypes.POINTER(ProcessEntry)]
+    kernel.Process32NextW.argtypes = [wintypes.HANDLE, ctypes.POINTER(ProcessEntry)]
+    kernel.CloseHandle.argtypes = [wintypes.HANDLE]
+    snapshot = kernel.CreateToolhelp32Snapshot(0x00000002, 0)
+    if snapshot == ctypes.c_void_p(-1).value:
+        return None
+    try:
+        entry = ProcessEntry()
+        entry.dwSize = ctypes.sizeof(entry)
+        more = kernel.Process32FirstW(snapshot, ctypes.byref(entry))
+        while more:
+            if entry.th32ProcessID == pid:
+                return int(entry.th32ParentProcessID)
+            more = kernel.Process32NextW(snapshot, ctypes.byref(entry))
+        return None
+    finally:
+        kernel.CloseHandle(snapshot)
+
+
+def _dashboard_pid_matches(registered: int, actual: object) -> bool:
+    if registered == actual:
+        return True
+    if os.name != "nt" or not isinstance(actual, int) or actual <= 0:
+        return False
+    try:
+        return _windows_parent_pid(actual) == registered
+    except OSError:
+        return False
+
+
+def _reuse_running_app(args: argparse.Namespace, settings: Settings) -> bool:
+    url = f"http://{args.host}:{args.port}"
+    if not _running_dashboard_matches(url, settings.data_dir / "runtime_status.json"):
+        return False
+    print(f"Finanzas ya esta lista. Panel: {url}")
+    if not args.no_browser:
+        webbrowser.open(url)
+    return True
+
+
+def _start_detached_once(args: argparse.Namespace, settings: Settings) -> int:
+    # Dos clics simultaneos no deben lanzar dos supervisores ni compartir por
+    # accidente el resultado de otro arranque.
+    deadline = time.monotonic() + LAUNCH_TIMEOUT_SECONDS + 5
+    while True:
+        try:
+            with SingleInstance(settings.data_dir / "finance_launch.lock"):
+                if _reuse_running_app(args, settings):
+                    return EXIT_OK
+                return _run_detached(args, settings)
+        except AlreadyRunningError:
+            if time.monotonic() >= deadline:
+                print("Finanzas sigue iniciandose. Revisa data/logs/launcher.log.")
+                return EXIT_NO_CONFIRMATION
+            time.sleep(0.3)
 
 
 def _run_detached(args: argparse.Namespace, settings: Settings) -> int:
@@ -529,6 +626,10 @@ def _run_supervisor(args: argparse.Namespace, settings: Settings) -> int:
                 print(f"Aviso: no se pudo actualizar el estado ({exc}). Finanzas sigue activa.")
                 status_warning_shown = True
 
+    if _reuse_running_app(args, settings):
+        _safe_write_launch_result(result_path, ok=True, code=EXIT_OK, message="Finanzas ya esta iniciada.")
+        return EXIT_OK
+
     orphans = _cleanup_orphans(status_path)
     for orphan in orphans:
         print(f"Cerrado proceso huerfano de la sesion anterior: {orphan}")
@@ -649,31 +750,49 @@ def _startup_dir() -> Path:
     return Path(appdata) / "Microsoft" / "Windows" / "Start Menu" / "Programs" / "Startup"
 
 
-def _autostart_script(python_exe: Path) -> str:
-    # pythonw no abre consola; --no-browser evita que el panel salte en cada inicio.
+def _autostart_script() -> str:
+    # Usa el mismo acceso sin consola que el escritorio. No abre el navegador
+    # al entrar en Windows; el supervisor mantiene Telegram y el panel activos.
+    launcher = str(ROOT / "Iniciar Finanzas.vbs").replace('"', '""')
     return (
-        "@echo off\r\n"
-        f'cd /d "{ROOT}"\r\n'
-        f'start "" "{python_exe}" -B "scripts\\start_finance_app.py" --detached --no-browser\r\n'
+        "' Finanzas: inicio automatico administrado\r\n"
+        'Option Explicit\r\nDim shell, launcher, command\r\n'
+        'Set shell = CreateObject("WScript.Shell")\r\n'
+        f'launcher = "{launcher}"\r\n'
+        'command = Chr(34) & shell.ExpandEnvironmentStrings("%WINDIR%\\System32\\wscript.exe") & Chr(34) & '
+        '" //nologo " & Chr(34) & launcher & Chr(34) & " --no-browser"\r\n'
+        'shell.Run command, 0, False\r\n'
     )
 
 
+def _remove_legacy_autostart() -> bool:
+    legacy = _startup_dir() / "Finanzas.cmd"
+    content = _tail(legacy, lines=20)
+    if str(ROOT) not in content or "start_finance_app.py" not in content:
+        return False
+    legacy.unlink()
+    return True
+
+
 def _install_autostart() -> int:
-    python_exe = Path(sys.executable)
-    windowless = python_exe.with_name("pythonw.exe")
-    if windowless.exists():
-        python_exe = windowless
+    if not (ROOT / "Iniciar Finanzas.vbs").is_file():
+        print("No se encontro Iniciar Finanzas.vbs. Revisa la instalacion.")
+        return EXIT_UNEXPECTED
     target = _startup_dir() / AUTOSTART_FILENAME
     target.parent.mkdir(parents=True, exist_ok=True)
-    target.write_text(_autostart_script(python_exe), encoding="utf-8")
+    target.write_text(_autostart_script(), encoding="utf-16")
+    _remove_legacy_autostart()
     print(f"Finanzas arrancara sola al iniciar sesion en Windows ({target}).")
     return EXIT_OK
 
 
 def _remove_autostart() -> int:
     target = _startup_dir() / AUTOSTART_FILENAME
+    removed = _remove_legacy_autostart()
     if target.exists():
         target.unlink()
+        removed = True
+    if removed:
         print("Arranque automatico desactivado.")
     else:
         print("El arranque automatico no estaba activado.")
@@ -724,13 +843,15 @@ def main() -> int:
 
     if args.stop:
         return _stop_running_app(args, settings)
+    if _reuse_running_app(args, settings):
+        return EXIT_OK
     try:
         inspect_database(settings.sqlite_db_path, check_integrity=True)
     except DatabaseUnavailableError as exc:
         print(str(exc))
         return EXIT_UNEXPECTED
     if _should_relaunch_detached(args.detached):
-        return _run_detached(args, settings)
+        return _start_detached_once(args, settings)
     return _run_supervisor(args, settings)
 
 

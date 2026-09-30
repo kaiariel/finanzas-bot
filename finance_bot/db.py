@@ -247,6 +247,33 @@ class FinanceDatabase:
             connection.executescript(
                 """
                 CREATE TABLE IF NOT EXISTS finance_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+
+                CREATE TABLE IF NOT EXISTS calendar_events (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    title TEXT NOT NULL,
+                    details TEXT NOT NULL DEFAULT '',
+                    kind TEXT NOT NULL DEFAULT 'reminder',
+                    person TEXT NOT NULL DEFAULT '',
+                    start_date TEXT NOT NULL,
+                    end_date TEXT NOT NULL DEFAULT '',
+                    event_time TEXT NOT NULL DEFAULT '',
+                    recurrence TEXT NOT NULL DEFAULT 'once',
+                    weekdays TEXT NOT NULL DEFAULT '[]',
+                    active INTEGER NOT NULL DEFAULT 1,
+                    source_key TEXT UNIQUE,
+                    source_label TEXT NOT NULL DEFAULT '',
+                    source_path TEXT NOT NULL DEFAULT '',
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS calendar_occurrences (
+                    event_id INTEGER NOT NULL REFERENCES calendar_events(id),
+                    date TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'pending',
+                    overrides TEXT NOT NULL DEFAULT '{}',
+                    updated_at TEXT NOT NULL,
+                    PRIMARY KEY(event_id, date)
+                );
                 INSERT OR IGNORE INTO finance_meta(key,value) VALUES ('initialized','1');
                 CREATE TABLE IF NOT EXISTS telegram_messages (
                     user_id INTEGER NOT NULL, message_id INTEGER NOT NULL, processed_at TEXT NOT NULL,
