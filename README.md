@@ -38,6 +38,15 @@ lista de movimientos hasta que se revisan y se convierten en entradas contables.
 
 El historial fechado y completo está en [CHANGELOG.md](CHANGELOG.md). Resumen:
 
+- El bot confirma cada movimiento con lo que entendió (tipo, importe, categoría)
+  y botones para corregirlo o deshacerlo desde el móvil. `/deshacer` quita el
+  último. Los tickets se registran por su total el mismo día; el detalle por
+  producto es opcional.
+- Nueva sección `Para revisar` en el panel: una sola bandeja con tickets sin
+  registrar, movimientos sin categoría, conceptos marcados sin movimiento y
+  posibles duplicados. Marcar un concepto como pagado o cobrado crea siempre su
+  movimiento.
+- Resumen semanal por Telegram los domingos (`WEEKLY_SUMMARY_ENABLED`).
 - El panel adopta una paleta azul clara con tarjetas suaves y conserva Resumen,
   Movimientos, Proyección, Ahorro, Archivos y Diagnóstico. En móvil, `Más` da acceso
   a Proyección y al resto de los módulos; el modo oscuro sigue disponible.
@@ -145,6 +154,7 @@ TIMEZONE=Europe/Madrid
 RECEIPTS_SYNC_DIR=data/receipts
 VOICES_SYNC_DIR=data/voices
 PREFER_CODEX_MEDIA_REVIEW=1
+WEEKLY_SUMMARY_ENABLED=1
 
 VOICE_TRANSCRIPTION_ENABLED=0
 VOICE_TRANSCRIPTION_MODEL=base
@@ -301,12 +311,37 @@ El bot queda escuchando por polling. Para detenerlo, usa `Ctrl+C`.
 ```text
 /start       Muestra ayuda inicial y tu user id.
 /ayuda       Lista comandos y ejemplos.
-/estado      Estado global de las finanzas.
-/resumen     Ingresos, gastos y balance del mes actual.
+/resumen     Cierre estimado del mes, sobre semanal y pendientes de revisar.
+/deshacer    Elimina tu último movimiento (con botón Restaurar).
+/pendientes  Lista tickets y voces pendientes.
+/hoy         Agenda del día.
+/estado      Totales del mes y del historial.
 /exportar    Genera y envia el CSV de movimientos.
 /reporte     Genera y envia el HTML interactivo.
-/pendientes  Lista tickets y voces pendientes.
 ```
+
+### Confirmación con botones
+
+Cada movimiento registrado se confirma con lo que el bot entendió:
+
+```text
+✅ Gasto · 150,00 € · Sin clasificar
+«trabajo de fotografía» · 04/10/2026 · #612
+⚠️ Sin categoría clara: elige una abajo.
+```
+
+Debajo aparecen botones: `Es ingreso` / `Es gasto`, `Categoría` (lista completa;
+la elegida se aprende para ese concepto) y `Deshacer` (el movimiento se elimina y
+puede restaurarse con otro botón). Si la categoría no está clara, o el mensaje es
+un Bizum o transferencia, la lista de categorías se abre directamente. Los
+cambios quedan en `audit_log` como los del panel.
+
+### Resumen semanal
+
+Con `WEEKLY_SUMMARY_ENABLED=1` (valor por defecto) el bot envía los domingos a
+partir de las 19:00 el mismo texto que `/resumen`: cierre estimado del mes,
+gasto del sobre semanal y lo pendiente en `Para revisar`. Si el equipo estaba
+apagado, lo envía el lunes. Se registra en `telegram_deliveries` para no repetirlo.
 
 ## Registrar movimientos por texto
 
@@ -370,8 +405,21 @@ cobro 50 cliente marketing
 
 ## Tickets, PDFs y notas de voz
 
-Si envias una foto, PDF o documento, el bot guarda el archivo y crea un pendiente.
-El caption se conserva como pista, pero el movimiento no se registra hasta la revision.
+Si envias una foto, PDF o documento, el bot guarda el archivo y responde pidiendo
+el total y el comercio. Responde a ese aviso (por ejemplo `21,40 Mercadona`) o
+escribe `#12 21,40 Mercadona` indicando el número del ticket: el movimiento se
+registra con la **fecha del ticket**, cuenta en el sobre semanal ese mismo día y
+se confirma con los botones habituales. Si el pie de foto ya incluye el importe,
+se registra sin preguntar.
+
+Ese movimiento queda marcado como *ticket por total* (`review_status = summary`).
+Detallar los productos es opcional: desde `Para revisar` o `Archivos`, `Detallar
+productos` abre el formulario de líneas y, al confirmarlo, las líneas sustituyen
+al total. Si el ticket se queda sin movimientos (por ejemplo tras `Deshacer`),
+vuelve a la bandeja de pendientes.
+
+Si no respondes, el ticket queda pendiente y aparece en `Para revisar`, desde
+donde también se puede registrar el total. El caption se conserva como pista.
 
 Ejemplo de caption util:
 
@@ -515,8 +563,28 @@ ultima edicion registrada en `audit_log` para ese movimiento concreto. El boton
 completa queda en `audit_log`, asi que tambien puede restaurarse con
 `POST /api/transactions/<id>/restore`.
 
-La navegacion queda en una barra lateral con las secciones `Resumen`, `Movimientos`,
-`Proyección`, `Ahorro`, `Archivos` y `Diagnóstico`. El boton `◐ Modo oscuro` de la
+La navegacion queda en una barra lateral con las secciones `Resumen`, `Para revisar`,
+`Movimientos`, `Proyección`, `Ahorro`, `Archivos`, `Diagnóstico` y `Calendario`.
+
+### Para revisar
+
+Es la bandeja única: mientras tenga elementos, el cierre estimado y el sobre
+semanal pueden estar incompletos. El contador aparece en el menú y en el Resumen.
+
+- **Tickets sin registrar**: `Registrar total` (total, comercio y categoría; la
+  fecha es la del ticket) o `Detallar productos`.
+- **Sin categoría clara**: movimientos en `Sin clasificar` o con la categoría
+  asumida por el parser. Elige la categoría y `Guardar` (se aprende), `Es
+  ingreso` / `Es gasto`, o `Está bien así` para cerrar el aviso.
+- **Marcados como pagados o cobrados sin movimiento**: conceptos del plan
+  completados sin dinero detrás. `Registrar movimiento` lo crea con el importe
+  previsto; si ya existe un movimiento parecido sin vincular, `Vincular` evita
+  contarlo dos veces. Hay un botón por mes para registrar todos los de ese mes.
+- **Posibles duplicados**: mismo tipo, importe, día y concepto registrados por
+  separado (al menos uno sin ticket). `Eliminar` uno (restaurable) o `Son
+  distintos`.
+- **Tickets registrados por su total**: lista informativa, con `Detallar
+  productos` opcional. El boton `◐ Modo oscuro` de la
 barra lateral cambia el tema visual del panel; la preferencia se guarda en el
 navegador. Cada seccion tiene un boton `¿Qué es esto?` con una explicacion breve de
 para que sirve ese panel.
@@ -585,7 +653,10 @@ un `Origin` o `Host` ajenos al propio panel. Casi todos los cambios quedan en
 | POST | `/api/transactions/<id>/restore` | Restaurar el ultimo borrado de ese movimiento. |
 | POST | `/api/transactions/<id>/undo` | Deshacer su ultima edicion. |
 | POST | `/api/transactions/<id>/payment` | Registrar un pago parcial. |
-| POST | `/api/receipts/<id>/review` | Confirmar las lineas de un ticket. |
+| POST | `/api/receipts/<id>/review` | Confirmar las lineas de un ticket (sustituye al total si lo habia). |
+| POST | `/api/receipts/<id>/total` | Registrar un ticket por su total (`amount`, `store`, `category`). |
+| POST | `/api/transactions/<id>/quick` | Cambio rapido: `category`, `kind`, `reviewed`, `projectionTemplateId`. |
+| POST | `/api/projections/<id>/<AAAA-MM>/register` | Crear el movimiento de un concepto marcado sin movimiento. |
 | POST | `/api/projections` | Crear un concepto de la proyeccion. |
 | POST | `/api/projections/<id>/<AAAA-MM>` | Editar un concepto en un mes. |
 | POST | `/api/projections/<id>/<AAAA-MM>/status` | Marcar pagado, pendiente u omitido. |
@@ -674,6 +745,20 @@ escritorio y configuración instalada en Windows son datos o ajustes locales; no
 se publican con el código. El importador conserva las correcciones hechas en la app.
 La maqueta inicial se conserva en `prototypes/inicio-familiar/` con datos ficticios.
 
+### Resumen diario por Telegram
+
+Activa `CALENDAR_DAILY_SUMMARY_ENABLED=1` en `.env` y reinicia Finanzas. Cada día
+a las 07:00, en la zona configurada (Europe/Madrid por defecto), el bot envía el
+contenido de `/hoy` a los `ALLOWED_TELEGRAM_USER_IDS`. Si no hay eventos o todos
+están omitidos, no envía nada. No envía a destinatarios no autorizados.
+
+El ordenador y el bot deben estar activos y conectados. Se reintentan fallos breves
+hasta las 07:05; iniciar más tarde no envía resúmenes atrasados. El progreso por
+destinatario se guarda en `calendar_daily_deliveries`, de modo que reiniciar no
+repite los mensajes ya confirmados. Las respuestas largas continúan desde la parte
+pendiente. Ante un fallo de red ambiguo, una parte enviada pero no confirmada puede
+repetirse. Para desactivar el envío, usa `CALENDAR_DAILY_SUMMARY_ENABLED=0` y reinicia.
+
 API de la agenda:
 
 | Método | Ruta | Uso |
@@ -697,11 +782,12 @@ Cuando un movimiento nuevo coincide de forma clara con una proyeccion activa del
 el sistema la marca automaticamente como completada. Esto funciona tanto para ingresos
 como para gastos recurrentes, y evita tener que cerrar manualmente cada pago/cobro.
 
-Los conceptos que se cobran solos (suscripciones, recibos domiciliados) pueden
-marcarse con `Se cobra o paga automáticamente` al editarlos. Al pulsar `Marcar como
-pagado` se crea su movimiento con el importe del mes, y `Volver a pendiente` lo
-elimina. Si despues registras el cargo real por Telegram y se vincula al concepto, el
-movimiento automatico se borra para no contarlo dos veces.
+`Marcar como pagado` o `Marcar como cobrado` crea siempre el movimiento con el
+importe del mes (también al guardar el estado `Pagado / cobrado` en el formulario
+del concepto), y `Volver a pendiente` lo elimina. Si después registras el cargo
+real por Telegram y se vincula al concepto, el movimiento automático se borra para
+no contarlo dos veces. Los conceptos marcados antes de este cambio, sin movimiento,
+aparecen en `Para revisar`.
 
 La proyeccion `Hogar y Alimentación` actua como presupuesto variable: el reporte calcula
 cuanto se ha gastado realmente en esa categoria durante el mes y cuanto queda disponible
@@ -865,6 +951,7 @@ Suscripciones
 | `category_rules` | Categorias aprendidas de tus correcciones (concepto normalizado + tipo). |
 | `audit_log` | Historial de cambios: `create`, `update`, `undo`, `delete`, `restore`, `status`, `review`, `payment`, `end`. Un `delete` guarda la fila completa. |
 | `telegram_messages` | Mensajes de Telegram ya procesados, para no registrarlos dos veces. |
+| `telegram_deliveries` | Resumenes semanales ya enviados (tipo, semana, destinatario). |
 | `accounts`, `transfers`, `budgets` | Cuentas, transferencias internas y presupuestos. |
 | `savings_settings`, `savings_wallets`, `savings_goals` | Panel de ahorro. |
 | `finance_meta`, `import_batches` | Marca de instalacion nueva e importaciones CSV. |

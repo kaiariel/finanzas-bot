@@ -113,7 +113,8 @@ if (typeof document !== 'undefined') (() => {
     setOptions($('tableCategoryFilter'), unique(data.transactions.map(row => row.category)), 'Todas', state.category);
     setOptions($('storeFilter'), unique(data.transactions.map(row => row.store)), 'Todos', state.store);
     setOptions($('userFilter'), unique([...data.transactions, ...data.receipts].map(row => row.user)), 'Todas', state.user);
-    const projectionMonths = data.projections.months.map(row => [row.monthKey, monthName(row.monthKey)]);
+    // Doce meses bastan para planificar; el resto solo alargaba el selector.
+    const projectionMonths = data.projections.months.slice(0, 12).map(row => [row.monthKey, monthName(row.monthKey)]);
     setOptions($('projectionMonth'), projectionMonths, null, state.projectionMonth);
     // Diagnóstico: meses con registros y, como mucho, los tres siguientes (antes llegaba a 2029).
     const [todayYear, todayMonth] = data.today.split('-').map(Number), horizon = new Date(todayYear, todayMonth + 2, 1);
@@ -142,19 +143,22 @@ if (typeof document !== 'undefined') (() => {
     const goalForm = $('goalForm'); if (goalForm && !goalForm.elements.walletId) goalForm.querySelector('button[type=submit]').insertAdjacentHTML('beforebegin', '<select name="walletId" aria-label="Cartera vinculada"><option value="">Sin cartera</option></select>'); if (goalForm?.elements.walletId) setOptions(goalForm.elements.walletId, (data.savings?.wallets || []).filter(wallet => wallet.active).map(wallet => [String(wallet.id), wallet.name]), 'Sin cartera');
     if (!$('budgetForm').elements.month.value) $('budgetForm').elements.month.value = data.today.slice(0, 7);
     calendarUI.update();
+    applyInboxBadges(); hideUnusedModules(); renderTodaySummary();
     addPanelHelpButtons();
     showTab(state.tab, false);
   }
   function addPanelHelpButtons() {
     const help = {
       dashboard: ['Resumen', 'Aquí ves una fotografía rápida del periodo elegido: cuánto entró, cuánto salió y en qué se fue el dinero. Los gráficos ayudan a detectar cambios.'],
+      inbox: ['Para revisar', 'Todo lo que necesita una decisión en un solo sitio: tickets sin registrar, movimientos sin categoría, conceptos marcados sin movimiento y posibles duplicados.'],
       transactions: ['Movimientos', 'Es la lista de ingresos y gastos registrados. Puedes buscar, filtrar, editar o crear un movimiento manual.'],
-      projection: ['Proyección', 'Sirve para anotar lo que esperas cobrar o pagar. Marcar algo como pagado solo organiza el plan; no mueve dinero del banco.'],
+      projection: ['Proyección', 'Sirve para anotar lo que esperas cobrar o pagar. Marcar algo como pagado o cobrado registra su movimiento, así el cierre estimado no pierde ese importe.'],
       savings: ['Ahorro', 'Aquí ves el saldo que tienes, tus carteras de ahorro y lo que podrías acumular hasta el mes elegido.'],
       files: ['Archivos', 'Aquí están los tickets, fotos, documentos y audios. Puedes abrirlos, revisar sus líneas y confirmar qué movimientos representan.'],
       analytics: ['Diagnóstico', 'Resume avisos de calidad: tickets pendientes, gastos sin justificante, categorías dudosas y meses futuros con riesgo.']
     };
     const detailedHelp = {
+      inbox: { title: 'Para revisar: vaciar la bandeja', what: 'Cada elemento es una decisión pendiente. Mientras haya algo aquí, el cierre estimado y el sobre semanal pueden estar incompletos.', steps: ['Registra cada ticket por su total y comercio; los productos son opcionales.', 'Elige la categoría de los movimientos dudosos: el bot la aprende.', 'Registra o vincula los conceptos marcados como pagados sin movimiento.', 'Resuelve los posibles duplicados eliminando uno o marcándolos como distintos.'], example: 'Un ticket de Mercadona de 21,40 € registrado por su total cuenta hoy en Hogar y Alimentación. Si más tarde detallas los productos, el detalle sustituye al total.' },
       dashboard: { title: 'Resumen: entender tu mes', what: 'Es la pantalla principal. Resume el dinero que ha entrado y salido en el periodo seleccionado.', steps: ['Elige un mes con las flechas o el selector de Periodo.', 'Mira Resultado registrado para saber si entró más dinero del que salió.', 'Usa Gasto por día para detectar días con gastos altos.', 'Usa Gasto por categoría para descubrir en qué tipo de gasto se concentra el dinero.'], example: 'Si eliges septiembre y ves 1.200 € de ingresos y 950 € de gastos, el resultado registrado es 250 €. Solo suma lo que la app conoce.' },
       transactions: { title: 'Movimientos: tu lista de ingresos y gastos', what: 'Cada fila representa un ingreso o un gasto que la app ha registrado.', steps: ['Pulsa Nuevo movimiento para introducir uno manualmente.', 'Usa Buscar para encontrar “Mercadona” o “alquiler”.', 'Abre Más filtros para ver solo gastos, ingresos, una categoría o una persona.', 'Pulsa Editar para corregir una fecha, importe, cuenta o descripción.'], example: 'Una compra puede ser: 35,40 €, “Compra semanal”, categoría “Hogar y Alimentación” y tipo “Gasto”.' },
       projection: { title: 'Proyección: planificar lo que viene', what: 'Es una lista de cobros y pagos esperados. Sirve para anticipar si un mes puede quedar corto.', steps: ['Elige el mes que quieres planificar.', 'Añade alquiler, sueldo, cuotas o suscripciones.', 'Marca Pagar o Cobrar cuando ya lo hayas realizado.', 'Revisa la diferencia entre lo previsto y lo registrado.'], example: 'Si añades “Alquiler” por 700 € y aún no aparece un movimiento, seguirá pendiente hasta que registres el pago.' },
@@ -188,17 +192,17 @@ if (typeof document !== 'undefined') (() => {
     state.page = 1; render(); saveState();
   }
   function showTab(tab, scroll = true) {
-    if (!['dashboard', 'transactions', 'projection', 'savings', 'files', 'analytics', 'calendar'].includes(tab)) tab = 'dashboard';
+    if (!['dashboard', 'inbox', 'transactions', 'projection', 'savings', 'files', 'analytics', 'calendar'].includes(tab)) tab = 'dashboard';
     if ($('mobileMoreModal')?.open) closeDialog('mobileMoreModal', true);
     state.tab = tab;
     document.querySelectorAll('[data-panel]').forEach(panel => { panel.hidden = panel.dataset.panel !== tab; });
     document.querySelectorAll('[data-tab]').forEach(button => { if (button.dataset.tab === tab) button.setAttribute('aria-current', 'page'); else button.removeAttribute('aria-current'); });
-    const [eyebrow, title] = { dashboard: ['Panel', 'Resumen'], transactions: ['El detalle', 'Movimientos'], projection: ['Plan del hogar', 'Proyección mensual'], savings: ['Dinero para tus objetivos', 'Ahorro'], files: ['Justificantes y audios', 'Archivos'], analytics: ['Calidad y previsión', 'Diagnóstico'], calendar: ['Agenda del hogar', 'Calendario'] }[tab];
+    const [eyebrow, title] = { dashboard: ['Panel', 'Resumen'], inbox: ['Pendientes de decisión', 'Para revisar'], transactions: ['El detalle', 'Movimientos'], projection: ['Plan del hogar', 'Proyección mensual'], savings: ['Dinero para tus objetivos', 'Ahorro'], files: ['Justificantes y audios', 'Archivos'], analytics: ['Calidad y previsión', 'Diagnóstico'], calendar: ['Agenda del hogar', 'Calendario'] }[tab];
     $('viewEyebrow').textContent = eyebrow; $('viewTitle').textContent = title;
-    $('viewEmoji').textContent = {dashboard:'🏡', transactions:'💸', projection:'🔭', savings:'🐷', files:'📁', analytics:'🔎', calendar:'📅'}[tab];
+    $('viewEmoji').textContent = {dashboard:'🏡', inbox:'📬', transactions:'💸', projection:'🔭', savings:'🐷', files:'📁', analytics:'🔎', calendar:'📅'}[tab];
     if (tab === 'dashboard') $('dashboardFiltersSlot').appendChild($('globalFilters'));
     else document.querySelector('[data-panel="' + tab + '"]').before($('globalFilters'));
-    $('globalFilters').hidden = ['projection', 'savings', 'analytics', 'calendar'].includes(tab);
+    $('globalFilters').hidden = ['inbox', 'projection', 'savings', 'analytics', 'calendar'].includes(tab);
     $('moreFilters').hidden = !state.more; $('toggleFilters').setAttribute('aria-expanded', String(state.more)); $('toggleFilters').textContent = state.more ? 'Menos filtros' : 'Más filtros';
     render(); saveState(); if (scroll) window.scrollTo({ top: 0 });
   }
@@ -225,6 +229,7 @@ if (typeof document !== 'undefined') (() => {
     activeFilterText();
     const rows = filterRows(data.transactions, state);
     if (state.tab === 'dashboard') renderSummary(rows);
+    if (state.tab === 'inbox') renderInbox();
     if (state.tab === 'transactions') renderTable(rows);
     if (state.tab === 'projection') renderProjection();
     if (state.tab === 'analytics') renderAnalytics();
@@ -246,7 +251,7 @@ if (typeof document !== 'undefined') (() => {
     const fileStatus = state.fileStatus; state.fileStatus = ''; const files = filteredFiles(); state.fileStatus = fileStatus;
     const pendingFiles = files.filter(pending).length;
     $('pendingCount').textContent = pendingFiles;
-    $('quickPendingCount').textContent = pendingFiles ? '· ' + pendingFiles : '';
+    $('quickPendingCount').textContent = data.inbox?.count ? '· ' + data.inbox.count : '';
     const forecast = data.projections.months.find(row => row.monthKey === state.month);
     if (forecast) {
       const estimate = projectionEstimate(forecast);
@@ -261,23 +266,26 @@ if (typeof document !== 'undefined') (() => {
     for (const kind of ['income', 'expense']) {
       const node = $(kind + 'Delta'); node.textContent = '';
       if (!state.month) continue;
-      const previous = previousMonthKey(state.month), priorRows = filterRows(data.transactions, state, previous);
+      const previous = previousMonthKey(state.month), currentMonth = state.month === data.today.slice(0, 7), todayDay = data.today.slice(8, 10);
+      // Mes en curso: se compara con el mismo tramo del mes anterior (hasta el día de hoy), no con el mes completo.
+      const priorRows = filterRows(data.transactions, state, previous).filter(row => !currentMonth || row.dateIso.slice(8, 10) <= todayDay);
       if (!priorRows.length) { node.textContent = 'Sin registros comparables en ' + monthName(previous); continue; }
       const before = totals(priorRows)[kind], difference = total[kind] - before;
       // El verde siempre significa "va a mejor": más ingresos o menos gastos.
       const better = kind === 'income' ? difference >= 0 : difference <= 0;
       const percent = before ? ' · ' + Math.round(Math.abs(difference) / before * 100) + '%' : '';
-      node.innerHTML = '<span class="delta ' + (better ? 'up' : 'down') + '">' + (difference >= 0 ? '▲' : '▼') + ' ' + esc(money(Math.abs(difference)) + percent) + '</span><span>frente a ' + esc(monthName(previous)) + (state.month === data.today.slice(0, 7) ? ' · mes en curso' : '') + '</span>';
+      node.innerHTML = '<span class="delta ' + (better ? 'up' : 'down') + '">' + (difference >= 0 ? '▲' : '▼') + ' ' + esc(money(Math.abs(difference)) + percent) + '</span><span>frente a ' + esc(monthName(previous)) + (currentMonth ? ' hasta el día ' + Number(todayDay) : '') + '</span>';
     }
     const alerts = [];
-    if (balance < 0) alerts.push(notice('Resultado negativo', 'Los gastos registrados superan los ingresos en ' + money(-balance) + '.', 'danger'));
-    if (files.some(pending)) alerts.push(notice('Archivos por revisar', files.filter(pending).length + ' archivos del filtro requieren atención.', 'warn', '<button class="secondary" data-go="files">Revisar archivos</button>'));
+    // En el mes en curso el resultado registrado siempre va por detrás del plan; la cifra que importa es el cierre estimado.
+    if (balance < 0 && state.month && state.month < data.today.slice(0, 7)) alerts.push(notice('Resultado negativo', 'Los gastos registrados superan los ingresos en ' + money(-balance) + '.', 'danger'));
+    const inbox = data.inbox || {};
+    const inboxLines = [[inbox.receipts?.length, 'ticket sin registrar', 'tickets sin registrar'], [inbox.unclassified?.length, 'movimiento sin categoría clara', 'movimientos sin categoría clara'], [inbox.manualCompleted?.length, 'concepto marcado sin movimiento', 'conceptos marcados sin movimiento'], [inbox.duplicates?.length, 'posible duplicado', 'posibles duplicados']].filter(([count]) => count);
+    if (inboxLines.length) alerts.push(notice('Pendientes de decisión', inboxLines.map(([count, singular, plural]) => count + ' ' + (count === 1 ? singular : plural)).join(' · '), 'warn', '<button class="secondary" data-go="inbox">Abrir Para revisar</button>'));
     if (state.requireReceipts) {
       const missing = expenses.length - justified.length;
       if (missing) alerts.push(notice('Gastos sin justificante disponible', missing + ' líneas no tienen una imagen o documento accesible. Comprueba cuáles necesitan justificante.', 'warn', '<button class="secondary" data-go="transactions">Ver movimientos</button>'));
     }
-    const uncertain = rows.filter(row => row.inferenceNotes.length);
-    if (uncertain.length) alerts.push(notice('Clasificaciones por revisar', uncertain.length + ' movimientos conservan avisos de interpretación.', 'warn', '<button class="secondary" data-go="analytics">Ver avisos</button>'));
     $('alertsList').innerHTML = alerts.join('') || empty('Sin avisos para este filtro.');
     const recent = [...rows].sort((a, b) => b.createdAt.localeCompare(a.createdAt) || b.id - a.id).slice(0, 5);
     $('recentList').innerHTML = recent.map(compactRow).join('') || empty('No hay movimientos. Cambia el periodo o limpia los filtros.');
@@ -359,7 +367,7 @@ if (typeof document !== 'undefined') (() => {
     const title = grouped ? (row.store || 'Compra / archivo') + ' · ' + row.children.length + (row.children.length === 1 ? ' producto' : ' productos') : row.description;
     const attachment = row.receipt ? '<button class="quiet" data-attachment="transactions:' + row.id + '">' + esc(row.fileAvailable ? 'Ver ' + row.attachmentType : 'Adjunto no disponible') + '</button>' : '<span>Sin adjunto</span>';
     const categories = grouped ? unique(row.children.map(r => r.category)).join(', ') : row.category;
-    return '<article class="movement"><div class="movement-main">' + avatar(row) + '<time datetime="' + row.dateIso + '">' + esc(row.date) + '</time><div><div class="movement-title">' + esc(title) + '</div><div class="movement-meta"><span data-meta="category">' + esc(categories) + '</span><span data-meta="store">' + esc(row.store || 'Sin comercio') + '</span><span data-meta="user">' + esc(row.user) + '</span><span>' + (row.isFixed ? 'Fijo' : 'Variable') + '</span>' + attachment + (row.inferenceNotes.length ? '<span class="expense">Revisar clasificación</span>' : '') + '</div></div><div class="movement-amount ' + row.kind + '">' + (row.kind === 'expense' ? '−' : '+') + esc(money(row.amountCents)) + '</div>' + (!grouped ? '<button class="secondary" data-edit="' + row.id + '">' + (data.editable ? 'Editar' : 'Ver detalle') + '</button>' : '') + '</div>' + (grouped ? '<details><summary>Ver productos y editar líneas</summary>' + row.children.map(movementRow).join('') + '</details>' : '') + '</article>';
+    return '<article class="movement"><div class="movement-main">' + avatar(row) + '<time datetime="' + row.dateIso + '">' + esc(row.date) + '</time><div><div class="movement-title">' + esc(title) + '</div><div class="movement-meta"><span data-meta="category">' + esc(categories) + '</span><span data-meta="store">' + esc(row.store || 'Sin comercio') + '</span><span data-meta="user">' + esc(row.user) + '</span><span>' + (row.isFixed ? 'Fijo' : 'Variable') + '</span>' + attachment + (row.inferenceNotes.length ? '<span class="expense">Revisar clasificación</span>' : '') + (row.reviewStatus === 'summary' ? '<span class="chip summary">Ticket por total</span>' : '') + '</div></div><div class="movement-amount ' + row.kind + '">' + (row.kind === 'expense' ? '−' : '+') + esc(money(row.amountCents)) + '</div>' + (!grouped ? '<button class="secondary" data-edit="' + row.id + '">' + (data.editable ? 'Editar' : 'Ver detalle') + '</button>' : '') + '</div>' + (grouped ? '<details><summary>Ver productos y editar líneas</summary>' + row.children.map(movementRow).join('') + '</details>' : '') + '</article>';
   }
   function closingBreakdown(summary) {
     // El cierre es una suma: se muestra la cuenta entera para que no haya cifras sueltas que cuadrar.
@@ -483,13 +491,10 @@ if (typeof document !== 'undefined') (() => {
       deductions.push(['Peso de conceptos recurrentes previstos', ratio > .7 ? 22 : ratio > .5 ? 10 : 0]);
       deductions.push(['Archivos pendientes del mes', Math.min(12, files.length * 4)]);
       deductions.push(['Avisos de clasificación o conciliación', Math.min(20, alerts.length * 2)]);
-      $('analyticsScore').textContent = Math.max(0, 100 - deductions.reduce((n, [, value]) => n + value, 0)) + '/100';
-      $('scoreBreakdown').innerHTML = '<p class="small muted">Base: 100. Margen: −35 si es negativo, −18 si es inferior al 8%, −8 si es inferior al 15%. Recurrentes/ingresos: −22 por encima del 70%, −10 por encima del 50%. Pendientes: −4 por archivo (máximo 12). Avisos: −2 por aviso (máximo 20). Son umbrales internos orientativos.</p>' + deductions.map(([label, points]) => '<div class="score-line"><span>' + esc(label) + '</span><strong>−' + points + '</strong></div>').join('');
       recommendations.push(notice('Previsión frente a registros', 'Plan: ' + money(summary.projectedBalanceCents) + '. Resultado registrado: ' + money(total.income - total.expense) + '. Cierre estimado: ' + money(projectionEstimate(summary)) + '.', alerts.length ? 'warn' : ''));
       if (alerts.length) recommendations.push(notice('Primero, conciliar', 'Hay diferencias o estados sin verificar. Revisa los avisos antes de usar la estimación de cierre.', 'warn'));
       if (margin < 0) recommendations.push(notice('El plan supera los ingresos previstos', 'La diferencia prevista es ' + money(-summary.projectedBalanceCents) + '. Revisa importes y fechas de los conceptos pendientes.', 'warn'));
     } else {
-      $('analyticsScore').textContent = 'Sin base suficiente'; $('scoreBreakdown').innerHTML = '<p>Se necesita una proyección con ingresos mayores que cero para calcular el índice.</p>';
       recommendations.push(notice('Sin plan comparable', 'Puedes consultar los movimientos de este mes; no hay ingresos previstos suficientes para calcular un margen.'));
     }
     const top = groupTotals(rows.filter(row => row.kind === 'expense'), 'category')[0];
@@ -499,16 +504,17 @@ if (typeof document !== 'undefined') (() => {
     $('analyticsRecommendations').innerHTML = recommendations.join('');
     $('analyticsAiAlertsCount').textContent = alerts.length + ' avisos';
     $('analyticsAiAlerts').innerHTML = alertsHtml(alerts) || empty('Sin avisos de interpretación o conciliación en este mes.');
-    $('analyticsFutureBody').innerHTML = data.projections.months.filter(row => row.monthKey >= month).map(row => '<div class="compact-row"><div>' + esc(monthName(row.monthKey)) + '<small>Ingresos ' + esc(money(row.projectedIncomeCents)) + ' · gastos ' + esc(money(row.projectedExpenseCents)) + '</small></div><strong class="' + (row.projectedBalanceCents < 0 ? 'expense' : 'income') + '">' + esc(money(row.projectedBalanceCents)) + '</strong></div>').join('') || empty('Sin meses futuros proyectados.');
+    $('analyticsFutureBody').innerHTML = data.projections.months.filter(row => row.monthKey >= month).slice(0, 12).map(row => '<div class="compact-row"><div>' + esc(monthName(row.monthKey)) + '<small>Ingresos ' + esc(money(row.projectedIncomeCents)) + ' · gastos ' + esc(money(row.projectedExpenseCents)) + '</small></div><strong class="' + (row.projectedBalanceCents < 0 ? 'expense' : 'income') + '">' + esc(money(row.projectedBalanceCents)) + '</strong></div>').join('') || empty('Sin meses futuros proyectados.');
   }
   function renderReceipts() {
     const files = filteredFiles(); $('fileCount').textContent = files.length + ' archivos coinciden con los filtros';
     const labels = { nuevo: 'Pendiente', pending: 'Pendiente', voice_pending: 'Audio por revisar', dudoso: 'Revisión manual', processed: 'Procesado', duplicado: 'Duplicado', missing: 'No disponible' };
     $('receiptList').innerHTML = files.slice(0, state.filesShown).map(file => {
       const rows = data.transactions.filter(row => row.receipt === file.path);
-      const currentCaption = file.status === 'processed' ? (rows.length ? rows.length + (rows.length === 1 ? ' línea registrada · ' : ' líneas registradas · ') + money(sum(rows)) : 'Procesado · sin movimientos vinculados') : (file.caption || 'Archivo pendiente de revisión');
+      const summaryOnly = rows.length > 0 && rows.every(row => row.reviewStatus === 'summary');
+      const currentCaption = file.status === 'processed' ? (rows.length ? (summaryOnly ? 'Registrado por su total · ' : rows.length + (rows.length === 1 ? ' línea registrada · ' : ' líneas registradas · ')) + money(sum(rows)) : 'Procesado · sin movimientos vinculados') : (file.caption || 'Archivo pendiente de revisión');
       const visual = file.attachmentType === 'imagen' && file.fileAvailable ? '<img loading="lazy" src="' + esc(file.url) + '" alt="Miniatura del archivo #' + file.id + '">' : '<div class="file-thumb" aria-hidden="true">' + (file.attachmentType === 'audio' ? 'AUDIO' : 'DOC') + '</div>';
-      const reviewAction = rows.length ? '' : '<button class="quiet" data-review="' + file.id + '">Revisar y confirmar</button>';
+      const reviewAction = !data.editable ? '' : !rows.length ? '<button class="quiet" data-inbox-total="' + file.id + '">Registrar total</button><button class="quiet" data-review="' + file.id + '">Detallar productos</button>' : summaryOnly ? '<button class="quiet" data-review="' + file.id + '">Detallar productos</button>' : '';
       return '<article class="file-card">' + visual + '<h3>' + esc(currentCaption) + '</h3><span class="status-chip ' + (file.status === 'processed' ? 'completed' : 'pending') + '">' + esc(file.fileAvailable ? labels[file.status] || file.status : 'Archivo no disponible') + '</span><p class="muted small">#' + file.id + ' · ' + esc(file.user + ' · recibido ' + file.date) + '</p><button class="secondary" data-attachment="receipts:' + file.id + '">Ver ' + esc(file.attachmentType) + '</button>' + reviewAction + (rows.length ? '<details><summary>Movimientos vinculados (' + rows.length + ')</summary>' + rows.map(row => '<button class="quiet" data-edit="' + row.id + '">' + esc(row.description + ' · ' + money(row.amountCents)) + '</button>').join('') + '</details>' : '') + '<details><summary>Historial y ubicación</summary><p>' + esc(file.caption) + '</p><p>' + esc(file.reviewNotes) + '</p><code>' + esc(file.path) + '</code></details></article>';
     }).join('') || empty('No hay archivos para estos filtros.');
     $('moreFiles').hidden = files.length <= state.filesShown;
@@ -542,6 +548,118 @@ if (typeof document !== 'undefined') (() => {
     $('goalsBody').innerHTML = (data.savingsGoals || []).map(goal => { const wallet = (savings.wallets || []).find(item => item.id === goal.walletId); const current = wallet ? wallet.balanceCents : goal.currentCents; const missing = Math.max(0, goal.targetCents - current); const reached = rows.find(row => row.accumulated >= missing); const percent = Math.min(100, Math.round(current / Math.max(1, goal.targetCents) * 100)); return '<div class="goal-card"><div class="goal-head"><div><strong>' + esc(goal.name) + '</strong><small>' + esc(wallet ? 'Cartera: ' + wallet.name : 'Progreso manual') + (goal.targetDate ? ' · objetivo ' + esc(goal.targetDate) : '') + '</small></div><strong>' + percent + '%</strong></div><div class="progress-track"><span style="width:' + percent + '%"></span></div><div class="progress-meta"><span>' + esc(money(current)) + ' de ' + esc(money(goal.targetCents)) + '</span><span>' + (missing ? 'Faltan ' + esc(money(missing)) : 'Objetivo alcanzado') + (reached && missing ? ' · posible en ' + esc(shortMonth(reached.monthKey)) : '') + '</span></div></div>'; }).join('') || empty('Todavía no hay objetivos.');
     $('accountsBody').innerHTML = (data.accounts || []).map(account => '<article class="file-card"><h3>' + esc(account.name) + '</h3><p class="muted small">' + esc(account.type) + '</p><strong>' + esc(money(account.balanceCents)) + '</strong></article>').join('') || empty('Añade tu primera cuenta.');
     $('budgetsBody').innerHTML = (data.budgets || []).map(budget => { const spent = data.transactions.filter(row => row.monthKey === budget.month && row.kind === 'expense' && row.category === budget.category).reduce((total, row) => total + row.amountCents, 0); const percent = Math.round(spent / Math.max(1, budget.amountCents) * 100); const remaining = budget.amountCents - spent; return '<div class="budget-card"><div class="budget-head"><div><strong>' + esc(budget.category) + '</strong><small>' + esc(monthName(budget.month)) + '</small></div><strong>' + percent + '%</strong></div><div class="progress-track ' + (remaining < 0 ? 'over' : '') + '"><span style="width:' + Math.min(100, percent) + '%"></span></div><div class="progress-meta"><span>Gastado ' + esc(money(spent)) + ' de ' + esc(money(budget.amountCents)) + '</span><span class="' + (remaining < 0 ? 'expense' : '') + '">' + (remaining < 0 ? 'Exceso ' + esc(money(-remaining)) : 'Disponible ' + esc(money(remaining))) + '</span></div></div>'; }).join('') || empty('Todavía no hay presupuestos.');
+  }
+  function applyInboxBadges() {
+    const count = data.inbox?.count || 0;
+    for (const id of ['navInboxCount', 'mobileInboxCount']) { const badge = $(id); if (badge) { badge.hidden = !count; badge.textContent = count; } }
+    $('quickPendingCount').textContent = count ? '· ' + count : '';
+  }
+  function hideUnusedModules() {
+    // Cuentas, presupuestos y objetivos solo aparecen si tienen datos: cada formulario de más es una forma más de equivocarse.
+    const accounts = (data.accounts || []).length, budgets = (data.budgets || []).length, goals = (data.savingsGoals || []).length;
+    if ($('accountsPanel')) $('accountsPanel').hidden = !accounts;
+    if ($('budgetsPanel')) $('budgetsPanel').hidden = !budgets;
+    if ($('goalsPanel')) $('goalsPanel').hidden = !goals;
+    document.querySelectorAll('[data-account-field]').forEach(node => { node.hidden = !accounts; });
+  }
+  function renderTodaySummary() {
+    const panel = $('todayPanel'); if (!panel) return;
+    const labels = { breakfast: 'Desayuno', meal: 'Comida', reminder: 'Recordatorio', event: 'Evento', note: 'Nota' };
+    const items = (data.calendar?.today || []).filter(item => item.status !== 'skipped');
+    $('todaySummary').textContent = items.length ? items.slice(0, 3).map(item => (labels[item.kind] || 'Evento') + ': ' + item.title).join(' · ') + (items.length > 3 ? ' · +' + (items.length - 3) : '') : 'Sin eventos hoy';
+    if (!panel.dataset.ready) {
+      panel.dataset.ready = '1';
+      try { panel.open = localStorage.getItem('finance-today-open') === '1'; } catch (_) {}
+      panel.addEventListener('toggle', () => { try { localStorage.setItem('finance-today-open', panel.open ? '1' : '0'); } catch (_) {} });
+    }
+  }
+  function inboxRow(row, actions, extra = '') {
+    const meta = [row.date, row.user, row.store, row.category].filter(Boolean).join(' · ');
+    return '<div class="inbox-item"><div class="inbox-main">' + avatar(row) + '<div><strong>' + esc(row.description) + '</strong><small>' + esc(meta) + '</small>' + extra + '</div></div><div class="inbox-actions"><strong class="amount ' + row.kind + '">' + (row.kind === 'expense' ? '−' : '+') + esc(money(row.amountCents)) + '</strong>' + actions + '</div></div>';
+  }
+  function renderInbox() {
+    const inbox = data.inbox || { receipts: [], summaries: [], unclassified: [], manualCompleted: [], duplicates: [] };
+    const byId = new Map(data.transactions.map(row => [row.id, row]));
+    const receiptById = new Map(data.receipts.map(row => [row.id, row]));
+    const editable = data.editable;
+    const categorySelect = row => '<select data-quick-category="' + row.id + '" aria-label="Categoría de ' + esc(row.description) + '">' + data.categories.map(category => '<option' + (category === row.category ? ' selected' : '') + '>' + esc(category) + '</option>').join('') + '</select>';
+    const receipts = (inbox.receipts || []).map(id => receiptById.get(id)).filter(Boolean).sort((a, b) => b.createdAt.localeCompare(a.createdAt));
+    $('inboxReceipts').hidden = !receipts.length; $('inboxReceiptsCount').textContent = receipts.length;
+    $('inboxReceiptsBody').innerHTML = receipts.map(file => {
+      const thumb = file.attachmentType === 'imagen' && file.fileAvailable ? '<img class="inbox-thumb" loading="lazy" src="' + esc(file.url) + '" alt="">' : '<div class="file-thumb inbox-thumb" aria-hidden="true">' + (file.attachmentType === 'audio' ? 'AUDIO' : 'DOC') + '</div>';
+      const caption = file.caption && !/pendiente de revision|pendiente de revisión/i.test(file.caption) ? ' · ' + file.caption : '';
+      return '<div class="inbox-item"><div class="inbox-main">' + thumb + '<div><strong>#' + file.id + ' · ' + esc(file.user) + '</strong><small>' + esc('Recibido ' + file.date + caption) + '</small></div></div><div class="inbox-actions"><button class="secondary" data-attachment="receipts:' + file.id + '">Ver</button>' + (editable ? '<button data-inbox-total="' + file.id + '">Registrar total</button><button class="quiet" data-review="' + file.id + '">Detallar productos</button>' : '') + '</div></div>';
+    }).join('');
+    const unclassified = (inbox.unclassified || []).map(id => byId.get(id)).filter(Boolean).sort((a, b) => b.createdAt.localeCompare(a.createdAt));
+    $('inboxUnclassified').hidden = !unclassified.length; $('inboxUnclassifiedCount').textContent = unclassified.length;
+    $('inboxUnclassifiedBody').innerHTML = unclassified.map(row => inboxRow(row, editable ? categorySelect(row) + '<button data-quick-save="' + row.id + '">Guardar</button><button class="quiet" data-quick-kind="' + row.id + ':' + (row.kind === 'expense' ? 'income' : 'expense') + '">' + (row.kind === 'expense' ? 'Es ingreso' : 'Es gasto') + '</button><button class="quiet" data-quick-review="' + row.id + '">Está bien así</button><button class="quiet" data-edit="' + row.id + '">Editar</button>' : '', row.inferenceNotes.length ? '<small class="expense">' + esc(row.inferenceNotes[0]) + '</small>' : '')).join('');
+    const manual = inbox.manualCompleted || [];
+    $('inboxManual').hidden = !manual.length; $('inboxManualCount').textContent = manual.length;
+    const months = unique(manual.map(item => item.month)).reverse();
+    $('inboxManualBody').innerHTML = months.map(month => {
+      const items = manual.filter(item => item.month === month);
+      const head = '<div class="inbox-month"><span>' + esc(monthName(month)) + ' · ' + items.length + (items.length === 1 ? ' concepto' : ' conceptos') + '</span>' + (editable && items.length > 1 ? '<button class="secondary" data-register-month="' + month + '">Registrar los ' + items.length + ' con su importe previsto</button>' : '') + '</div>';
+      return head + items.map(item => {
+        // Si ya hay un movimiento parecido sin vincular, vincularlo evita contar dos veces.
+        const candidates = data.transactions.filter(row => row.monthKey === month && row.kind === item.kind && !row.projectionTemplateId && Math.abs(row.amountCents - item.amountCents) <= Math.max(100, item.amountCents * 0.05)).slice(0, 2);
+        const link = candidates.map(row => '<button class="secondary" data-link-projection="' + row.id + ':' + item.templateId + '">Vincular a #' + row.id + ' ' + esc(row.description) + ' · ' + esc(money(row.amountCents)) + '</button>').join('');
+        const actions = editable ? link + '<button data-register-projection="' + item.templateId + ':' + month + '">Registrar movimiento</button><button class="quiet" data-projection-month="' + item.templateId + ':' + month + '">Ver concepto</button>' : '';
+        return '<div class="inbox-item"><div class="inbox-main"><span class="avatar ' + item.kind + '">' + categoryIcon(item.category) + '</span><div><strong>' + esc(item.name) + '</strong><small>' + esc(item.type + ' · ' + item.category + ' · marcado como ' + (item.kind === 'income' ? 'cobrado' : 'pagado')) + '</small></div></div><div class="inbox-actions"><strong class="amount ' + item.kind + '">' + (item.kind === 'expense' ? '−' : '+') + esc(money(item.amountCents)) + '</strong>' + actions + '</div></div>';
+      }).join('');
+    }).join('');
+    const duplicates = (inbox.duplicates || []).map(pair => pair.map(id => byId.get(id))).filter(pair => pair.every(Boolean));
+    $('inboxDuplicates').hidden = !duplicates.length; $('inboxDuplicatesCount').textContent = duplicates.length;
+    $('inboxDuplicatesBody').innerHTML = duplicates.map(([first, second]) => inboxRow(first, '', '<small>' + esc('Coincide con #' + second.id + ' · ' + second.description + ' · ' + second.date + ' · ' + second.user + (second.receipt ? ' · con ticket' : '')) + '</small>') + '<div class="inbox-item"><div class="inbox-main"></div><div class="inbox-actions">' + (editable ? '<button class="danger" data-delete-duplicate="' + first.id + '">Eliminar #' + first.id + '</button><button class="danger" data-delete-duplicate="' + second.id + '">Eliminar #' + second.id + '</button><button class="quiet" data-distinct="' + first.id + ':' + second.id + '">Son distintos</button>' : '') + '<button class="quiet" data-edit="' + first.id + '">Ver #' + first.id + '</button><button class="quiet" data-edit="' + second.id + '">Ver #' + second.id + '</button></div></div>').join('');
+    const summaries = (inbox.summaries || []).map(id => byId.get(id)).filter(Boolean).sort((a, b) => b.createdAt.localeCompare(a.createdAt));
+    $('inboxSummaries').hidden = !summaries.length; $('inboxSummariesCount').textContent = summaries.length;
+    $('inboxSummariesBody').innerHTML = summaries.map(row => inboxRow(row, (editable && row.receiptId ? '<button class="secondary" data-review="' + row.receiptId + '">Detallar productos</button>' : '') + '<button class="quiet" data-edit="' + row.id + '">Editar</button>')).join('');
+    $('inboxEmpty').hidden = Boolean(receipts.length || unclassified.length || manual.length || duplicates.length);
+  }
+  function openReceiptTotalModal(id) {
+    if (!data.editable) return;
+    const file = data.receipts.find(row => row.id === Number(id)); if (!file) return;
+    const form = $('receiptTotalForm'); setOptions(form.elements.category, data.categories, null);
+    fillForm(form, { receiptId: id, amount: '', store: '', category: 'Hogar y Alimentación' });
+    $('receiptTotalMeta').textContent = '#' + id + ' · ' + file.user + ' · recibido ' + file.date + (file.caption ? ' · ' + file.caption : '');
+    $('receiptTotalPreview').innerHTML = !file.fileAvailable ? notice('Archivo no disponible', 'Comprueba la carpeta del justificante.', 'warn') : file.attachmentType === 'imagen' ? '<img src="' + esc(file.url) + '" alt="Ticket #' + id + '">' : file.attachmentType === 'audio' ? '<audio controls src="' + esc(file.url) + '"></audio>' : (file.path || '').toLowerCase().endsWith('.pdf') ? '<iframe title="Ticket #' + id + '" src="' + esc(file.url) + '"></iframe>' : '';
+    $('receiptTotalError').hidden = true; openDialog('receiptTotalModal'); form.elements.amount.focus();
+  }
+  async function submitReceiptTotal(event) {
+    event.preventDefault(); if (busy) return;
+    const form = event.target, payload = Object.fromEntries(new FormData(form)), error = $('receiptTotalError');
+    busy = true; error.hidden = true;
+    try { await mutate('/api/receipts/' + payload.receiptId + '/total', payload); closeDialog('receiptTotalModal', true); await refreshData(); notify('Ticket registrado por su total. Ya cuenta en el mes.'); }
+    catch (exception) { error.textContent = exception.message; error.hidden = false; }
+    finally { busy = false; }
+  }
+  async function quickUpdate(id, payload, message) {
+    if (busy) return; busy = true;
+    try { await mutate('/api/transactions/' + id + '/quick', payload); await refreshData(); notify(message); }
+    catch (error) { notify(error.message, true); }
+    finally { busy = false; }
+  }
+  async function registerProjection(templateId, month) {
+    if (busy) return; busy = true;
+    try { await mutate('/api/projections/' + templateId + '/' + month + '/register', {}); await refreshData(); notify('Movimiento registrado con el importe previsto.'); }
+    catch (error) { notify(error.message, true); }
+    finally { busy = false; }
+  }
+  async function registerMonth(month) {
+    const items = (data.inbox?.manualCompleted || []).filter(item => item.month === month);
+    if (!items.length || busy) return;
+    if (!confirm('¿Registrar ' + items.length + ' movimientos de ' + monthName(month) + ' con su importe previsto?\nSi alguno ya existe como movimiento sin vincular, mejor usa «Vincular».')) return;
+    busy = true; let done = 0;
+    try { for (const item of items) { await mutate('/api/projections/' + item.templateId + '/' + month + '/register', {}); done++; } await refreshData(); notify(done + ' movimientos registrados.'); }
+    catch (error) { try { await refreshData(); } catch (_) {} notify('Registrados ' + done + ' de ' + items.length + '. ' + error.message, true); }
+    finally { busy = false; }
+  }
+  async function deleteDuplicate(id) {
+    const row = data.transactions.find(item => item.id === Number(id)); if (!row || busy) return;
+    if (!confirm('¿Eliminar «' + row.description + '» (' + money(row.amountCents) + ')?\nPodrás deshacerlo justo después.')) return;
+    busy = true;
+    try { await mutate('/api/transactions/' + id, {}, 'DELETE'); await refreshData(); notify('Movimiento eliminado.', false, { label: 'Deshacer', run: async () => { await mutate('/api/transactions/' + id + '/restore', {}); await refreshData(); notify('Movimiento restaurado.'); } }); }
+    catch (error) { notify(error.message, true); }
+    finally { busy = false; }
   }
   function savingsLineChart(rows) {
     if (!rows.length) return empty('No hay previsiones hasta ese mes.');
@@ -582,6 +700,7 @@ if (typeof document !== 'undefined') (() => {
     setOptions(form.elements.receiptId, data.receipts.map(file => [String(file.id), '#' + file.id + ' · ' + file.date + ' · ' + file.user + ' · ' + file.attachmentType]), row.receipt && !row.receiptId ? 'Conservar adjunto existente' : 'Sin adjunto');
     fillForm(form, { id: row.id, date: row.dateIso, amount: (row.amountCents / 100).toFixed(2).replace('.', ','), description: row.description, category: row.category, kind: row.kind, store: row.store, accountId: row.accountId, userId: row.userId, isFixed: String(row.isFixed), receiptId: row.receiptId });
     projectionOptions(form, row.projectionTemplateId);
+    form.querySelector('[data-account-field]').hidden = !(data.accounts || []).length;
     $('editContext').innerHTML = row.inferenceNotes.map(note => notice('Aviso pendiente', note, 'warn')).join('') + (row.receipt ? '<button type="button" class="quiet" data-attachment="transactions:' + row.id + '">Ver adjunto actual</button>' : '') + '<button type="button" class="quiet" data-undo="' + row.id + '">Deshacer último cambio</button>';
     $('editError').hidden = true; openDialog('editModal');
   }
@@ -591,6 +710,7 @@ if (typeof document !== 'undefined') (() => {
     setOptions(form.elements.category, data.categories, null);
     setOptions(form.elements.accountId, (data.accounts || []).map(account => [String(account.id), account.name + ' · ' + money(account.balanceCents)]), 'Sin cuenta');
     fillForm(form, { date: data.today, amount: '', description: '', category: data.categories[0], kind: 'expense', store: '', isFixed: 'false' });
+    form.querySelector('[data-account-field]').hidden = !(data.accounts || []).length;
     $('newTransactionError').hidden = true; openDialog('newTransactionModal');
   }
   function openWalletModal(wallet = null) {
@@ -636,7 +756,7 @@ if (typeof document !== 'undefined') (() => {
     if (!data.editable) return;
     const row = data.projections.rows.find(row => row.templateId === Number(id) && row.month === state.projectionMonth), form = $('projectionForm');
     setOptions(form.elements.category, data.categories, null);
-    fillForm(form, { id: row?.templateId || '', month: state.projectionMonth, name: row?.name || '', kind: row?.kind || 'expense', category: row?.category || data.categories[0], amount: row ? (row.amountCents / 100).toFixed(2).replace('.', ',') : '', status: row?.status || 'pending', duration: row?.installmentTotal ? row.installmentTotal === 1 ? 'once' : 'installments' : 'monthly', startMonth: row?.startMonth || state.projectionMonth, endMonth: row?.endMonth || '', updateDefault: 'false', installmentCurrent: row?.installmentCurrent || '', installmentTotal: row?.installmentTotal || '', note: row?.storedNote || '', autoRegister: Boolean(row?.autoRegister), weeklyBudget: row?.weeklyBudgetCents ? (row.weeklyBudgetCents / 100).toFixed(2).replace('.', ',') : '' });
+    fillForm(form, { id: row?.templateId || '', month: state.projectionMonth, name: row?.name || '', kind: row?.kind || 'expense', category: row?.category || data.categories[0], amount: row ? (row.amountCents / 100).toFixed(2).replace('.', ',') : '', status: row?.status || 'pending', duration: row?.installmentTotal ? row.installmentTotal === 1 ? 'once' : 'installments' : 'monthly', startMonth: row?.startMonth || state.projectionMonth, endMonth: row?.endMonth || '', updateDefault: 'false', installmentCurrent: row?.installmentCurrent || '', installmentTotal: row?.installmentTotal || '', note: row?.storedNote || '', weeklyBudget: row?.weeklyBudgetCents ? (row.weeklyBudgetCents / 100).toFixed(2).replace('.', ',') : '' });
     // El presupuesto semanal solo tiene sentido en el sobre por categoría; deshabilitado no se envía.
     const envelope = Boolean(row?.tracksActualCategory); form.querySelector('[data-envelope]').hidden = !envelope; form.elements.weeklyBudget.disabled = !envelope;
     $('projectionEditTitle').textContent = row ? 'Editar concepto' : 'Añadir concepto'; $('projectionEditContext').textContent = 'Mes de los importes y del estado: ' + monthName(state.projectionMonth); $('projectionError').hidden = true;
@@ -655,7 +775,6 @@ if (typeof document !== 'undefined') (() => {
     event.preventDefault(); if (busy) return;
     const form = event.target, payload = Object.fromEntries(new FormData(form));
     payload.isFixed = payload.isFixed === 'true'; payload.updateDefault = payload.updateDefault === 'true';
-    if (projection) payload.autoRegister = Boolean(form.elements.autoRegister?.checked);
     payload.reviewed = Boolean(form.elements.reviewed?.checked); payload.removeAttachment = Boolean(form.elements.removeAttachment?.checked);
     if (payload.removeAttachment) payload.receiptId = '';
     const error = $(projection ? 'projectionError' : 'editError'), dialog = projection ? 'projectionModal' : 'editModal';
@@ -787,6 +906,7 @@ if (typeof document !== 'undefined') (() => {
   });
   $('editForm').addEventListener('submit', event => submitForm(event, false)); $('projectionForm').addEventListener('submit', event => submitForm(event, true)); $('newTransactionForm').addEventListener('submit', submitNewTransaction); $('walletForm').addEventListener('submit', submitWallet);
   $('receiptReviewForm').addEventListener('submit', submitReceiptReview); $('addReceiptLine').addEventListener('click', () => addReceiptReviewLine());
+  $('receiptTotalForm').addEventListener('submit', submitReceiptTotal);
   $('receiptReviewForm').addEventListener('input', updateReceiptReviewSum);
   $('projectionForm').elements.duration.addEventListener('change', updateDurationFields);
   for (const name of ['date', 'kind']) $('editForm').elements[name].addEventListener('change', () => projectionOptions($('editForm'), $('editForm').elements.projectionTemplateId.value));
@@ -810,6 +930,16 @@ if (typeof document !== 'undefined') (() => {
     if (button.dataset.omit) setProjectionStatus(button.dataset.omit, 'skipped', button);
     if (button.dataset.endProjection) { const [id, month] = button.dataset.endProjection.split(':'); if (confirm('¿Finalizar este concepto desde ' + monthName(month) + '? Se conservarán los meses anteriores.')) (async () => { try { await mutate('/api/projections/' + id + '/' + month + '/from', {}, 'DELETE'); await refreshData(); notify('Concepto finalizado desde ' + monthName(month) + '.'); } catch (error) { notify(error.message, true); } })(); }
     if (button.dataset.attachment) openAttachment(button.dataset.attachment);
+    if (button.dataset.inboxTotal) openReceiptTotalModal(button.dataset.inboxTotal);
+    if (button.dataset.quickSave) { const select = document.querySelector('[data-quick-category="' + button.dataset.quickSave + '"]'); if (select) quickUpdate(button.dataset.quickSave, { category: select.value }, 'Categoría guardada. La próxima vez se usará sola.'); }
+    if (button.dataset.quickReview) quickUpdate(button.dataset.quickReview, { reviewed: true }, 'Marcado como revisado.');
+    if (button.dataset.quickKind) { const [id, kind] = button.dataset.quickKind.split(':'); quickUpdate(id, { kind }, kind === 'income' ? 'Ahora es un ingreso.' : 'Ahora es un gasto.'); }
+    if (button.dataset.registerProjection) { const [id, month] = button.dataset.registerProjection.split(':'); registerProjection(id, month); }
+    if (button.dataset.registerMonth) registerMonth(button.dataset.registerMonth);
+    if (button.dataset.linkProjection) { const [id, templateId] = button.dataset.linkProjection.split(':'); quickUpdate(id, { projectionTemplateId: templateId }, 'Movimiento vinculado al concepto.'); }
+    if (button.dataset.projectionMonth) { const [id, month] = button.dataset.projectionMonth.split(':'); state.projectionMonth = month; $('projectionMonth').value = month; showTab('projection'); openProjectionModal(id); }
+    if (button.dataset.deleteDuplicate) deleteDuplicate(button.dataset.deleteDuplicate);
+    if (button.dataset.distinct) { const [first, second] = button.dataset.distinct.split(':'); (async () => { if (busy) return; busy = true; try { await mutate('/api/transactions/' + first + '/quick', { reviewed: true }); await mutate('/api/transactions/' + second + '/quick', { reviewed: true }); await refreshData(); notify('Marcados como distintos.'); } catch (error) { notify(error.message, true); } finally { busy = false; } })(); }
     if (button.dataset.undo) (async () => { try { await mutate('/api/transactions/' + button.dataset.undo + '/undo', {}); await refreshData(); notify('Último cambio deshecho.'); } catch (error) { notify(error.message, true); } })();
   });
   $('quickAddTransaction').addEventListener('click', openNewTransactionModal);

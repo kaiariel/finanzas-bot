@@ -287,7 +287,7 @@ def test_transaction_delete_and_restore_http_routes(tmp_path) -> None:
         worker.join()
 
 
-def test_auto_register_concept_creates_and_removes_its_movement(tmp_path) -> None:
+def test_marking_a_concept_paid_creates_and_removes_its_movement(tmp_path) -> None:
     module = _load_serve_dashboard()
     settings = _settings(tmp_path)
     db = FinanceDatabase(settings.sqlite_db_path, settings.timezone, create=True)
@@ -318,8 +318,12 @@ def test_auto_register_concept_creates_and_removes_its_movement(tmp_path) -> Non
     module.set_projection_status(settings, template, "2026-08", "pending")
     assert linked(template) == []
 
-    # Un concepto sin la marca sigue sin crear movimientos.
+    # Marcar como pagado siempre crea el movimiento: un "completado" sin dinero
+    # detras desaparecia del cierre estimado.
     module.set_projection_status(settings, plain, "2026-08", "completed")
+    [created_plain] = linked(plain)
+    assert created_plain["amount_cents"] == 3000
+    module.set_projection_status(settings, plain, "2026-08", "pending")
     assert linked(plain) == []
 
 

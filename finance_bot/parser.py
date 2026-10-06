@@ -113,23 +113,37 @@ CLIENT_REIMBURSABLE_EXPENSE_PHRASES = (
 )
 
 INCOME_WORDS = {
+    "cobrado",
+    "cobramos",
     "cobre",
     "cobro",
     "ingrese",
     "ingreso",
+    "ingresos",
     "nomina",
+    "pagaron",
     "paro",
     "recibi",
+    "recibido",
+    "recibimos",
     "sueldo",
     "subsidio",
     "venta",
 }
 
+# Formas de "cobrar" que, junto a una categoria de gasto, significan que nos
+# cobraron a nosotros ("cobro amazon cuota silla", "cobrado seguro salud").
+CHARGE_WORDS = {"cobre", "cobro", "cobrado", "cobraron"}
+
 EXPENSE_WORDS = {
+    "cargo",
+    "cobraron",
     "compra",
     "compre",
+    "descontaron",
     "gaste",
     "gasto",
+    "pagado",
     "pague",
     "pago",
     "recibo",
@@ -615,8 +629,17 @@ def infer_kind(text: str, sign: str | None, category: str | None) -> str:
         return "expense"
     if category == "Ingresos clientes" and is_client_reimbursable_expense(normalized):
         return "expense"
-    if category and category not in INCOME_CATEGORIES and "cobro" in words:
+    if category and category not in INCOME_CATEGORIES and words & CHARGE_WORDS:
         return "expense"
+    # "me cobraron" o "descontaron" es un cargo aunque la frase diga "ingreso".
+    if words & {"cobraron", "descontaron"}:
+        return "expense"
+    # El primer verbo manda: "gasto 30 venta ropa" es un gasto aunque diga "venta".
+    for word in re.findall(r"\w+", normalized):
+        if word in EXPENSE_WORDS:
+            return "expense"
+        if word in INCOME_WORDS:
+            return "income"
     if words & INCOME_WORDS:
         return "income"
     if words & EXPENSE_WORDS:
@@ -651,11 +674,12 @@ def clean_note(text: str, match: re.Match[str]) -> str:
     after = text[match.end() :].strip(" -:;,.")
     note = " ".join(part for part in (before, after) if part).strip()
     note = re.sub(
-        r"\b(hoy|ayer|gasto|gaste|gasté|pago|pague|pagué|compra|compre|compré|ingreso|ingrese|ingresé|cobro|cobre|cobré|recibi|recibí|recibo|descontaron|descontado|cobraron|cobrado)\b\s*",
+        r"\b(hoy|ayer|gasto|gaste|gasté|pago|pague|pagué|pagado|pagaron|compra|compre|compré|ingreso|ingresos|ingrese|ingresé|cobro|cobre|cobré|cobramos|recibi|recibí|recibido|recibimos|recibo|descontaron|descontado|cobraron|cobrado|cargo)\b\s*",
         "",
         note,
         flags=re.IGNORECASE,
     ).strip(" -:;,.")
+    note = re.sub(r"^(me|nos)\s+", "", note, flags=re.IGNORECASE)
     note = re.sub(r"^(y|en|a|de|por)\s+(el|la|los|las)?\s*", "", note, flags=re.IGNORECASE)
     note = re.sub(r"\s+(por|de|en)$", "", note, flags=re.IGNORECASE)
     return note or text.strip()

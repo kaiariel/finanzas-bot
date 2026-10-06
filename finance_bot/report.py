@@ -20,10 +20,13 @@ from finance_bot.formatting import (
     parse_created_at,
     tipo_label,
 )
+from finance_bot.db import REVIEW_QUEUE_STATUSES, SUMMARY_REVIEW_STATUS
 from finance_bot.parser import (
+    DEFAULT_EXPENSE_CATEGORY,
     HOUSEHOLD_FOOD_CATEGORY,
     LEGACY_HOUSEHOLD_FOOD_CATEGORIES,
     VALID_CATEGORIES,
+    note_key,
 )
 
 
@@ -203,6 +206,95 @@ def weekly_envelope(
             start += timedelta(days=7)
         pending = round(pending)
     return {"planCents": plan, "pendingCents": pending, "weekSpentCents": week_spent, "weekLeftCents": week_left}
+
+
+HOUSEHOLD_ENVELOPE_NAMES = {
+    _normalize_text(name)
+    for name in ("Hogar/Alimentacion", "Hogar/Alimentación", "Hogar y Alimentacion", HOUSEHOLD_FOOD_CATEGORY)
+}
+
+
+def _is_household_envelope(name: object, category: object) -> bool:
+    return _normalize_category(str(category or "")) == HOUSEHOLD_FOOD_CATEGORY and _normalize_text(str(name or "")) in HOUSEHOLD_ENVELOPE_NAMES
+
+
+def _duplicate_pairs(transactions: list[dict[str, object]]) -> list[list[int]]:
+    """Mismo tipo, importe, dia y concepto, registrados por separado.
+
+    Dos lineas iguales del mismo ticket (dos bolsas) son normales y no se marcan;
+    tampoco dos tickets distintos revisados a mano. Se avisa cuando al menos uno
+    de los dos llego como texto, que es donde se repite un gasto sin querer.
+    """
+    groups: dict[tuple[object, ...], list[dict[str, object]]] = {}
+    for row in transactions:
+        if row["reviewStatus"] == "reviewed":
+            continue
+        key = (row["kind"], row["amountCents"], row["dateIso"], note_key(str(row["description"])))
+        groups.setdefault(key, []).append(row)
+    pairs: list[list[int]] = []
+    for items in groups.values():
+        for index, first in enumerate(items):
+            for second in items[index + 1:]:
+                if first["receiptId"] is not None and second["receiptId"] is not None:
+                    continue
+                pairs.append([int(first["id"]), int(second["id"])])
+    return pairs[:50]
+
+
+def _needs_classification(row: dict[str, object]) -> bool:
+    """Sigue dudoso si la categoria es la asumida por el parser o no se pudo vincular.
+
+    Un movimiento ya corregido en el panel conserva su aviso antiguo; si la
+    categoria actual ya no es la asumida, no hay nada que decidir.
+    """
+    if row["reviewStatus"] == "reviewed":
+        return False
+    if row["category"] == DEFAULT_EXPENSE_CATEGORY:
+        return True
+    for note in row["inferenceNotes"]:
+        text = str(note)
+        if text.startswith("Categoria asumida como "):
+            assumed = text[len("Categoria asumida como "):].split(" por ")[0].strip(" .")
+            if _normalize_category(assumed) == row["category"]:
+                return True
+        elif "es de gastos" in text and not row["projectionTemplateId"]:
+            return True
+        elif "No se pudo deducir" in text and not row["projectionTemplateId"]:
+            return True
+    return False
+
+
+def inbox_payload(
+    transactions: list[dict[str, object]], receipts: list[dict[str, object]], db: FinanceDatabase, current_month: str
+) -> dict[str, object]:
+    """Bandeja unica: todo lo que necesita una decision antes de fiarse de las cifras."""
+    pending_receipts = [int(row["id"]) for row in receipts if row["status"] in REVIEW_QUEUE_STATUSES]
+    summaries = [int(row["id"]) for row in transactions if row["reviewStatus"] == SUMMARY_REVIEW_STATUS]
+    unclassified = [int(row["id"]) for row in transactions if _needs_classification(row)]
+    manual = [
+        {
+            "templateId": int(row["template_id"]),
+            "month": str(row["month"]),
+            "monthName": format_month(datetime.fromisoformat(str(row["month"]) + "-01")),
+            "name": row["name"],
+            "kind": row["kind"],
+            "type": tipo_label(str(row["kind"])),
+            "category": _normalize_category(row["category"]),
+            "amountCents": int(row["amount_cents"]),
+            "amount": format_euro(int(row["amount_cents"])),
+        }
+        for row in db.completed_without_movement(current_month)
+        if not _is_household_envelope(row["name"], row["category"])
+    ]
+    duplicates = _duplicate_pairs(transactions)
+    return {
+        "receipts": pending_receipts,
+        "summaries": summaries,
+        "unclassified": unclassified,
+        "manualCompleted": manual,
+        "duplicates": duplicates,
+        "count": len(pending_receipts) + len(unclassified) + len(manual) + len(duplicates),
+    }
 
 
 def _add_months(date_value: datetime, months: int) -> datetime:
@@ -497,7 +589,8 @@ def report_data(settings: Settings, *, editable: bool = False) -> dict:
         "emergencyMonthlyCents": savings_settings["emergency_monthly_cents"],
         "wallets": savings_wallets,
     }
-    return {"transactions": transactions, "receipts": receipts, "projections": projections, "calendar": calendar_data,
+    inbox = inbox_payload(transactions, receipts, db, now.strftime("%Y-%m"))
+    return {"transactions": transactions, "receipts": receipts, "projections": projections, "calendar": calendar_data, "inbox": inbox,
             "dataHealth": {"lastRecordAt": health["lastRecordAt"], "lastBackupAt": read_backup_status(settings.data_dir).get("verifiedAt")},
             "accounts": accounts, "budgets": budgets, "savingsGoals": goals, "savings": savings,
             "generatedAt": now.strftime("%d/%m/%Y %H:%M"), "today": now.strftime("%Y-%m-%d"), "timezone": settings.timezone,

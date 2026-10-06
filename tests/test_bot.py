@@ -71,7 +71,7 @@ def test_record_text_ignores_redelivered_message_and_keeps_send_date(tmp_path) -
     db = FinanceDatabase(settings.sqlite_db_path, settings.timezone, create=True)
     replies: list[str] = []
 
-    async def reply_text(text: str) -> None:
+    async def reply_text(text: str, reply_markup=None) -> None:
         replies.append(text)
 
     message = SimpleNamespace(
@@ -96,7 +96,10 @@ def test_record_text_ignores_redelivered_message_and_keeps_send_date(tmp_path) -
 
     rows = db.status_overview()
     assert rows["total_expense_cents"] == 1250
-    assert replies == ["Enviado para registro."]
+    # Una sola confirmacion, y dice lo que se guardo.
+    assert len(replies) == 1
+    assert "Gasto · 12,50 €" in replies[0]
+    assert "Hogar y Alimentación" in replies[0]
     assert refresh_requests.is_set()
 
 

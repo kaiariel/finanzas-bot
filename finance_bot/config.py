@@ -74,6 +74,8 @@ class Settings:
     voice_transcription_model: str
     voice_transcription_device: str
     voice_transcription_compute_type: str
+    calendar_daily_summary_enabled: bool = False
+    weekly_summary_enabled: bool = True
 
     @classmethod
     def from_env(cls, env_file: str | Path = ".env") -> "Settings":
@@ -108,6 +110,8 @@ class Settings:
             voice_transcription_compute_type=os.getenv(
                 "VOICE_TRANSCRIPTION_COMPUTE_TYPE", "int8"
             ).strip(),
+            calendar_daily_summary_enabled=_parse_bool(os.getenv("CALENDAR_DAILY_SUMMARY_ENABLED"), default=False),
+            weekly_summary_enabled=_parse_bool(os.getenv("WEEKLY_SUMMARY_ENABLED"), default=True),
         )
 
     def validate_for_bot(self) -> None:

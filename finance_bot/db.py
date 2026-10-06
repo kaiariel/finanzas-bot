@@ -22,10 +22,13 @@ from finance_bot.formatting import (
 )
 from finance_bot.parser import (
     DEFAULT_EXPENSE_CATEGORY,
+    DEFAULT_INCOME_CATEGORY,
     HOUSEHOLD_FOOD_CATEGORY,
+    INCOME_CATEGORIES,
     LEGACY_HOUSEHOLD_FOOD_CATEGORIES,
     ParsedTransaction,
     VALID_CATEGORIES,
+    infer_is_fixed,
     note_key,
     with_learned_category,
 )
@@ -36,6 +39,9 @@ from finance_bot.storage import inspect_database
 AUTO_REGISTER_SOURCE = "Registrado automaticamente al marcar el concepto como pagado"
 
 REVIEW_QUEUE_STATUSES = ("nuevo", "pending", "voice_pending", "dudoso", "missing")
+# Movimiento creado con el total de un ticket desde Telegram; el detalle por
+# producto es opcional y, si se hace desde el panel, lo sustituye.
+SUMMARY_REVIEW_STATUS = "summary"
 
 
 @dataclass(frozen=True)
@@ -177,6 +183,17 @@ class FinanceDatabase:
             link, month = row["projection_template_id"], str(row["created_at"])[:7]
             occurrence = self.get_projection_occurrence(link, month) if link else None
             connection.execute("DELETE FROM transactions WHERE id = ?", (transaction_id,))
+            receipt_status = None
+            if row["receipt_id"] is not None:
+                # Si el ticket se queda sin movimientos vuelve a la bandeja de pendientes.
+                orphan = connection.execute(
+                    "SELECT status FROM receipts WHERE id = ? AND status = 'processed' AND NOT EXISTS "
+                    "(SELECT 1 FROM transactions WHERE receipt_id = ?)",
+                    (row["receipt_id"], row["receipt_id"]),
+                ).fetchone()
+                if orphan:
+                    receipt_status = orphan["status"]
+                    connection.execute("UPDATE receipts SET status = 'pending' WHERE id = ?", (row["receipt_id"],))
             if link:
                 # Igual que al cambiar el vinculo desde el panel: si el concepto se
                 # habia completado solo por este movimiento, vuelve a pendiente.
@@ -195,7 +212,8 @@ class FinanceDatabase:
                 "transaction",
                 transaction_id,
                 json.dumps(
-                    {"row": dict(row), "projection": dict(occurrence) if occurrence else None},
+                    {"row": dict(row), "projection": dict(occurrence) if occurrence else None,
+                     "receiptStatus": receipt_status},
                     ensure_ascii=False,
                     default=str,
                 ),
@@ -226,6 +244,8 @@ class FinanceDatabase:
                     "WHERE template_id = ? AND month = ?",
                     (occurrence["status"], occurrence["note"], self._now(), occurrence["template_id"], occurrence["month"]),
                 )
+            if payload.get("receiptStatus") and saved.get("receipt_id") is not None:
+                connection.execute("UPDATE receipts SET status = ? WHERE id = ?", (payload["receiptStatus"], saved["receipt_id"]))
             self.log_audit("restore", "transaction", transaction_id, "Restaurado tras un borrado")
         restored = self.get_transaction(transaction_id)
         assert restored is not None
@@ -241,6 +261,230 @@ class FinanceDatabase:
             raise KeyError(f"No existe el movimiento {transaction_id}")
         self.log_audit("payment", "transaction", transaction_id, f"Pagado {paid_amount_cents}")
         return row
+
+    def receipt_transactions(self, receipt_id: int) -> list[sqlite3.Row]:
+        with self._connect() as connection:
+            return connection.execute(
+                "SELECT * FROM transactions WHERE receipt_id = ? ORDER BY id", (receipt_id,)
+            ).fetchall()
+
+    def register_receipt_total(
+        self,
+        receipt_id: int,
+        *,
+        amount_cents: int,
+        category: str,
+        note: str,
+        kind: str = "expense",
+        store: str = "",
+        source_text: str = "",
+        inference_notes: tuple[str, ...] | list[str] = (),
+        telegram_message_id: int | None = None,
+    ) -> int:
+        """Registra un ticket por su total, con la fecha del ticket.
+
+        Asi el gasto cuenta el mismo dia en el sobre semanal y en el cierre estimado.
+        El detalle por producto queda opcional: si se hace desde el panel, sustituye
+        a este movimiento (ver _register_receipt_entries).
+        """
+        if kind not in {"expense", "income"}:
+            raise ValueError("kind debe ser 'expense' o 'income'")
+        if amount_cents <= 0:
+            raise ValueError("El total debe ser mayor que cero")
+        if category not in VALID_CATEGORIES:
+            raise ValueError("Categoria no valida")
+        with self.atomic(), self._connect() as connection:
+            receipt = self.get_receipt(receipt_id)
+            if receipt is None:
+                raise KeyError(f"No existe el ticket {receipt_id}")
+            linked = self.receipt_transactions(receipt_id)
+            if linked:
+                raise ValueError(
+                    f"El ticket #{receipt_id} ya tiene movimientos registrados (#{linked[0]['id']})."
+                )
+            transaction_id = self.add_manual_transaction(
+                kind=kind,
+                amount_cents=amount_cents,
+                category=category,
+                note=note.strip() or f"Ticket #{receipt_id}",
+                store=store,
+                is_fixed=infer_is_fixed(source_text or note, category),
+                source_text=source_text,
+                created_at=receipt["created_at"],
+                receipt_local_path=receipt["local_path"],
+                telegram_message_id=telegram_message_id if telegram_message_id is not None else receipt["telegram_message_id"],
+                telegram_user_id=receipt["telegram_user_id"],
+                telegram_username=receipt["telegram_username"],
+                telegram_full_name=receipt["telegram_full_name"],
+                receipt_id=receipt_id,
+                review_status=SUMMARY_REVIEW_STATUS,
+            )
+            if inference_notes:
+                connection.execute(
+                    "UPDATE transactions SET inference_notes = ? WHERE id = ?",
+                    (json.dumps(list(inference_notes), ensure_ascii=False), transaction_id),
+                )
+            connection.execute(
+                "UPDATE receipts SET status = 'processed', review_notes = ? WHERE id = ?",
+                ("Registrado por su total; el detalle por producto es opcional", receipt_id),
+            )
+            self.log_audit("create", "transaction", transaction_id, f"Total del ticket #{receipt_id}")
+        return transaction_id
+
+    def update_transaction_fields(
+        self,
+        transaction_id: int,
+        *,
+        kind: str | None = None,
+        category: str | None = None,
+        reviewed: bool = False,
+        origin: str = "Telegram",
+    ) -> sqlite3.Row:
+        """Cambio rapido de tipo o categoria (botones de Telegram y bandeja del panel).
+
+        Deja el mismo rastro en audit_log que el formulario del panel (asi se puede
+        deshacer), aprende la categoria corregida y desvincula la proyeccion si el
+        tipo ya no coincide con ella.
+        """
+        existing = self.get_transaction(transaction_id)
+        if existing is None:
+            raise KeyError(f"No existe el movimiento {transaction_id}")
+        if kind is not None and kind not in {"expense", "income"}:
+            raise ValueError("kind debe ser 'expense' o 'income'")
+        if category is not None and category not in VALID_CATEGORIES:
+            raise ValueError("Categoria no valida")
+        new_kind = kind or existing["kind"]
+        new_category = category or existing["category"]
+        if category is None and new_kind != existing["kind"]:
+            # Un ingreso no se queda con una categoria de gasto, ni al reves.
+            if new_kind == "income" and new_category not in INCOME_CATEGORIES:
+                new_category = DEFAULT_INCOME_CATEGORY
+            elif new_kind == "expense" and new_category in INCOME_CATEGORIES:
+                new_category = DEFAULT_EXPENSE_CATEGORY
+        values: dict[str, object] = {}
+        if new_kind != existing["kind"]:
+            values["kind"] = new_kind
+        if new_category != existing["category"]:
+            values["category"] = new_category
+            values["is_fixed"] = int(infer_is_fixed(existing["source_text"] or existing["note"] or "", new_category))
+        if category is not None or reviewed:
+            values["inference_notes"] = "[]"
+            values["review_status"] = "reviewed"
+        if not values:
+            return existing
+        old_link = existing["projection_template_id"]
+        month = str(existing["created_at"])[:7]
+        unlink = bool(old_link) and "kind" in values
+        with self.atomic(), self._connect() as connection:
+            snapshots = []
+            if old_link:
+                occurrence = self.get_projection_occurrence(old_link, month)
+                snapshots.append({"templateId": old_link, "month": month, "before": dict(occurrence) if occurrence else None})
+            if unlink:
+                values["projection_template_id"] = None
+            connection.execute(
+                "UPDATE transactions SET " + ", ".join(key + " = ?" for key in values) + " WHERE id = ?",
+                (*values.values(), transaction_id),
+            )
+            if unlink:
+                remaining = connection.execute(
+                    "SELECT COUNT(*) FROM transactions WHERE projection_template_id = ? AND substr(created_at,1,7) = ?",
+                    (old_link, month),
+                ).fetchone()[0]
+                if not remaining:
+                    connection.execute(
+                        "UPDATE projection_occurrences SET status = 'pending', note = '', updated_at = ? "
+                        "WHERE template_id = ? AND month = ? AND status = 'completed'",
+                        (self._now(), old_link, month),
+                    )
+            for snapshot in snapshots:
+                occurrence = self.get_projection_occurrence(snapshot["templateId"], snapshot["month"])
+                snapshot["after"] = dict(occurrence) if occurrence else None
+            self.log_audit(
+                "update",
+                "transaction",
+                transaction_id,
+                json.dumps({"before": dict(existing), "after": values, "projections": snapshots, "origin": origin},
+                           ensure_ascii=False, default=str),
+            )
+            if category is not None and "category" in values:
+                self.learn_category(existing["note"], new_kind, new_category)
+        row = self.get_transaction(transaction_id)
+        assert row is not None
+        return row
+
+    def link_transaction_to_projection(self, transaction_id: int, template_id: int) -> sqlite3.Row:
+        """Vincula un movimiento ya registrado a un concepto del plan (sin crear otro cargo)."""
+        existing = self.get_transaction(transaction_id)
+        if existing is None:
+            raise KeyError(f"No existe el movimiento {transaction_id}")
+        template = self.get_projection_template(template_id)
+        month = str(existing["created_at"])[:7]
+        if template is None or template["kind"] != existing["kind"] or not self._projection_applies_to_month(template, month):
+            raise ValueError("La proyección no corresponde al tipo o mes del movimiento.")
+        old_link = existing["projection_template_id"]
+        with self.atomic(), self._connect() as connection:
+            before = self.get_projection_occurrence(template_id, month)
+            connection.execute("UPDATE transactions SET projection_template_id = ? WHERE id = ?", (template_id, transaction_id))
+            if old_link and old_link != template_id:
+                remaining = connection.execute(
+                    "SELECT COUNT(*) FROM transactions WHERE projection_template_id = ? AND substr(created_at,1,7) = ?",
+                    (old_link, month),
+                ).fetchone()[0]
+                if not remaining:
+                    connection.execute(
+                        "UPDATE projection_occurrences SET status = 'pending', note = '', updated_at = ? WHERE template_id = ? AND month = ?",
+                        (self._now(), old_link, month),
+                    )
+            connection.execute(
+                """INSERT INTO projection_occurrences(template_id, month, amount_cents, status, note, updated_at)
+                   VALUES (?, ?, ?, 'completed', ?, ?) ON CONFLICT(template_id, month)
+                   DO UPDATE SET status = 'completed', updated_at = excluded.updated_at""",
+                (template_id, month, template["default_amount_cents"], f"Vinculado manualmente al movimiento #{transaction_id}", self._now()),
+            )
+            self.drop_auto_payments(template_id, month, keep=transaction_id)
+            after = self.get_projection_occurrence(template_id, month)
+            self.log_audit(
+                "update", "transaction", transaction_id,
+                json.dumps({"before": dict(existing), "after": {"projection_template_id": template_id},
+                            "projections": [{"templateId": template_id, "month": month, "before": dict(before) if before else None, "after": dict(after) if after else None}]},
+                           ensure_ascii=False, default=str),
+            )
+        row = self.get_transaction(transaction_id)
+        assert row is not None
+        return row
+
+    def last_telegram_transaction(self, telegram_user_id: int) -> sqlite3.Row | None:
+        """Ultimo movimiento que esta persona registro desde Telegram (texto o total de ticket)."""
+        with self._connect() as connection:
+            return connection.execute(
+                "SELECT * FROM transactions WHERE telegram_user_id = ? AND telegram_message_id IS NOT NULL "
+                "AND (receipt_id IS NULL OR review_status = ?) ORDER BY id DESC LIMIT 1",
+                (telegram_user_id, SUMMARY_REVIEW_STATUS),
+            ).fetchone()
+
+    def remember_telegram_message(self, telegram_user_id: int | None, telegram_message_id: int | None) -> None:
+        if telegram_user_id is None or telegram_message_id is None:
+            return
+        with self._connect() as connection:
+            connection.execute(
+                "INSERT OR IGNORE INTO telegram_messages(user_id, message_id, processed_at) VALUES (?, ?, ?)",
+                (telegram_user_id, telegram_message_id, self._now()),
+            )
+
+    def telegram_delivery_sent(self, kind: str, period: str, chat_id: int) -> bool:
+        with self._connect() as connection:
+            return connection.execute(
+                "SELECT 1 FROM telegram_deliveries WHERE kind = ? AND period = ? AND chat_id = ?",
+                (kind, period, chat_id),
+            ).fetchone() is not None
+
+    def mark_telegram_delivery(self, kind: str, period: str, chat_id: int) -> None:
+        with self._connect() as connection:
+            connection.execute(
+                "INSERT OR REPLACE INTO telegram_deliveries(kind, period, chat_id, sent_at) VALUES (?, ?, ?, ?)",
+                (kind, period, chat_id, self._now()),
+            )
 
     def _init_schema(self) -> None:
         with self._connect() as connection:
@@ -273,6 +517,20 @@ class FinanceDatabase:
                     overrides TEXT NOT NULL DEFAULT '{}',
                     updated_at TEXT NOT NULL,
                     PRIMARY KEY(event_id, date)
+                );
+                CREATE TABLE IF NOT EXISTS calendar_daily_deliveries (
+                    day TEXT NOT NULL,
+                    chat_id INTEGER NOT NULL,
+                    content TEXT NOT NULL,
+                    next_part INTEGER NOT NULL DEFAULT 0,
+                    PRIMARY KEY(day, chat_id)
+                );
+                CREATE TABLE IF NOT EXISTS telegram_deliveries (
+                    kind TEXT NOT NULL,
+                    period TEXT NOT NULL,
+                    chat_id INTEGER NOT NULL,
+                    sent_at TEXT NOT NULL,
+                    PRIMARY KEY(kind, period, chat_id)
                 );
                 INSERT OR IGNORE INTO finance_meta(key,value) VALUES ('initialized','1');
                 CREATE TABLE IF NOT EXISTS telegram_messages (
@@ -783,9 +1041,13 @@ class FinanceDatabase:
         return (following - timedelta(days=1)).isoformat(timespec="seconds")
 
     def register_projection_payment(self, template_id: int, month: str) -> int | None:
-        """Crea el movimiento de un concepto domiciliado si ese mes aun no tiene ninguno."""
+        """Crea el movimiento de un concepto marcado como pagado o cobrado si ese mes aun no tiene ninguno.
+
+        Un estado "completado" sin movimiento no contaba en ningun sitio: ni en lo
+        registrado ni en lo pendiente, asi que el cierre estimado perdia ese importe.
+        """
         template = self.get_projection_template(template_id)
-        if template is None or not template["auto_register"]:
+        if template is None:
             return None
         with self.atomic(), self._connect() as connection:
             linked = connection.execute(
@@ -1038,10 +1300,17 @@ class FinanceDatabase:
             raise KeyError(f"No existe el ticket {receipt_id}")
         if not entries:
             raise ValueError("El ticket necesita al menos una línea")
-        if not allow_existing:
-            with self._connect() as connection:
-                if connection.execute("SELECT 1 FROM transactions WHERE receipt_id = ? LIMIT 1", (receipt_id,)).fetchone():
-                    raise ValueError("El ticket ya está registrado. Edita sus movimientos vinculados para corregirlo.")
+        with self._connect() as connection:
+            linked = connection.execute(
+                "SELECT id, review_status FROM transactions WHERE receipt_id = ? ORDER BY id", (receipt_id,)
+            ).fetchall()
+        summaries = [row["id"] for row in linked if row["review_status"] == SUMMARY_REVIEW_STATUS]
+        if linked and len(summaries) == len(linked):
+            # El ticket se registro por su total desde Telegram; el detalle lo sustituye.
+            for transaction_id in summaries:
+                self.delete_transaction(transaction_id)
+        elif linked and not allow_existing:
+            raise ValueError("El ticket ya está registrado. Edita sus movimientos vinculados para corregirlo.")
         prepared: list[tuple[object, ...]] = []
         for entry in entries:
             kind = str(entry.get("kind") or "expense")
@@ -1417,6 +1686,28 @@ class FinanceDatabase:
                 ORDER BY month ASC, template_id ASC
                 """,
                 tuple(params),
+            ).fetchall()
+
+    def completed_without_movement(self, up_to_month: str) -> list[sqlite3.Row]:
+        """Conceptos marcados como pagados o cobrados sin ningun movimiento en ese mes.
+
+        Antes de que marcar creara el movimiento, estos importes no contaban en
+        ningun sitio. La bandeja del panel permite registrarlos con un clic.
+        """
+        with self._connect() as connection:
+            return connection.execute(
+                """
+                SELECT o.template_id, o.month, o.amount_cents, t.name, t.kind, t.category
+                FROM projection_occurrences o
+                JOIN projection_templates t ON t.id = o.template_id
+                WHERE o.status = 'completed' AND o.month <= ? AND t.active = 1
+                  AND NOT EXISTS (
+                      SELECT 1 FROM transactions x
+                      WHERE x.projection_template_id = o.template_id AND substr(x.created_at, 1, 7) = o.month
+                  )
+                ORDER BY o.month DESC, t.kind, t.name
+                """,
+                (up_to_month,),
             ).fetchall()
 
     def find_possible_duplicate(

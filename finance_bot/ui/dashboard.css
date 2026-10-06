@@ -478,3 +478,34 @@ body:has(dialog[open]){overflow:hidden}
 [data-theme=dark] .toast.error{background:#5c2731;color:#ffe3e7}
 [data-theme=dark] button.theme-toggle{background:var(--accent-soft);color:var(--accent-strong);border-color:var(--accent-line)}
 [data-theme=dark] .skip{background:var(--surface);color:var(--accent-strong)}
+
+/* Bandeja única, badge de pendientes y agenda plegable del inicio. */
+.nav-badge{margin-left:auto;background:var(--danger);color:#fff;border-radius:99px;font-size:12px;font-weight:700;padding:2px 8px;line-height:1.4;min-width:22px;text-align:center}
+.mobile-home-nav .nav-badge{position:absolute;top:4px;right:10px;margin:0}
+.mobile-home-nav button{position:relative}
+.today-panel>summary{display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap;cursor:pointer;list-style:none;font-size:17px}
+.today-panel>summary::-webkit-details-marker{display:none}
+.today-panel>summary::after{content:"▾";color:var(--muted);margin-left:auto}
+.today-panel[open]>summary::after{content:"▴"}
+.today-panel[open]>summary{margin-bottom:14px}
+.today-summary-main{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
+.today-summary-main strong{font-size:20px}
+.count{display:inline-block;font-size:14px;font-weight:700;color:var(--accent-strong);background:var(--accent-soft);border-radius:99px;padding:2px 9px;margin-left:8px;vertical-align:middle}
+.inbox-list{display:flex;flex-direction:column}
+.inbox-item{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:10px 16px;align-items:center;padding:12px 0;border-top:1px solid var(--line-soft)}
+.inbox-item:first-child{border-top:0}
+.inbox-main{display:flex;gap:12px;align-items:center;min-width:0}
+.inbox-main>div{min-width:0}
+.inbox-main strong{display:block;overflow-wrap:anywhere}
+.inbox-main small{display:block;color:var(--muted)}
+.inbox-main small.expense{color:var(--danger)}
+.inbox-actions{display:flex;gap:8px;flex-wrap:wrap;justify-content:flex-end;align-items:center}
+.inbox-actions strong.amount{font-variant-numeric:tabular-nums;white-space:nowrap;margin-right:6px;font-size:17px}
+.inbox-actions select{min-height:38px;width:auto;min-width:170px}
+.inbox-actions button{min-height:38px;padding:6px 12px;font-size:14px}
+.inbox-thumb{width:56px;height:56px;object-fit:cover;border-radius:10px;border:1px solid var(--line);flex-shrink:0;display:grid;place-items:center;font-size:12px}
+.inbox-month{display:flex;justify-content:space-between;align-items:center;gap:12px;margin:16px 0 4px;padding-top:12px;border-top:2px solid var(--line);font-weight:700;color:var(--ink-soft)}
+.inbox-group+.inbox-group{margin-top:18px}
+.chip.summary{background:var(--warn-soft);color:var(--warn)}
+#receiptTotalPreview img{max-height:260px}
+@media(max-width:760px){.inbox-item{grid-template-columns:1fr}.inbox-actions{justify-content:flex-start}.inbox-actions select{min-width:0;flex:1 1 160px}}

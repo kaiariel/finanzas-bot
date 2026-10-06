@@ -3,6 +3,72 @@
 Registro de cambios funcionales, del más reciente al más antiguo. El detalle de uso
 de cada función está en el [README](README.md).
 
+## 2026-10-06 · Confirmaciones con botones, tickets por total y bandeja única
+
+### Bot de Telegram
+
+- Cada movimiento registrado se confirma mostrando tipo, importe, categoría y
+  concepto, con botones para cambiar el tipo, elegir otra categoría (que se
+  aprende) o deshacer (restaurable). Antes solo decía "Enviado para registro" y
+  un ingreso guardado como gasto pasaba inadvertido.
+- Si la categoría no está clara, o el mensaje es un Bizum o transferencia, se
+  guarda igual y se abre la lista de categorías. Antes el Bizum se descartaba y
+  había que reescribirlo.
+- `/deshacer` elimina el último movimiento propio, con botón Restaurar.
+- Tickets: al recibir una foto el bot pide el total y el comercio (respuesta al
+  aviso o `#12 21,40 Mercadona`). El movimiento queda con la fecha del ticket y
+  cuenta en el sobre semanal el mismo día. Si el pie de foto trae el importe, se
+  registra sin preguntar. El detalle por producto pasa a ser opcional desde el
+  panel y, si se hace, sustituye al total.
+- Parser: `ingresos`, `recibido`, `cobrado` y `pagaron` cuentan como ingreso;
+  `cobraron`, `descontaron`, `pagado` y `cargo` como gasto. El primer verbo de
+  la frase manda: `gasto 30 venta ropa` es un gasto.
+- `/resumen` muestra el cierre estimado, el sobre semanal y lo pendiente de
+  revisar. El mismo texto llega el domingo a las 19:00 (o el lunes si el equipo
+  estaba apagado). Se desactiva con `WEEKLY_SUMMARY_ENABLED=0`.
+
+### Panel
+
+- Nueva sección **Para revisar**, con contador en el menú y en el Resumen:
+  tickets sin registrar (registrar total o detallar productos), movimientos sin
+  categoría clara (categoría con un clic, que se aprende), conceptos marcados
+  como pagados o cobrados sin movimiento (registrar o vincular a un movimiento
+  existente, uno a uno o por mes) y posibles duplicados.
+- **Marcar como pagado o cobrado siempre crea el movimiento**, y volver a
+  pendiente lo elimina; también desde el formulario del concepto. Antes dependía
+  de la casilla "domiciliado", desactivada en todos los conceptos, y el cierre
+  estimado perdía esos importes (en octubre, 455 € cobrados y 100 € pagados).
+- Resumen: las finanzas van primero y la agenda `Hoy` se pliega (recuerda su
+  estado y resume el día en una línea). La comparativa del mes en curso usa el
+  mismo tramo del mes anterior, hasta el día de hoy. El aviso "Resultado
+  negativo" solo aparece en meses cerrados.
+- Diagnóstico sin el índice orientativo. Proyección y Próximos meses se limitan
+  a 12 meses. Cuentas, presupuestos por categoría y objetivos solo se muestran
+  si tienen datos.
+- Al eliminar el único movimiento de un ticket, el ticket vuelve a la bandeja;
+  restaurarlo lo saca. API nueva: `POST /api/receipts/<id>/total`,
+  `POST /api/transactions/<id>/quick` y
+  `POST /api/projections/<id>/<AAAA-MM>/register`.
+
+### Datos y mantenimiento
+
+- Revisión del 6 de octubre: el ingreso del 4/10 guardado como gasto pasa a
+  ingreso; `Agua`, `Electricidad septiembre` y `Personal Tv y Telefonia` pasan a
+  `Suministros`; `Guardar Alquiler` pasa a `Ahorro`; los siete conceptos de
+  octubre marcados sin movimiento quedan registrados. Copia previa en
+  `data/backups/finances-20261006-100638-980552.db`.
+- `pytest` sin argumentos vuelve a funcionar (`pytest.ini` limita la búsqueda a
+  `tests/`). 153 pruebas automatizadas.
+
+## 2026-09-30 · Resumen diario de la agenda por Telegram
+
+- Envío opcional a las 07:00 en la zona configurada, solo con eventos para el día y
+  a usuarios autorizados. Activación mediante `CALENDAR_DAILY_SUMMARY_ENABLED`.
+- Progreso persistente por fecha, destinatario y parte enviada; reintento de fallos
+  breves, sin envío de resúmenes atrasados al iniciar después de las 07:05.
+- Pruebas de días vacíos/omitidos, horario local, recurrencias, destinatarios,
+  reinicios y continuación de respuestas largas.
+
 ## 2026-09-30 · Agenda familiar, accesibilidad e inicio de Windows
 
 - Rediseño azul claro, tarjetas con bordes visibles y emojis acompañados de texto.

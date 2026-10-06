@@ -3,14 +3,16 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
 from telegram import Update
-from telegram.error import NetworkError, RetryAfter
+from telegram.error import BadRequest, NetworkError, RetryAfter
 from telegram.ext import (
     Application,
+    CallbackQueryHandler,
     CommandHandler,
     ContextTypes,
     MessageHandler,
@@ -20,13 +22,28 @@ from telegram.ext import (
 from finance_bot.config import Settings
 from finance_bot.db import FinanceDatabase
 from finance_bot.calendar import CalendarStore
+from finance_bot.calendar_delivery import message_parts, send_daily_calendar
 from finance_bot.formatting import format_month
 from finance_bot.local_transcription import (
     LocalTranscriptionUnavailable,
     transcribe_voice_file,
 )
-from finance_bot.parser import parse_transactions
+from finance_bot.parser import DEFAULT_EXPENSE_CATEGORY, parse_transaction, parse_transactions
 from finance_bot.report import generate_report
+from finance_bot.summaries import build_summary, send_weekly_summary
+from finance_bot.telegram_ui import (
+    category_from_argument,
+    category_keyboard,
+    deleted_text,
+    parse_callback,
+    restore_keyboard,
+    ticket_from_reply,
+    ticket_prompt,
+    ticket_prompt_markup,
+    ticket_total_text,
+    transaction_keyboard,
+    transaction_text,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -39,6 +56,9 @@ HEARTBEAT_INTERVAL_SECONDS = 60
 # regenera una sola vez al terminar la rafaga en lugar de una vez por mensaje.
 REPORT_REFRESH_DELAY_SECONDS = 3
 DOWNLOAD_ATTEMPTS = 4
+# Un mensaje con muchas lineas se confirma una a una, pero sin inundar el chat.
+MAX_CONFIRMATIONS_PER_MESSAGE = 6
+AMOUNT_ONLY_NOTE_RE = re.compile(r"^[\d.,\s]+(?:€|eur|euros?)?$", re.IGNORECASE)
 
 
 def _format_money(cents: int, currency: str = "EUR") -> str:
@@ -186,6 +206,21 @@ def _get_services(context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+async def _confirm_transaction(message, db: FinanceDatabase, transaction_id: int, *, ticket_id: int | None = None,
+                               ask_category: bool = False, hint: str | None = None) -> None:
+    """Muestra lo que se guardo, con botones para corregirlo desde el movil.
+
+    Si la categoria no esta clara (Sin clasificar, Bizum...) se abre directamente
+    la lista de categorias: un toque y queda bien.
+    """
+    row = db.get_transaction(transaction_id)
+    if row is None:
+        return
+    ask_category = ask_category or row["category"] == DEFAULT_EXPENSE_CATEGORY
+    keyboard = category_keyboard(row) if ask_category else transaction_keyboard(row)
+    await message.reply_text(transaction_text(row, hint=hint, ticket_id=ticket_id), reply_markup=keyboard)
+
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     settings, _ = _get_services(context)
     if not await _is_allowed(update, settings):
@@ -206,19 +241,22 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
     await update.effective_message.reply_text(
         "Comandos:\n"
-        "/estado - estado global de las finanzas\n"
-        "/resumen - resumen del mes actual\n"
+        "/resumen - cierre estimado del mes, sobre semanal y pendientes\n"
+        "/deshacer - elimina tu último movimiento (se puede restaurar)\n"
+        "/pendientes - tickets sin registrar\n"
         "/hoy - desayunos, menú y recordatorios de hoy\n"
+        "/estado - totales del mes y del historial\n"
         "/exportar - genera y envia CSV\n"
-        "/reporte - genera y envia HTML interactivo\n"
-        "/pendientes - lista tickets y voces pendientes\n\n"
+        "/reporte - genera y envia el panel HTML\n\n"
         "Texto rapido:\n"
         "gasto 34,20 supermercado\n"
         "ingreso 250 venta bici\n"
         "+1200 nomina\n"
-        "-9,99 spotify\n\n"
+        "-9,99 spotify\n"
+        "Cada registro se confirma con botones para cambiar tipo o categoría, o deshacer.\n\n"
         "Tickets:\n"
-        "envia una foto o PDF y quedara pendiente para analizarlo en Codex"
+        "envía la foto y responde al aviso con el total y el comercio (21,40 Mercadona).\n"
+        "También vale escribir: #12 21,40 Mercadona"
     )
 
 
@@ -230,14 +268,50 @@ async def today_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     day = datetime.now(db.timezone).date()
     text = CalendarStore(db).today_text(day)
     # Telegram limita cada mensaje a 4096 caracteres. Dividir conserva todos los datos.
-    while text:
-        cut = min(len(text), 3800)
-        if len(text) > cut:
-            newline = text.rfind("\n", 0, cut)
-            if newline > 0:
-                cut = newline
-        await update.effective_message.reply_text(text[:cut])
-        text = text[cut:].lstrip("\n")
+    for part in message_parts(text):
+        await update.effective_message.reply_text(part)
+
+
+async def _register_ticket_total(update: Update, context: ContextTypes.DEFAULT_TYPE, receipt_id: int) -> None:
+    """Total de un ticket enviado como respuesta: queda registrado con la fecha del ticket."""
+    settings, db = _get_services(context)
+    message = update.effective_message
+    receipt = db.get_receipt(receipt_id)
+    if receipt is None:
+        await message.reply_text(f"No encuentro el ticket #{receipt_id}. Revisa el número en /pendientes.")
+        return
+    linked = db.receipt_transactions(receipt_id)
+    if linked:
+        await message.reply_text(
+            f"El ticket #{receipt_id} ya está registrado (movimiento #{linked[0]['id']}). "
+            "Usa Deshacer en su mensaje o corrígelo en el panel."
+        )
+        return
+    if _already_stored(update, db):
+        return
+    text = ticket_total_text(message)
+    parsed = parse_transaction(text)
+    if parsed is None:
+        await message.reply_text(f"No veo el total del ticket #{receipt_id}. Responde por ejemplo: 21,40 Mercadona")
+        return
+    parsed = db.apply_learned_category(parsed)
+    note = parsed.note
+    if AMOUNT_ONLY_NOTE_RE.match(note or ""):
+        note = f"Ticket {parsed.store}".strip() if parsed.store else f"Ticket #{receipt_id}"
+    transaction_id = db.register_receipt_total(
+        receipt_id,
+        amount_cents=parsed.amount_cents,
+        category=parsed.category,
+        note=note,
+        kind=parsed.kind,
+        store=parsed.store,
+        source_text=text,
+        inference_notes=parsed.inference_notes,
+        telegram_message_id=message.message_id,
+    )
+    db.remember_telegram_message(update.effective_user.id if update.effective_user else None, message.message_id)
+    _request_report_refresh(context)
+    await _confirm_transaction(message, db, transaction_id, ticket_id=receipt_id)
 
 
 async def record_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -245,20 +319,19 @@ async def record_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     if not await _is_allowed(update, settings):
         return
 
-    text = update.effective_message.text or ""
+    message = update.effective_message
+    text = message.text or ""
     if text.strip().casefold() == "hoy":
         await today_command(update, context)
         return
+    receipt_id = ticket_from_reply(message)
+    if receipt_id is not None:
+        await _register_ticket_total(update, context, receipt_id)
+        return
     parsed_transactions = parse_transactions(text)
     if not parsed_transactions:
-        await update.effective_message.reply_text(
+        await message.reply_text(
             "No veo un importe claro. Prueba: gasto 12,50 mercadona comida"
-        )
-        return
-
-    if any(transaction.needs_clarification for transaction in parsed_transactions):
-        await update.effective_message.reply_text(
-            "¿La transferencia/Bizum corresponde a ingreso, deuda, ayuda familiar, ahorro u otra categoría?"
         )
         return
 
@@ -268,12 +341,22 @@ async def record_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     user_metadata = _user_metadata(update, settings)
     created_at = _created_at(_message_datetime(update, settings))
     ids = db.add_telegram_transactions(parsed_transactions,
-        telegram_message_id=update.effective_message.message_id,
+        telegram_message_id=message.message_id,
         created_at=created_at, **user_metadata)
     if not ids:
         return
     _request_report_refresh(context)
-    await update.effective_message.reply_text(_confirmation_text(len(parsed_transactions)))
+    if len(ids) > MAX_CONFIRMATIONS_PER_MESSAGE:
+        await message.reply_text(
+            f"Registrados {len(ids)} movimientos (#{ids[0]} a #{ids[-1]}). "
+            "Revísalos en el panel o usa /deshacer para quitar el último."
+        )
+        return
+    for parsed, transaction_id in zip(parsed_transactions, ids):
+        hint = None
+        if parsed.needs_clarification:
+            hint = "❓ Bizum o transferencia: ¿es ingreso, deuda, ayuda familiar, ahorro u otra categoría? Elige abajo."
+        await _confirm_transaction(message, db, transaction_id, ask_category=parsed.needs_clarification, hint=hint)
 
 
 async def record_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -312,9 +395,11 @@ async def record_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
                 if not ids:
                     return
                 _request_report_refresh(context)
-                await update.effective_message.reply_text(
-                    _confirmation_text(len(parsed_transactions))
-                )
+                for transaction_id in ids[:MAX_CONFIRMATIONS_PER_MESSAGE]:
+                    await _confirm_transaction(
+                        update.effective_message, db, transaction_id,
+                        hint=f"🎙️ Entendí: «{transcription.strip()}»",
+                    )
                 return
 
             pending_id = db.add_receipt(
@@ -329,7 +414,8 @@ async def record_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             )
             _request_report_refresh(context)
             await update.effective_message.reply_text(
-                f"Voz recibida para revisión #{pending_id}."
+                f"Voz recibida para revisión #{pending_id}. Entendí: «{(transcription or '').strip() or 'nada'}». "
+                "Si es un gasto, escríbelo en texto: gasto 12,50 mercadona."
             )
             return
 
@@ -362,10 +448,12 @@ async def record_receipt(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         telegram_file_id = document.file_id
         unique_id = document.file_unique_id
         suffix = _safe_suffix(document.file_name, ".bin")
+        label = "documento"
     elif photo:
         telegram_file_id = photo.file_id
         unique_id = photo.file_unique_id
         suffix = ".jpg"
+        label = "foto"
     else:
         return
 
@@ -389,9 +477,111 @@ async def record_receipt(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         **_user_metadata(update, settings),
     )
     _request_report_refresh(context)
-    await message.reply_text(
-        f"Documento recibido para análisis #{receipt_id}."
-    )
+
+    # Con el total en el pie de foto no hace falta preguntar: se registra ya.
+    parsed = parse_transaction(caption) if caption.strip() else None
+    if parsed is not None:
+        parsed = db.apply_learned_category(parsed)
+        note = parsed.note
+        if AMOUNT_ONLY_NOTE_RE.match(note or ""):
+            note = f"Ticket {parsed.store}".strip() if parsed.store else f"Ticket #{receipt_id}"
+        transaction_id = db.register_receipt_total(
+            receipt_id,
+            amount_cents=parsed.amount_cents,
+            category=parsed.category,
+            note=note,
+            kind=parsed.kind,
+            store=parsed.store,
+            source_text=caption,
+            inference_notes=parsed.inference_notes,
+        )
+        _request_report_refresh(context)
+        await _confirm_transaction(
+            message, db, transaction_id, ticket_id=receipt_id,
+            hint="Tomado del pie de foto. Si el total no es ese, pulsa Deshacer y responde con el correcto.",
+        )
+        return
+
+    await message.reply_text(ticket_prompt(receipt_id, label), reply_markup=ticket_prompt_markup())
+
+
+async def undo_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Elimina el ultimo movimiento que esta persona registro desde Telegram (restaurable)."""
+    settings, db = _get_services(context)
+    if not await _is_allowed(update, settings):
+        return
+    user = update.effective_user
+    row = db.last_telegram_transaction(user.id) if user else None
+    if row is None:
+        await update.effective_message.reply_text("No hay ningún movimiento tuyo que deshacer.")
+        return
+    db.delete_transaction(int(row["id"]))
+    _request_report_refresh(context)
+    await update.effective_message.reply_text(deleted_text(row), reply_markup=restore_keyboard(int(row["id"])))
+
+
+async def transaction_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Botones bajo cada confirmacion: cambiar tipo, categoria, deshacer o restaurar."""
+    settings, db = _get_services(context)
+    query = update.callback_query
+    user = update.effective_user
+    allowed = settings.allowed_telegram_user_ids
+    if not user or (allowed is not None and user.id not in allowed):
+        await query.answer("Usuario no autorizado.", show_alert=True)
+        return
+    parsed = parse_callback(query.data or "")
+    if parsed is None:
+        await query.answer("Botón no reconocido.")
+        return
+    transaction_id, action, argument = parsed
+    row = db.get_transaction(transaction_id)
+    feedback = ""
+    try:
+        if action == "undo":
+            if row is None:
+                await query.answer("Ya estaba eliminado.")
+                return
+            db.delete_transaction(transaction_id)
+            text, keyboard = deleted_text(row), restore_keyboard(transaction_id)
+            feedback = "Movimiento eliminado."
+        elif action == "restore":
+            row = db.restore_deleted_transaction(transaction_id)
+            text, keyboard = transaction_text(row), transaction_keyboard(row)
+            feedback = "Movimiento restaurado."
+        elif row is None:
+            await query.answer("Este movimiento ya no existe.", show_alert=True)
+            return
+        elif action == "kind":
+            new_kind = "income" if row["kind"] == "expense" else "expense"
+            row = db.update_transaction_fields(transaction_id, kind=new_kind)
+            text, keyboard = transaction_text(row), transaction_keyboard(row)
+            feedback = "Ahora es un ingreso." if new_kind == "income" else "Ahora es un gasto."
+        elif action == "cat":
+            category = category_from_argument(argument)
+            if category is None:
+                await query.answer("Categoría no reconocida.")
+                return
+            row = db.update_transaction_fields(transaction_id, category=category)
+            text, keyboard = transaction_text(row), transaction_keyboard(row)
+            feedback = f"Categoría: {category}. La próxima vez se usará sola."
+        elif action == "cats":
+            text, keyboard = transaction_text(row, hint="🏷️ Elige la categoría:"), category_keyboard(row)
+        elif action == "back":
+            text, keyboard = transaction_text(row), transaction_keyboard(row)
+        else:
+            await query.answer("Botón no reconocido.")
+            return
+    except (KeyError, ValueError) as exc:
+        await query.answer(str(exc), show_alert=True)
+        return
+    if action in {"undo", "restore", "kind", "cat"}:
+        _request_report_refresh(context)
+    await query.answer(feedback or None)
+    try:
+        await query.edit_message_text(text, reply_markup=keyboard)
+    except BadRequest as exc:
+        # "Message is not modified" cuando se pulsa dos veces lo mismo.
+        logger.info("No se pudo actualizar el mensaje de confirmacion: %s", exc)
 
 
 async def pending(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -404,7 +594,7 @@ async def pending(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await update.effective_message.reply_text("No hay tickets ni voces pendientes.")
         return
 
-    lines = ["Pendientes:"]
+    lines = ["Pendientes (responde al aviso del ticket o escribe «#ID total comercio»):"]
     for row in rows[:20]:
         user_id = row["telegram_user_id"]
         user_label = (
@@ -413,7 +603,7 @@ async def pending(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             or row["telegram_username"]
             or "sin usuario"
         )
-        lines.append(f"#{row['id']} [{row['status']}] {user_label}: {row['local_path']}")
+        lines.append(f"#{row['id']} · {row['created_at'][:10]} · {user_label} · {Path(row['local_path']).name}")
     if len(rows) > 20:
         lines.append(f"...y {len(rows) - 20} mas.")
     await update.effective_message.reply_text("\n".join(lines))
@@ -424,14 +614,8 @@ async def summary(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not await _is_allowed(update, settings):
         return
 
-    data = db.summary_current_month()
-    balance = data["income_cents"] - data["expense_cents"]
-    await update.effective_message.reply_text(
-        "Resumen del mes:\n"
-        f"Ingresos: {_format_money(data['income_cents'])} ({data['income_count']})\n"
-        f"Gastos: {_format_money(data['expense_cents'])} ({data['expense_count']})\n"
-        f"Balance: {_format_money(balance)}"
-    )
+    text = await asyncio.to_thread(build_summary, settings)
+    await update.effective_message.reply_text(text)
 
 
 async def status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -568,11 +752,36 @@ async def _report_refresh_loop(application: Application) -> None:
         await asyncio.to_thread(_refresh_report, settings)
 
 
+async def _calendar_summary_loop(application: Application) -> None:
+    while True:
+        try:
+            await send_daily_calendar(application, datetime.now(timezone.utc))
+        except Exception:
+            logger.warning("No se pudo comprobar el resumen diario del calendario")
+        await asyncio.sleep(30)
+
+
+async def _weekly_summary_loop(application: Application) -> None:
+    while True:
+        try:
+            await send_weekly_summary(application, datetime.now(timezone.utc))
+        except Exception:
+            logger.exception("No se pudo comprobar el resumen semanal")
+        await asyncio.sleep(60)
+
+
 async def _post_init(application: Application) -> None:
+    settings: Settings = application.bot_data["settings"]
+    if settings.calendar_daily_summary_enabled:
+        logger.info("Resumen diario del calendario activo a las 07:00 (%s), solo con eventos", settings.timezone)
+    if settings.weekly_summary_enabled:
+        logger.info("Resumen semanal de finanzas activo: domingos a partir de las 19:00 (%s)", settings.timezone)
     application.bot_data["report_refresh"] = asyncio.Event()
     application.bot_data["background_tasks"] = [
         asyncio.create_task(_heartbeat_loop(application)),
         asyncio.create_task(_report_refresh_loop(application)),
+        asyncio.create_task(_calendar_summary_loop(application)),
+        asyncio.create_task(_weekly_summary_loop(application)),
     ]
 
 
@@ -609,6 +818,8 @@ def build_application(settings: Settings) -> Application:
     application.add_handler(CommandHandler("reporte", report))
     application.add_handler(CommandHandler("pendientes", pending))
     application.add_handler(CommandHandler("hoy", today_command))
+    application.add_handler(CommandHandler("deshacer", undo_command))
+    application.add_handler(CallbackQueryHandler(transaction_button, pattern=r"^tx:"))
     # Solo mensajes nuevos: editar un mensaje ya enviado no debe registrarlo otra vez.
     new_messages = filters.UpdateType.MESSAGE
     application.add_handler(MessageHandler(new_messages & filters.VOICE, record_voice))

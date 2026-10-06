@@ -17,7 +17,7 @@ from finance_bot.config import Settings
 from finance_bot.db import FinanceDatabase
 from finance_bot.calendar import CalendarStore, month_bounds
 from finance_bot.formatting import parse_created_at
-from finance_bot.parser import VALID_CATEGORIES, amount_to_cents
+from finance_bot.parser import DEFAULT_EXPENSE_CATEGORY, VALID_CATEGORIES, amount_to_cents, parse_transaction
 from finance_bot.report import generate_report, render_report_html, report_data
 from finance_bot.storage import DatabaseUnavailableError, inspect_database, read_backup_status
 
@@ -341,11 +341,14 @@ class DashboardHandler(BaseHTTPRequestHandler):
         savings_settings = path == "/api/savings-settings"
         savings_wallet = path == "/api/savings-wallets"
         receipt_review = re.fullmatch(r"/api/receipts/(\d+)/review", path)
+        receipt_total = re.fullmatch(r"/api/receipts/(\d+)/total", path)
+        quick_match = re.fullmatch(r"/api/transactions/(\d+)/quick", path)
+        register_match = re.fullmatch(r"/api/projections/(\d+)/(\d{4}-\d{2})/register", path)
         status_match = re.fullmatch(r"/api/projections/(\d+)/(\d{4}-\d{2})/status", path)
         projection_end_match = re.fullmatch(r"/api/projections/(\d+)/(\d{4}-\d{2})/from", path)
         projection_match = re.fullmatch(r"/api/projections/(\d+)/(\d{4}-\d{2})", path)
         projection_create = path == "/api/projections"
-        if not calendar_create and not calendar_event and not calendar_occurrence and not match and not undo_match and not restore_match and not payment_match and not create_transaction and not create_account and not create_transfer and not create_budget and not create_goal and not savings_settings and not savings_wallet and not receipt_review and not status_match and not projection_end_match and not projection_match and not projection_create:
+        if not calendar_create and not calendar_event and not calendar_occurrence and not match and not undo_match and not restore_match and not payment_match and not create_transaction and not create_account and not create_transfer and not create_budget and not create_goal and not savings_settings and not savings_wallet and not receipt_review and not receipt_total and not quick_match and not register_match and not status_match and not projection_end_match and not projection_match and not projection_create:
             self._send_json(404, {"ok": False, "error": "Ruta no encontrada."})
             return
 
@@ -408,6 +411,19 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 generate_report(self.settings)
             elif receipt_review:
                 self._review_receipt(int(receipt_review.group(1)), payload)
+            elif receipt_total:
+                self._register_receipt_total(int(receipt_total.group(1)), payload)
+            elif quick_match:
+                self._quick_update(int(quick_match.group(1)), payload)
+            elif register_match:
+                db = FinanceDatabase(self.settings.sqlite_db_path, self.settings.timezone)
+                template_id = int(register_match.group(1))
+                month = _parse_month(register_match.group(2))
+                if db.get_projection_template(template_id) is None:
+                    raise KeyError(f"No existe la proyeccion {template_id}.")
+                created = db.register_projection_payment(template_id, month)
+                db.log_audit("status", "projection", template_id, f"Mes {month}: movimiento registrado desde la bandeja" + (f" (#{created})" if created else " (ya existia)"))
+                generate_report(self.settings)
             elif undo_match:
                 db = FinanceDatabase(self.settings.sqlite_db_path, self.settings.timezone)
                 db.undo_last_transaction_change(int(undo_match.group(1)))
@@ -469,6 +485,40 @@ class DashboardHandler(BaseHTTPRequestHandler):
             account_id=int(payload["accountId"]) if str(payload.get("accountId") or "") else None,
         )
         db.log_audit("create", "transaction", transaction_id, "Creado desde el panel")
+        generate_report(self.settings)
+
+    def _register_receipt_total(self, receipt_id: int, payload: dict[str, object]) -> None:
+        """Registra un ticket por su total desde la bandeja; el detalle queda opcional."""
+        db = FinanceDatabase(self.settings.sqlite_db_path, self.settings.timezone)
+        amount_cents = _parse_amount(payload.get("amount"))
+        if amount_cents <= 0:
+            raise ValueError("El total debe ser mayor que cero.")
+        store = _text(payload.get("store"))
+        parsed = parse_transaction(f"{amount_cents / 100:.2f} {store}".strip())
+        category = _text(payload.get("category")) or (parsed.category if parsed else DEFAULT_EXPENSE_CATEGORY)
+        if category not in VALID_CATEGORIES:
+            raise ValueError("Categoria no valida.")
+        if parsed is not None:
+            store = parsed.store or store
+        note = _text(payload.get("description")) or (f"Ticket {store}" if store else f"Ticket #{receipt_id}")
+        transaction_id = db.register_receipt_total(
+            receipt_id, amount_cents=amount_cents, category=category, note=note,
+            kind=_parse_kind(payload.get("kind") or "expense"), store=store, source_text="Total desde el panel",
+        )
+        db.log_audit("review", "receipt", receipt_id, json.dumps({"transactions": [transaction_id], "total": True}, ensure_ascii=False))
+        generate_report(self.settings)
+
+    def _quick_update(self, transaction_id: int, payload: dict[str, object]) -> None:
+        """Cambio rapido de categoria, tipo o revision desde la bandeja (mismo rastro que Telegram)."""
+        db = FinanceDatabase(self.settings.sqlite_db_path, self.settings.timezone)
+        category = _text(payload.get("category")) or None
+        if category is not None and category not in VALID_CATEGORIES:
+            raise ValueError("Categoria no valida.")
+        kind = _parse_kind(payload["kind"]) if str(payload.get("kind") or "") else None
+        link = payload.get("projectionTemplateId")
+        if link not in (None, ""):
+            db.link_transaction_to_projection(transaction_id, int(link))
+        db.update_transaction_fields(transaction_id, kind=kind, category=category, reviewed=_parse_bool(payload.get("reviewed")), origin="Panel")
         generate_report(self.settings)
 
     def _review_receipt(self, receipt_id: int, payload: dict[str, object]) -> None:
@@ -680,14 +730,19 @@ class DashboardHandler(BaseHTTPRequestHandler):
             installment_total=installment_total,
             clear_installments=installment_current is None and installment_total is None,
         )
+        status = _parse_projection_status(payload.get("status"))
         db.set_projection_occurrence(
             template_id=template_id,
             month=month,
             amount_cents=amount_cents,
-            status=_parse_projection_status(payload.get("status")),
+            status=status,
             note=_text(payload.get("note")),
         )
-        self._apply_auto_register(db, template_id, month, payload)
+        # Igual que el boton rapido: pagado o cobrado lleva su movimiento detras.
+        if status == "completed":
+            db.register_projection_payment(template_id, month)
+        else:
+            db.drop_auto_payments(template_id, month)
         self._apply_weekly_budget(db, template_id, payload)
         db.log_audit("update", "projection", template_id, f"Mes {month}")
         generate_report(self.settings)
